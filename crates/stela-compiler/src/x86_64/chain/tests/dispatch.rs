@@ -333,7 +333,9 @@ fn dispatch_caches_complete_transfers_as_table_probes() {
                 ..ChainControl::default()
             };
             let held = cache.slot(btype, pc);
-            let cached = held[0] == pc && held[1] == cache.generation() + epoch;
+            let cached = held[0] == pc
+                && held[1] == cache.generation() + epoch
+                && held[4] == itlb.drop_epoch(pc);
             let (mut probed, mut dispatched) = (base, base);
             let mut states = [state.clone(), state.clone()];
             let lookup = run.run(false, btype, pc, word, &mut states[0], &mut probed);

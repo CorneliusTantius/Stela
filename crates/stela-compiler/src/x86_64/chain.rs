@@ -706,11 +706,12 @@ pub unsafe fn stamp_counts(stamps: u64) -> [u64; STAMP_COUNTS] {
     })
 }
 /// Slots of each BTYPE's part of a [`DispatchCache`].
-pub const DISPATCH_SLOTS: usize = 2048;
+pub const DISPATCH_SLOTS: usize = 1024;
 /// Bytes of one slot of a [`DispatchCache`]: the target, the dispatch
-/// generation it was filled in, the block word for `ChainControl::block`
-/// and the block's host entry.
-pub const DISPATCH_SLOT_BYTES: usize = 32;
+/// generation it was filled in, the block word for `ChainControl::block`,
+/// the block's host entry and the ITLB drop epoch of the target's half
+/// ([`ITLB_DROPS`]) it was filled in.
+pub const DISPATCH_SLOT_BYTES: usize = 64;
 /// Bytes of each BTYPE's part of a [`DispatchCache`].
 pub const DISPATCH_PART_BYTES: usize = DISPATCH_SLOTS * DISPATCH_SLOT_BYTES;
 /// Byte offset from a [`DispatchCache`]'s address of its generation.
@@ -730,13 +731,15 @@ pub const fn dispatch_slot(pc: u64) -> usize {
 /// found ([`dispatching_dispatcher`]), a part for each BTYPE, by
 /// [`dispatch_slot`]. A slot is good while the PE's dispatch generation
 /// plus its control's interruption epoch is what it was when the slot was
-/// filled: the generation grows at every change that could make a table
-/// probe of the target find another block or none, so the probe checks
-/// nothing else. It grows when the block table forgets an entry or puts
-/// another in its place for the same PC and key ([`LookupTable`] holds each
-/// PE's cache), when the PE's ITLB drops a page or changes its translation
-/// (its drop epochs), and when the PE's owner changes its contexts, tables
-/// or acknowledged interruption. A capacity eviction from either table is
+/// filled, and the drop epoch of the target's half in the PE's ITLB
+/// ([`ITLB_DROPS`]) is too: the generation grows at every other change that
+/// could make a table probe of the target find another block or none. It
+/// grows when the block table forgets an entry or puts another in its place
+/// for the same PC and key ([`LookupTable`] holds each PE's cache), when
+/// the ITLB is cleared, and when the PE's owner changes its contexts,
+/// tables or acknowledged interruption. A page of the ITLB dropping or
+/// changing grows only its half's drop epoch, which only the PE's owner
+/// changes, never while its native code runs. A capacity eviction from either table is
 /// not a change: the entry's block stays valid until forgetting reaches
 /// it, as a cell keeps it ([`LookupTable::link_cell`]).
 #[derive(Debug)]
@@ -778,8 +781,9 @@ impl DispatchCache {
     }
 
     /// The slot of `pc` in the part of `btype`: the target, the generation
-    /// plus epoch it was filled in, the block word and the host entry.
-    pub fn slot(&self, btype: u8, pc: u64) -> [u64; 4] {
+    /// plus epoch it was filled in, the block word, the host entry and the
+    /// drop epoch of `pc`'s half it was filled in.
+    pub fn slot(&self, btype: u8, pc: u64) -> [u64; DISPATCH_SLOT_BYTES / 8] {
         let at = DISPATCH_HEADER_WORDS
             + (usize::from(btype) * DISPATCH_PART_BYTES + dispatch_slot(pc) * DISPATCH_SLOT_BYTES)
                 / 8;
@@ -983,6 +987,11 @@ impl LookupTable {
     pub fn page_slot(&self, pc: u64, context: u64) -> usize {
         debug_assert_eq!(self.grouping, Grouping::Pc);
         itlb_slot(pc, context, self.mask)
+    }
+
+    /// The drop epoch of `pc`'s half ([`ITLB_DROPS`]), of an ITLB.
+    pub fn drop_epoch(&self, pc: u64) -> u64 {
+        self.sets.header()[half(pc)].load(Ordering::Relaxed)
     }
 
     /// The salt of `context` in this ITLB ([`itlb_salt`]), for
@@ -1341,8 +1350,8 @@ impl LookupTable {
     /// changed ([`ITLB_DROPS`]).
     fn dropped(&self, pc: u64) {
         if self.grouping == Grouping::Pc {
+            // Dispatch cache slots check their half's epoch themselves.
             self.sets.header()[half(pc)].fetch_add(1, Ordering::Relaxed);
-            self.invalidate_dispatch();
         }
     }
 
@@ -2352,7 +2361,7 @@ pub const CELL_PROBE_ENTRY: usize = 0;
 pub const PROBE_ENTRY: usize = CELL_PROBE_BYTES;
 /// Where a [`lookup_dispatcher`]'s stamping cell probe begins, after the
 /// table probe: a [`stamped_tail`]'s miss takes it.
-pub const STAMPING_PROBE_ENTRY: usize = PROBE_ENTRY + 512;
+pub const STAMPING_PROBE_ENTRY: usize = PROBE_ENTRY + 576;
 /// Bytes in a [`lookup_tail`]: `mov edx, word` and `jmp probe`.
 pub const TAIL_BYTES: usize = 5 + 5;
 /// Bytes in a [`cell_tail`].
@@ -2400,7 +2409,7 @@ fn dispatcher_with_policy(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
 }
 
 /// R`slot` = the byte offset over 8 of `pc`'s slot ([`dispatch_slot`]) in a
-/// part of a [`DispatchCache`], from the target in RAX.
+/// part of a [`DispatchCache`], from the target in RAX: 8 words a slot.
 fn dispatch_index(asm: &mut crate::x86_64::asm::Asm, slot: Gpr, target: crate::TargetCpu) {
     if target.supports(crate::TargetCpu::Bmi2) {
         // The rotated-in high bits land above the mask.
@@ -2411,6 +2420,18 @@ fn dispatch_index(asm: &mut crate::x86_64::asm::Asm, slot: Gpr, target: crate::T
     }
     asm.alu(Alu::Xor, Dword, slot, Rax);
     asm.alu_imm32(Alu::And, Dword, slot, ((DISPATCH_SLOTS - 1) << 2) as i32);
+    asm.shift_imm(ShiftOp::Shl, Dword, slot, 1);
+}
+
+/// R`into` = the drop epoch of the half of the target in RAX in the ITLB
+/// of the control at RCX ([`ITLB_DROPS`]).
+fn dispatch_drops(asm: &mut crate::x86_64::asm::Asm, into: Gpr) {
+    asm.mov(Qword, into, Rax);
+    asm.shift_imm(ShiftOp::Shr, Qword, into, 55);
+    asm.alu_imm8(Alu::And, Dword, into, 1);
+    asm.shift_imm(ShiftOp::Shl, Dword, into, 3);
+    asm.alu_load(Alu::Add, Qword, into, Mem::base(Rcx, ITLB));
+    asm.mov_load(Qword, into, Mem::base(into, ITLB_DROPS));
 }
 
 /// The memory operand of word `word` of the slot R`slot` names
@@ -2454,6 +2475,9 @@ fn dispatcher_with(
         let other = asm.jcc8(Cond::Ne);
         asm.alu_load(Alu::Cmp, Qword, R8, dispatch_word(R9, btype, 1));
         let stale = asm.jcc8(Cond::Ne);
+        dispatch_drops(&mut asm, R11);
+        asm.alu_load(Alu::Cmp, Qword, R11, dispatch_word(R9, btype, 4));
+        let dropped = asm.jcc8(Cond::Ne);
         spend_budget(&mut asm, policy);
         let spent = asm.jcc8(Cond::B);
         asm.shift_imm(ShiftOp::Shr, Dword, Rdx, ExitWord::RAN_SHIFT as u8);
@@ -2468,6 +2492,7 @@ fn dispatcher_with(
         // read, before any of the table probe's reads.
         asm.bind(other);
         asm.bind(stale);
+        asm.bind(dropped);
         // Into the table probe, which follows.
         asm.mov_store(Qword, Mem::base(Rcx, DISPATCH_SEEN), R8);
     }
@@ -2534,6 +2559,10 @@ fn dispatcher_with(
         asm.mov_store(Qword, dispatch_word(R11, btype, 1), Rdx);
         asm.mov_store(Qword, dispatch_word(R11, btype, 2), R8);
         asm.mov_store(Qword, dispatch_word(R11, btype, 3), R9);
+        // The ITLB changes only between native runs, so its drop epoch
+        // now is the one the table probe's translation saw.
+        dispatch_drops(&mut asm, Rdx);
+        asm.mov_store(Qword, dispatch_word(R11, btype, 4), Rdx);
     }
     found(&mut asm);
     for miss in misses {
