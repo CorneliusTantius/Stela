@@ -1290,6 +1290,8 @@ fn open_gpus(
         Ok(None)
     };
     let firmware = firmware.clone();
+    // Named on the screen when no GPU starts; the claim takes `adapters`.
+    let found = adapters.clone();
     let claiming = host::rdtsc();
     let claimed = work.call_owned(60_000_000, move || {
         let services = services::Services::new(mmio, remappers, None, heap, tsc_hz, Vec::new())
@@ -1308,7 +1310,7 @@ fn open_gpus(
             // Each GPU that did not start, and why, or that there is none.
             use stela_boot_core::gpu_status;
             match refused.split_first() {
-                None => crate::status::warn(&gpu_status::none()),
+                None => crate::status::warn(&gpu_status::none(&found)),
                 Some((first, rest)) => {
                     crate::status::warn(&gpu_status::refused(
                         &first.address,
@@ -1323,6 +1325,13 @@ fn open_gpus(
                         ));
                     }
                 }
+            }
+            // The display adapters Stela's GPU driver does not run, and why.
+            for adapter in found
+                .iter()
+                .filter(|adapter| adapter.vendor != stela_drivers::gpu::Vendor::Nvidia)
+            {
+                crate::status::info(&gpu_status::unused(adapter));
             }
             return false;
         }

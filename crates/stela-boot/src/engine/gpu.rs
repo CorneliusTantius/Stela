@@ -1141,6 +1141,18 @@ pub(super) fn claim_all(
         device: adapter.device,
         reason,
     };
+    for adapter in adapters
+        .iter()
+        .filter(|adapter| adapter.vendor != gpu::Vendor::Nvidia)
+    {
+        output::arguments(format_args!(
+            "GPU {} vendor={:?} device={:04x} unused: {}\n",
+            adapter.address,
+            adapter.vendor,
+            adapter.device,
+            adapter.unavailable_reason()
+        ));
+    }
     let nvidia = adapters
         .iter()
         .filter(|adapter| adapter.vendor == gpu::Vendor::Nvidia);
