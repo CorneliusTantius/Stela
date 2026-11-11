@@ -451,7 +451,7 @@ const HALF_FORMS: [u32; 18] = [
     0x7ec0_1400,
     0x5e40_1c00,
 ];
-/// FDIV H, 4H and 8H, which end their block.
+/// FDIV H, 4H and 8H.
 const HALF_DIVISIONS: [u32; 3] = [0x1ee0_1800, 0x2e40_3c00, 0x6e40_3c00];
 /// FADDP H, and FMUL 8H, FMULX 4H and FMUL H by element with Vm = V2.
 const HALF_FIXED_RIGHT: [u32; 4] = [0x5e30_d800, 0x4f12_9800, 0x2f32_9000, 0x5f32_9800];
@@ -459,8 +459,8 @@ const HALF_FIXED_RIGHT: [u32; 4] = [0x5e30_d800, 0x4f12_9800, 0x2f32_9000, 0x5f3
 /// Run the block; the state must match exact completion, on the inline path
 /// or after a helper exit that left only the prefix's effects.
 fn check_half(mapping: &Mapping, operand: &Operand, state: GuestState) -> bool {
-    // A Half division ends its block before the suffix.
-    let suffix = u64::from(operand.operation != BinaryOperation::Divide);
+    // Every form, Half division included, runs on through the suffix.
+    let suffix = 1;
     let mut expected = state.clone();
     expected.x[8] += 1;
     let prefix = expected.clone();

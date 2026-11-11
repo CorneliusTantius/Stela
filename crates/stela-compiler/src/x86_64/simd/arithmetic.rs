@@ -9,6 +9,12 @@ mod half;
     target_arch = "x86_64",
     any(target_os = "macos", target_os = "linux")
 ))]
+mod half_tests;
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    any(target_os = "macos", target_os = "linux")
+))]
 mod tiny_tests;
 use super::super::isa::ShiftOpcode;
 use super::numerical::{
@@ -624,8 +630,9 @@ fn emit_vector(
     finish(code, sticky, full, operand)
 }
 
-pub(super) fn always_exits(operand: &Operand) -> bool {
-    operand.format == Format::Half && operand.operation == BinaryOperation::Divide
+/// No binary form ends its block: Half division runs the lane recipe.
+pub(super) fn always_exits(_operand: &Operand) -> bool {
+    false
 }
 
 /// The S/D forms return their [`ColdSplit`].
@@ -636,10 +643,7 @@ pub(in crate::x86_64) fn emit(
     target: TargetCpu,
     entry: Entry,
 ) -> Option<ColdSplit> {
-    if always_exits(operand) && !crate::x86_64::asm::vector_extensions::half_supported(target) {
-        super::super::block::direct_exit(code, pc, ExitKind::FloatingPoint);
-        None
-    } else if operand.format == Format::Half {
+    if operand.format == Format::Half {
         half::emit(code, operand, pc, target);
         None
     } else if operand.shape == Shape::Scalar {
@@ -671,6 +675,9 @@ mod tests {
             0x4e42_1420, // fadd v0.8h, v1.8h, v2.8h
             0x4ec2_1420, // fsub v0.8h, v1.8h, v2.8h
             0x6e42_1c20, // fmul v0.8h, v1.8h, v2.8h
+            0x1ee2_1820, // fdiv h0, h1, h2
+            0x2e42_3c20, // fdiv v0.4h, v1.4h, v2.4h
+            0x6e42_3c20, // fdiv v0.8h, v1.8h, v2.8h
         ] {
             let bytes: Vec<u8> = [word, RET]
                 .iter()
@@ -688,15 +695,6 @@ mod tests {
             assert_eq!(block.source_bytes, bytes.len());
             assert_eq!(block.native.source_map.len(), 2);
             assert_eq!(block.native.source_map[1].0, GuestAddress(0x1004));
-        }
-        for word in [0x1ee2_1820u32, 0x2e42_3c20, 0x6e42_3c20] {
-            let bytes: Vec<u8> = [word, RET]
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect();
-            let block = crate::testing::block(&bytes, GuestAddress(0x1000)).unwrap();
-            assert_eq!(block.source_bytes, size_of::<u32>());
-            assert_eq!(block.native.source_map, [(GuestAddress(0x1000), 0)]);
         }
     }
 }
