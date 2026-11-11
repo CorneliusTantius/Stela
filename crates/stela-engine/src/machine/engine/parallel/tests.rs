@@ -1710,7 +1710,7 @@ fn the_home_machine_sees_any_pes_reset_and_dma_without_the_lock() {
             dma: Some(7),
             ..Pending::default()
         },
-        hub,
+        Arc::clone(&hub),
     );
     let mut worker = home.worker();
     assert_eq!(home.dma_deadline(), Some(7), "as the board was made");
@@ -1719,8 +1719,20 @@ fn the_home_machine_sees_any_pes_reset_and_dma_without_the_lock() {
         (home.dma_deadline(), worker.dma_deadline()),
         (Some(90), None)
     );
+    // Home at work outside its run loop: the other PEs take its DMA, which
+    // a wake would not get it to before that work ends; asleep, it is woken.
+    hub.set_outside(0, true);
+    assert_eq!(worker.dma_deadline(), Some(90));
+    hub.inboxes[0].sleeping.store(true, Ordering::SeqCst);
+    assert_eq!(worker.dma_deadline(), None);
+    hub.inboxes[0].sleeping.store(false, Ordering::SeqCst);
+    hub.set_outside(0, false);
+    assert_eq!(worker.dma_deadline(), None);
     worker.write(1, 0, 4, 0, 0).unwrap();
     assert_eq!(home.dma_deadline(), None);
+    hub.set_outside(0, true);
+    assert_eq!(worker.dma_deadline(), None, "no DMA, none to take");
+    hub.set_outside(0, false);
     // A reset another PE's access requested reaches the home machine
     // once, and never the worker.
     worker.write(1, 0, 4, 1, 0).unwrap();

@@ -1043,6 +1043,16 @@ impl Hub {
             .is_some_and(|inbox| inbox.outside.load(Ordering::Acquire))
     }
 
+    /// Whether the home machine is outside its run loop at work of its own
+    /// (serving the host, compiling, a report), not asleep: a wake would
+    /// not reach it until that work ends.
+    pub(super) fn home_busy_outside(&self) -> bool {
+        let home = self.home.load(Ordering::Acquire);
+        self.inboxes.get(home).is_some_and(|inbox| {
+            inbox.outside.load(Ordering::Acquire) && !inbox.sleeping.load(Ordering::SeqCst)
+        })
+    }
+
     /// The counts in a millisecond of the count every PE reads.
     pub(super) fn counts_per_milli(&self) -> u64 {
         self.clock.counts_per_milli()
