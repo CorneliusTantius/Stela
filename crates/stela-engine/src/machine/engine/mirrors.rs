@@ -380,8 +380,8 @@ impl Mirrors {
 
 /// System registers whose writes leave the derived caches intact.
 /// Exception registers and thread pointers are read when used. TTBR0
-/// changes translation, and CONTEXTIDR changes prediction identity and
-/// live debug matches. Their writes still synchronize the host regime.
+/// changes translation, and its write still synchronizes the host regime.
+/// CONTEXTIDR changes only live debug matches, which read it when checked.
 pub(super) fn stored(register: SystemRegister) -> bool {
     use SystemRegister::*;
     matches!(
