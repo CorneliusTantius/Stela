@@ -2083,6 +2083,7 @@ fn prepare_restore(
             signer,
             fdr_storage,
             network: proxy_network,
+            signing_network: matches!(host_network, Some(Ok(_))),
         },
     )
     .unwrap_or_else(|error| {
