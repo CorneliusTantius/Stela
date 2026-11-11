@@ -569,16 +569,6 @@ impl<const N: usize> Queue<N> {
         guard.state().completed(ticket.sequence)
     }
     #[cfg(target_arch = "x86_64")]
-    fn next(
-        &self,
-        lane: Lane,
-        geometry: stack_requirement::Geometry,
-    ) -> Result<Option<(usize, Job)>, WorkError> {
-        self.lock()?
-            .state()
-            .select_job(lane, geometry, self.abandoned.load(Ordering::Acquire))
-    }
-    #[cfg(target_arch = "x86_64")]
     fn finish(
         &self,
         slot: usize,
