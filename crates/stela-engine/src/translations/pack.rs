@@ -317,6 +317,19 @@ impl<'a> Layout<'a> {
         Self::with_format(translator, records, PackFormat::Raw)
     }
 
+    /// The pack of `records` laid out over `previous`, the pack the file
+    /// holds, within `bound`, as [`Store::plan`] lays out its choice: kept
+    /// records stay where they are and [`Self::changed`] names the rest.
+    pub fn over(
+        translator: &Digest,
+        previous: Option<Pack<'a>>,
+        records: Vec<(Digest, Piece<'a>)>,
+        bound: u64,
+    ) -> Self {
+        let format = previous.map_or(PackFormat::Raw, |pack| pack.format);
+        layout_over(translator, previous, records, format, bound)
+    }
+
     fn with_format(
         translator: &Digest,
         records: Vec<(Digest, Piece<'a>)>,
