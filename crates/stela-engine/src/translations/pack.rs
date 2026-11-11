@@ -327,7 +327,8 @@ impl<'a> Layout<'a> {
         bound: u64,
     ) -> Self {
         let format = previous.map_or(PackFormat::Raw, |pack| pack.format);
-        layout_over(translator, previous, records, format, bound)
+        let entries = previous.as_ref().map(file_entries);
+        layout_over(translator, entries.as_deref(), records, format, bound)
     }
 
     fn with_format(
@@ -483,6 +484,38 @@ fn layout_bytes(records: usize, bytes: u64) -> u64 {
     prefix_length(records) as u64 + bytes
 }
 
+/// A record the pack file holds: its page key, offset and bytes.
+pub type FileEntry<'a> = (Digest, u64, &'a [u8]);
+
+/// The records `pack` holds, by key, with their offsets in it.
+fn file_entries<'a>(pack: &Pack<'a>) -> Vec<FileEntry<'a>> {
+    let base = pack.bytes.as_ptr() as usize;
+    pack.iter()
+        .map(|(key, bytes)| (key, (bytes.as_ptr() as usize - base) as u64, bytes))
+        .collect()
+}
+
+/// The records the pack file holds once `layout` is durable in it, by key:
+/// the layout's new records are kept for the rest of the run (leaked: a
+/// later layout keeps them by address, and a later merge decodes them).
+pub fn written<'a>(layout: Layout<'a>) -> Vec<FileEntry<'a>> {
+    let count = (layout.prefix.len() - HEADER_BYTES - CHECKSUM_BYTES) / INDEX_ENTRY_BYTES;
+    let mut pieces: BTreeMap<u64, &'a [u8]> = BTreeMap::new();
+    for (offset, piece) in layout.records {
+        let bytes: &'a [u8] = match piece {
+            Piece::Kept(bytes) => bytes,
+            Piece::New(bytes) => alloc::boxed::Box::leak(bytes.into_boxed_slice()),
+        };
+        pieces.insert(offset, bytes);
+    }
+    (0..count)
+        .filter_map(|index| {
+            let (key, offset, _) = entry(&layout.prefix, index);
+            Some((key, offset, *pieces.get(&offset)?))
+        })
+        .collect()
+}
+
 /// The layout of `records`, the plan's choice within `bound`, over the pack
 /// read, `previous`: each record it keeps unchanged stays where it was, the
 /// others follow its last, and only they and the index are written. When
@@ -491,7 +524,7 @@ fn layout_bytes(records: usize, bytes: u64) -> u64 {
 /// laid out again, with room for the index to grow.
 fn layout_over<'a>(
     translator: &Digest,
-    previous: Option<Pack<'a>>,
+    previous: Option<&[FileEntry<'a>]>,
     records: Vec<(Digest, Piece<'a>)>,
     format: PackFormat,
     bound: u64,
@@ -513,15 +546,14 @@ fn layout_over<'a>(
         };
         Layout::compact(translator, records, format, start)
     };
-    let Some(pack) = previous else {
+    let Some(previous) = previous else {
         return relayout(records);
     };
-    let base = pack.bytes.as_ptr() as usize;
-    let first_record = pack
+    let first_record = previous
         .iter()
-        .map(|(_, bytes)| (bytes.as_ptr() as usize - base) as u64)
+        .map(|(_, offset, _)| *offset)
         .min()
-        .unwrap_or(pack.bytes.len() as u64);
+        .unwrap_or(prefix_length(previous.len()) as u64);
     let prefix = prefix_length(records.len()) as u64;
     if prefix > first_record {
         return relayout(records);
@@ -532,10 +564,12 @@ fn layout_over<'a>(
     let mut appended = Vec::new();
     for (key, piece) in records {
         let kept = match &piece {
-            Piece::Kept(bytes) => pack
-                .get(&key)
-                .filter(|slot| core::ptr::eq(*slot, *bytes))
-                .map(|slot| (slot.as_ptr() as usize - base) as u64),
+            Piece::Kept(bytes) => previous
+                .binary_search_by_key(&key, |(key, _, _)| *key)
+                .ok()
+                .map(|index| previous[index])
+                .filter(|(_, _, slot)| core::ptr::eq(*slot, *bytes))
+                .map(|(_, offset, _)| offset),
             Piece::New(_) => None,
         };
         match kept {
@@ -574,7 +608,7 @@ fn layout_over<'a>(
     }
     // The index changes whenever a record comes, goes or moves; a pack the
     // same in every byte is not written at all.
-    let same = placed.len() == pack.records() && changed.is_empty();
+    let same = placed.len() == previous.len() && changed.is_empty();
     let mut ranges = Vec::new();
     if !same {
         ranges.push(0..prefix);
@@ -1074,6 +1108,9 @@ pub struct Store<'a> {
     shared_bound: usize,
     misses: MissTables,
     pub counters: Counters,
+    /// The records the pack file holds since a checkpoint wrote it during
+    /// the run ([`Self::adopt`]); `None` while it holds the pack read.
+    file: Option<Arc<Vec<FileEntry<'a>>>>,
 }
 
 /// The next pack, and what laying it out did.
@@ -1160,6 +1197,7 @@ impl<'a> Store<'a> {
             shared_bound: 0,
             misses: MissTables::default(),
             counters: Counters::default(),
+            file: None,
         }
     }
 
@@ -1559,6 +1597,106 @@ impl<'a> Store<'a> {
     /// entries, then those this boot used, then the others, as long as
     /// they fit. Records kept unchanged stay where they were in the pack
     /// read ([`Layout::changed`]).
+    /// The records the pack file holds now: those the last checkpoint
+    /// wrote, else the pack read.
+    pub fn file(&self) -> Arc<Vec<FileEntry<'a>>> {
+        self.file
+            .clone()
+            .unwrap_or_else(|| Arc::new(self.pack.as_ref().map(file_entries).unwrap_or_default()))
+    }
+
+    fn format(&self) -> PackFormat {
+        self.pack.map_or(PackFormat::Raw, |pack| pack.format)
+    }
+
+    /// The pack file holds `file` now ([`written`]): later layouts keep
+    /// its records in place and append only what is new.
+    pub fn adopt(&mut self, file: Arc<Vec<FileEntry<'a>>>) {
+        self.file = Some(file);
+    }
+
+    /// The entries proven during the run, for a checkpoint to write; the
+    /// store proves on into an empty set.
+    pub fn take_proven(&mut self) -> BTreeMap<Digest, Record> {
+        self.proven_bytes = 0;
+        self.proven_full = false;
+        core::mem::take(&mut self.proven)
+    }
+
+    /// Take back entries a checkpoint did not write.
+    pub fn restore_proven(&mut self, proven: BTreeMap<Digest, Record>) {
+        for (key, record) in proven {
+            self.proven_bytes += record.retained_bytes();
+            match self.proven.entry(key) {
+                alloc::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(record);
+                }
+                alloc::collections::btree_map::Entry::Occupied(mut slot) => {
+                    slot.get_mut().merge(record);
+                }
+            }
+        }
+    }
+
+    /// The pack a checkpoint writes over the pack file's records `file`
+    /// within `bound`: the records that gain entries from `proven` first,
+    /// then the file's others, as long as they fit. Records the file holds
+    /// unchanged stay where they are, so only the gains are written.
+    pub fn checkpoint_layout(
+        &self,
+        file: &[FileEntry<'a>],
+        proven: &BTreeMap<Digest, Record>,
+        bound: u64,
+    ) -> Layout<'a> {
+        let format = self.format();
+        let mut scratch = DecodeScratch::default();
+        let mut candidates: Vec<(Digest, Piece<'a>)> = Vec::new();
+        for (key, record) in proven {
+            if let Ok(index) = file.binary_search_by_key(key, |(key, _, _)| *key) {
+                let stored = PackedRecord {
+                    bytes: file[index].2,
+                    format,
+                    checked: false,
+                };
+                match stored.decode(&self.translator, key, &mut scratch) {
+                    Ok(previous) => {
+                        let before = previous.entries.len();
+                        let mut record = record.clone();
+                        record.merge(previous);
+                        if record.entries.len() == before {
+                            candidates.push((*key, Piece::Kept(stored.bytes)));
+                        } else {
+                            candidates.push((*key, Piece::New(record.encode())));
+                        }
+                        continue;
+                    }
+                    Err(DecodeError::Invalid) => {}
+                    Err(DecodeError::Capacity) => {
+                        candidates.push((*key, Piece::Kept(stored.bytes)));
+                        continue;
+                    }
+                }
+            }
+            candidates.push((*key, Piece::New(record.encode())));
+        }
+        for &(key, _, bytes) in file {
+            if !proven.contains_key(&key) {
+                candidates.push((key, Piece::Kept(bytes)));
+            }
+        }
+        let (mut kept, mut kept_bytes) = (Vec::new(), 0u64);
+        for (key, piece) in candidates {
+            let bytes = piece.bytes().len() as u64;
+            if kept.len() < MAX_RECORDS && layout_bytes(kept.len() + 1, kept_bytes + bytes) <= bound
+            {
+                kept_bytes += bytes;
+                kept.push((key, piece));
+            }
+        }
+        let previous = (self.pack.is_some() || self.file.is_some()).then_some(file);
+        layout_over(&self.translator, previous, kept, format, bound)
+    }
+
     pub fn plan(&mut self, bound: u64, room: impl Fn() -> bool) -> Planned<'a> {
         let mut proven = core::mem::take(&mut self.proven);
         self.proven_bytes = 0;
@@ -1591,10 +1729,22 @@ impl<'a> Store<'a> {
         self.pending_blocks = 0;
         self.pending_bytes = 0;
         // Gained entries first, then this boot's records, then the others.
+        let file = self.file();
+        let format = self.format();
+        let held = |key: &Digest| {
+            file.binary_search_by_key(key, |(key, _, _)| *key)
+                .ok()
+                .map(|index| file[index].2)
+        };
         let mut scratch = core::mem::take(&mut self.decode_scratch);
         let mut candidates: Vec<(Digest, Piece<'a>)> = Vec::new();
         for (key, record) in &mut proven {
-            if let Some(stored) = self.pack.and_then(|pack| pack.record(key)) {
+            if let Some(bytes) = held(key) {
+                let stored = PackedRecord {
+                    bytes,
+                    format,
+                    checked: false,
+                };
                 match stored.decode(&self.translator, key, &mut scratch) {
                     Ok(previous) => {
                         let before = previous.entries.len();
@@ -1616,19 +1766,17 @@ impl<'a> Store<'a> {
         }
         self.decode_scratch.retain(&mut scratch);
         drop(scratch);
-        if let Some(pack) = self.pack {
-            for (key, valid) in &self.loaded {
-                if *valid
-                    && !proven.contains_key(key)
-                    && let Some(bytes) = pack.get(key)
-                {
-                    candidates.push((*key, Piece::Kept(bytes)));
-                }
+        for (key, valid) in &self.loaded {
+            if *valid
+                && !proven.contains_key(key)
+                && let Some(bytes) = held(key)
+            {
+                candidates.push((*key, Piece::Kept(bytes)));
             }
-            for (key, bytes) in pack.iter() {
-                if !self.loaded.contains_key(&key) && !proven.contains_key(&key) {
-                    candidates.push((key, Piece::Kept(bytes)));
-                }
+        }
+        for &(key, _, bytes) in file.iter() {
+            if !self.loaded.contains_key(&key) && !proven.contains_key(&key) {
+                candidates.push((key, Piece::Kept(bytes)));
             }
         }
         let (mut kept, mut kept_bytes, mut evicted) = (Vec::new(), 0u64, 0);
@@ -1642,9 +1790,10 @@ impl<'a> Store<'a> {
                 evicted += 1;
             }
         }
-        let format = self.pack.map_or(PackFormat::Raw, |pack| pack.format);
+        // A store that never had a pack lays its first out from the start.
+        let previous = (self.pack.is_some() || self.file.is_some()).then_some(&file[..]);
         Planned {
-            layout: layout_over(&self.translator, self.pack, kept, format, bound),
+            layout: layout_over(&self.translator, previous, kept, format, bound),
             proven: count,
             unprovable,
             unproven,
@@ -2420,7 +2569,13 @@ mod tests {
             .iter()
             .map(|(key, bytes)| (key, Piece::Kept(bytes)))
             .collect();
-        let layout = layout_over(&translator, Some(pack), records, pack.format, u64::MAX);
+        let layout = layout_over(
+            &translator,
+            Some(&file_entries(&pack)),
+            records,
+            pack.format,
+            u64::MAX,
+        );
         assert_eq!(layout.changed(), None);
     }
 
@@ -2600,5 +2755,111 @@ mod tests {
             merged.plan(u64::MAX, || true).layout.to_vec(),
             whole.plan(u64::MAX, || true).layout.to_vec()
         );
+    }
+
+    /// A pack's records by key, checked.
+    fn pack_records(bytes: &[u8]) -> Vec<(Digest, Vec<u8>)> {
+        Pack::parse(bytes, &translator_id())
+            .unwrap()
+            .iter()
+            .map(|(key, bytes)| (key, bytes.to_vec()))
+            .collect()
+    }
+
+    /// `image` with `layout`'s changed ranges written over it: what a
+    /// writer of only those ranges leaves (room between records keeps
+    /// what the file held).
+    fn applied(image: &[u8], layout: &Layout) -> Vec<u8> {
+        let mut file = image.to_vec();
+        file.resize(file.len().max(layout.bytes() as usize), 0);
+        let full = layout.to_vec();
+        for range in layout.changed().expect("an in-place layout") {
+            let range = range.start as usize..range.end as usize;
+            file[range.clone()].copy_from_slice(&full[range]);
+        }
+        file.truncate(full.len());
+        file
+    }
+
+    #[test]
+    fn a_checkpoint_adopted_by_the_store_leaves_later_saves_appending() {
+        let translator = translator_id();
+        let (first, second, third) = (
+            Digest::of(b"first page"),
+            Digest::of(b"second page"),
+            Digest::of(b"third page"),
+        );
+        let bound = 1 << 20;
+        let mut store = Store::new(translator, None).0;
+        store.offer(offer(0x1_0000_4008, first));
+        store.offer(offer(0x1_0000_8010, second));
+        while let Some(batch) = store.take_batch(8) {
+            store.fold(batch.prove());
+        }
+        // The first checkpoint: nothing on file yet, so laid out whole.
+        let proven = store.take_proven();
+        let layout = store.checkpoint_layout(&store.file(), &proven, bound);
+        assert_eq!(layout.changed(), None);
+        let image = layout.to_vec();
+        store.adopt(Arc::new(written(layout)));
+        assert_eq!(store.file().len(), 2);
+        // More code: a new page and a new block on the first page.
+        store.offer(offer(0x1_0000_4010, first));
+        store.offer(offer(0x1_0000_c008, third));
+        while let Some(batch) = store.take_batch(8) {
+            store.fold(batch.prove());
+        }
+        // The second checkpoint appends the two changed records and the
+        // index; the second page's record stays where it is.
+        let proven = store.take_proven();
+        let layout = store.checkpoint_layout(&store.file(), &proven, bound);
+        let changed = layout.changed().unwrap().to_vec();
+        assert_eq!(changed.len(), 3);
+        let second_bytes = Pack::parse(&image, &translator)
+            .unwrap()
+            .get(&second)
+            .unwrap();
+        let after = applied(&image, &layout);
+        assert_eq!(pack_records(&after), pack_records(&layout.to_vec()));
+        assert_eq!(
+            Pack::parse(&after, &translator)
+                .unwrap()
+                .get(&second)
+                .unwrap(),
+            second_bytes
+        );
+        store.adopt(Arc::new(written(layout)));
+        // A failed checkpoint would give its entries back: the stop's plan
+        // then holds them. Here one more block waits for the stop.
+        store.offer(offer(0x1_0000_8018, second));
+        let planned = store.plan(bound, || true);
+        assert_eq!(planned.proven, 1);
+        let last = applied(&after, &planned.layout);
+        assert_eq!(pack_records(&last), pack_records(&planned.layout.to_vec()));
+        let mut next = Store::new(translator, Some(&last)).0;
+        let context = offer(0x1_0000_4008, first).context();
+        let record = next.record(&first).unwrap();
+        assert!(record.find(8, &context).is_some() && record.find(16, &context).is_some());
+        let record = next.record(&second).unwrap();
+        assert!(record.find(16, &context).is_some() && record.find(24, &context).is_some());
+        assert!(next.record(&third).unwrap().find(8, &context).is_some());
+    }
+
+    #[test]
+    fn entries_a_checkpoint_did_not_write_go_back_to_the_store() {
+        let translator = translator_id();
+        let key = Digest::of(b"page");
+        let mut store = Store::new(translator, None).0;
+        store.offer(offer(0x1_0000_4008, key));
+        let batch = store.take_batch(8).unwrap();
+        store.fold(batch.prove());
+        let proven = store.take_proven();
+        assert_eq!(proven.len(), 1);
+        store.restore_proven(proven);
+        let planned = store.plan(1 << 20, || true);
+        let bytes = planned.layout.to_vec();
+        let mut next = Store::new(translator, Some(&bytes)).0;
+        let context = offer(0x1_0000_4008, key).context();
+        assert!(next.record(&key).unwrap().find(8, &context).is_some());
     }
 }
