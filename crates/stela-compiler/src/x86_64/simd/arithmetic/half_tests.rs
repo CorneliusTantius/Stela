@@ -77,7 +77,7 @@ fn half(random: &mut u64) -> u64 {
         // Exact quotients and products: powers of two and small integers.
         3 => 0x3c00 | (*random >> 24 & 0x7) << 10,
         4 => 0x4000 + (*random >> 30 & 0x1f) * 0x80,
-        _ => (*random >> 16 & 0x7fff) % 0x7800 + 0x400 | (*random >> 40 & 1) << 15,
+        _ => ((*random >> 16 & 0x7fff) % 0x7800 + 0x400) | ((*random >> 40 & 1) << 15),
     }
 }
 
