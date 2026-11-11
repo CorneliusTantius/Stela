@@ -23,10 +23,14 @@ pub const HEAP_FLOOR: u64 = 2816 * MIB;
 /// Above the floor, the heap grows with the host to this: a larger host
 /// runs more and larger pipelines, apps and translation packs.
 pub const HEAP_CEILING: u64 = 16 * GIB;
-/// Free host RAM bytes per byte of the engine heap's base share. A 16 GiB
-/// guest's first Metal shader compiles carved all of a sixteenth (1816 MiB)
-/// and failed.
-const HEAP_SHARE: u64 = 12;
+/// Free host RAM bytes per byte of the engine heap's base share, which
+/// passes the floor only on hosts with more than about 50 GiB free. The
+/// heap's peak past its window's block records does not grow with the
+/// guest: 2111 MiB with 6.7 GiB of guest DRAM and 1987 MiB with 10.4 GiB
+/// (`BEAT peak=2815M` with a 704 MiB window, `peak=2963M` with 976 MiB),
+/// both under the floor's 2304 MiB. (A sixteenth, 1816 MiB, was once too
+/// little for a 16 GiB guest, under today's floor.)
+const HEAP_SHARE: u64 = 24;
 /// Heap bytes per byte of the board's code window: the shared block records,
 /// successors, recovery rows, index and lookup of the blocks it holds,
 /// once for the board since the block store is shared. An 8-PE 26A434
@@ -61,19 +65,19 @@ const POOL_RUNNER_FLOOR: u64 = 32 * MIB;
 /// halves reset as a cache of the guest's working set, rather than hold a
 /// tenth of a large host's RAM.
 const POOL_PER_RUNNER: u64 = GIB;
-/// Past small guests a runner's pool grows by a byte per [`POOL_GROWTH`]
-/// bytes of guest DRAM above [`POOL_BASE`], not by a sixty-fourth. Its upper
-/// half holds the kernel's mappings, which grow with the DRAM it touches:
-/// PE0's peaked at 23 MiB of a 52 MiB half with 6.7 GiB of guest DRAM
-/// (`BEAT shadow_peak=52M/23M/52M`), about a 290th. Its lower half is a
-/// cache of recent address spaces: it fills whatever it has (52 MiB there),
-/// and ran out 74 times in a 20-minute run that reset its shadow 33 000
-/// times for TLB maintenance (`SHADOW exhausted= maintained=`). Each half,
-/// 32 MiB and a 320th of the guest, holds more than both measured peaks on
-/// every host from 12 GiB (whose pools lose 6 MiB of 864) up; below that
-/// the sixty-fourth is less.
-const POOL_BASE: u64 = 64 * MIB;
-const POOL_GROWTH: u64 = 160;
+/// Past small guests a runner's pool is [`POOL_BASE`] and a byte per
+/// [`POOL_GROWTH`] bytes of guest DRAM, not a sixty-fourth. Its upper half
+/// holds the kernel's mappings: PE0's peaked at 23 MiB with 6.7 GiB of guest
+/// DRAM and at 22 MiB with 10.4 GiB (`BEAT shadow_peak=52M/23M/52M` and
+/// `64M/22M/64M`), so it hardly grows with the DRAM. Its lower half is a
+/// cache of recent address spaces: it fills whatever it has, and ran out
+/// about once in 1.6 heartbeats with 52 MiB as with 64 MiB (74 times in 117,
+/// 106 in 178), while TLB maintenance reset the shadow about 190 times a
+/// heartbeat (`SHADOW exhausted= maintained=`). Each half, 48 MiB and a
+/// 2048th of the guest, holds about the 52 MiB lower half of the 12 GiB
+/// run (51 MiB on a 12 GiB host, 54 on 16) and twice the upper half's peak.
+const POOL_BASE: u64 = 96 * MIB;
+const POOL_GROWTH: u64 = 1024;
 /// The least guest DRAM Stela boots macOS with. Below it macOS spends its
 /// time paging; 26A434 reaches the desktop with 3.1 GiB.
 pub const GUEST_FLOOR: u64 = 3 * GIB;
@@ -159,7 +163,7 @@ impl Shortfall {
 /// running PEs; the others add only their parked reserves.
 ///
 /// Each part takes a share of `free`, between its bounds:
-/// - the heap a twelfth, [`HEAP_PER_WINDOW`] byte per byte of the board's
+/// - the heap a twenty-fourth, [`HEAP_PER_WINDOW`] byte per byte of the board's
 ///   code window and [`PE_HEAP`] per runner, within
 ///   [`HEAP_FLOOR`]..=[`HEAP_CEILING`], the floor moved by the window's
 ///   difference from [`FLOOR_WINDOW`];
@@ -230,7 +234,7 @@ fn estimate_with(free: u64, cores: usize, runners: usize, per_runner: u64) -> Re
     let rest = free.saturating_sub(heap).saturating_sub(code.bytes);
     let sharers = u128::from(running.min(POOL_SHARERS));
     let rest = u128::from(rest);
-    // A sixty-fourth of the guest each, or the base and a 160th if less.
+    // A sixty-fourth of the guest each, or the base and a 1024th if less.
     let share = sharers * rest / (u128::from(POOL_SHARE) + sharers);
     let growth = u128::from(POOL_GROWTH);
     let grown = sharers * (growth * u128::from(POOL_BASE) + rest) / (growth + sharers);
