@@ -163,8 +163,57 @@ pub(super) const TABLE_BASE_KEPT: usize = EVENT_WAIT + 1;
 /// TTBR0_EL1 (TTBR0_EL2 at EL2 with E2H).
 pub(super) const TABLE_BASE: Encoding = Encoding::new(3, 0, 2, 0, 0);
 
+/// The cells of the EL2 virtual timer's compare and control
+/// (`x86_64::register_read::timer_thunk`), whose `value`s are the addresses
+/// of CNTHV_CVAL_EL2's and CNTHV_CTL_EL2's storage. An access of CNTV_TVAL,
+/// CNTV_CVAL or CNTV_CTL that completes plainly opens both, only where
+/// such an access always reaches that channel with no offset: at EL2,
+/// outside a guarded level, with HCR_EL2.E2H set (Arm `AArch64_CNTV_*`
+/// redirect to CNTHV_*), on a chip whose one timer bank counts the system
+/// count unscaled (before the M3: `timer::agt`). No CNTHCTL_EL2 trap applies
+/// at EL2.
+pub(super) const TIMER_COMPARE: usize = TABLE_BASE_KEPT + 1;
+pub(super) const TIMER_CONTROL: usize = TIMER_COMPARE + 1;
+
+/// Where native timer accesses find the channel and the engine's words.
+pub(super) const TIMER: register_read::TimerPlaces = register_read::TimerPlaces {
+    compare: cell_place(TIMER_COMPARE),
+    control: cell_place(TIMER_CONTROL),
+    lines_until: Place::new(Anchor::Mirrors, offset_of!(Mirrors, lines_until)),
+    count: Place::new(Anchor::Count, 0),
+};
+
+/// MSR CNTV_TVAL_EL0, CNTV_CTL_EL0 and CNTV_CVAL_EL0, and MRS
+/// CNTV_CTL_EL0, with Rt in bits 4:0.
+const TIMER_VALUE_WRITE: u32 = 0xd51b_e300;
+const TIMER_CONTROL_WRITE: u32 = 0xd51b_e320;
+const TIMER_COMPARE_WRITE: u32 = 0xd51b_e340;
+const TIMER_CONTROL_READ: u32 = 0xd53b_e320;
+
+/// What a native timer access of `word` does, and Rt, if `word` is one:
+/// [`TimerWord`].
+pub(super) fn timer_word(word: u32) -> Option<(TimerWord, u8)> {
+    let access = match word & !31 {
+        TIMER_VALUE_WRITE => TimerWord::Value,
+        TIMER_CONTROL_WRITE => TimerWord::ControlWrite,
+        TIMER_COMPARE_WRITE => TimerWord::Compare,
+        TIMER_CONTROL_READ => TimerWord::ControlRead,
+        _ => return None,
+    };
+    Some((access, (word & 31) as u8))
+}
+
+/// The timer accesses native code completes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TimerWord {
+    Value,
+    Compare,
+    ControlWrite,
+    ControlRead,
+}
+
 /// The cell of the first of the [`STORED_WRITES`].
-const STORED_WRITE_CELLS: usize = TABLE_BASE_KEPT + 1;
+const STORED_WRITE_CELLS: usize = TIMER_CONTROL + 1;
 
 /// The IMPLEMENTATION DEFINED registers that a store completes writes of
 /// that get a cell of their own the first time code naming them is installed

@@ -360,7 +360,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// The earliest count at which the running PE's timers signal: their
     /// own deadline, kept, held back while a busy PE has not had its share
     /// of work since the last timer interrupt (`clock::TIMER_WORK`).
+    /// The deadline is read from the registers' storage whenever
+    /// native code changed what it was computed from.
     pub(super) fn timer_deadline(&mut self) -> Option<u64> {
+        let registers = native_timer_registers(&self.cpu);
+        if registers != self.timer_registers {
+            self.timer_registers = registers;
+            self.timers = None;
+        }
         let deadline = *self
             .timers
             .get_or_insert_with(|| timer::deadline(&self.cpu));
@@ -521,6 +528,15 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let lines = self.lines_at(now);
         interrupt_pending(&self.cpu, lines)
     }
+}
+
+/// The timer registers native code writes ([`TIMER_COMPARE`]), as the
+/// engine's cached timer deadline depends on them.
+fn native_timer_registers(cpu: &Cpu) -> [u64; 2] {
+    [
+        cpu.registers.get(SystemRegister::CNTHV_CVAL_EL2, 0),
+        cpu.registers.get(SystemRegister::CNTHV_CTL_EL2, 0),
+    ]
 }
 
 #[cfg(test)]

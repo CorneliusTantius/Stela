@@ -9284,6 +9284,7 @@ mod stage2_syndrome;
 mod table_base;
 mod tagged;
 mod thread_switch;
+mod timer_native;
 
 #[test]
 fn host_work_holds_the_shared_count_only_for_a_pe_stopped_in_the_kernel() {

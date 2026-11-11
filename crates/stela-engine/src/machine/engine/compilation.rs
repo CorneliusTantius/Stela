@@ -1401,6 +1401,17 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 epoch,
                 count,
             )
+        } else if let Some((access, rt)) = timer_word(word) {
+            self.clock.native(self.host.tsc_counter()?);
+            let access = match access {
+                TimerWord::Value => register_read::TimerAccess::WriteValue,
+                TimerWord::Compare => register_read::TimerAccess::WriteCompare,
+                TimerWord::ControlRead => register_read::TimerAccess::ReadControl,
+                TimerWord::ControlWrite => register_read::TimerAccess::WriteControl(
+                    self.register_fixed_bits(SystemRegister::CNTHV_CTL_EL2),
+                ),
+            };
+            register_read::timer_thunk(GuestAddress(pc), rt, access, TIMER)
         } else if let Some(access) = mrs_access(pc, word) {
             self.stored_read_thunk(pc, access)?
         } else {

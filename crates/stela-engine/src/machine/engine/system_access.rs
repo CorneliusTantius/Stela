@@ -391,6 +391,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         {
             return self.kernel_permission_write(word, access);
         }
+        if timer_word(word).is_some() {
+            return self.timer_access(word, access);
+        }
         if let Some(index) = written(access) {
             return self.stored_write(word, access, index);
         }
@@ -507,6 +510,66 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let storage = self.write_storage(encoding);
         if let (Ok(()), true, Some((value, _))) = (&step, self.position() == before, storage) {
             self.mirrors[stored_write_cell(cell)] = register_read::Cell { readable: 1, value };
+        }
+        step
+    }
+
+    /// MSR CNTV_TVAL_EL0, CNTV_CVAL_EL0 or CNTV_CTL_EL0, or MRS CNTV_CTL_EL0:
+    /// one that completes plainly where it reaches CNTHV_* with no offset
+    /// ([`TIMER_COMPARE`]) opens the timer cells on that storage, once the
+    /// registers show the access did what the native one does.
+    fn timer_access(&mut self, word: u32, access: RegisterAccess) -> Step {
+        const HCR_E2H: u64 = 1 << 34;
+        let before = self.completion_point();
+        let written = self.cpu.state.x.get(usize::from(access.rt())).copied();
+        let written = if access.rt() == ZERO_REGISTER {
+            0
+        } else {
+            written.unwrap_or(0)
+        };
+        let step = self.register_access(word, access);
+        let pstate = self.cpu.pstate;
+        if step.is_err()
+            || self.position() != before
+            || pstate.el != 2
+            || pstate.guarded
+            || timer::agt::present(self.cpu.registers.chip())
+            || self.cpu.read(SystemRegister::HCR_EL2) & HCR_E2H == 0
+        {
+            return step;
+        }
+        let compare = self.cpu.registers.get(SystemRegister::CNTHV_CVAL_EL2, 0);
+        let control = self.cpu.registers.get(SystemRegister::CNTHV_CTL_EL2, 0);
+        let fixed = self.register_fixed_bits(SystemRegister::CNTHV_CTL_EL2);
+        let did = match timer_word(word).map(|(access, _)| access) {
+            Some(TimerWord::Value) => {
+                compare == self.clock.last().wrapping_add(written as u32 as i32 as u64)
+            }
+            Some(TimerWord::Compare) => compare == written,
+            Some(TimerWord::ControlWrite) => control == written & fixed.keep | fixed.set,
+            Some(TimerWord::ControlRead) => {
+                let met = control & timer::ENABLE != 0 && self.clock.last() >= compare;
+                access.rt() == ZERO_REGISTER
+                    || self.cpu.state.x[usize::from(access.rt())]
+                        == control & !timer::ISTATUS | if met { timer::ISTATUS } else { 0 }
+            }
+            None => false,
+        };
+        let storage = (
+            self.cpu
+                .registers
+                .address(SystemRegister::CNTHV_CVAL_EL2, 0),
+            self.cpu.registers.address(SystemRegister::CNTHV_CTL_EL2, 0),
+        );
+        if let (true, (Some(compare), Some(control))) = (did, storage) {
+            self.mirrors[TIMER_COMPARE] = register_read::Cell {
+                readable: 1,
+                value: compare,
+            };
+            self.mirrors[TIMER_CONTROL] = register_read::Cell {
+                readable: 1,
+                value: control,
+            };
         }
         step
     }

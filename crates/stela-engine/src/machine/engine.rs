@@ -928,6 +928,10 @@ pub struct Machine<H: Host, D: Devices> {
     /// The earliest physical count at which a timer signals FIQ; `None` when
     /// a System register write may have changed it.
     timers: Option<Option<u64>>,
+    /// CNTHV_CVAL_EL2 and CNTHV_CTL_EL2 as [`Self::timers`] was computed
+    /// from: native timer writes store there
+    /// (`x86_64::register_read::timer_thunk`), so a change forgets it.
+    timer_registers: [u64; 2],
     /// The EL FP/SIMD traps to, if any; `None` when a System register write
     /// or an EL change may have changed it.
     floating_point: Option<Option<u8>>,
@@ -1370,6 +1374,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             profile_missing: Vec::new(),
             lookup: super::system::Lookup::new(),
             timers: None,
+            timer_registers: [0; 2],
             floating_point: None,
             memory_checks: None,
             native_system: None,
