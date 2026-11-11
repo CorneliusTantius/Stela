@@ -130,7 +130,11 @@ impl RootCpu {
         SAMPLES.fetch_add(1, Ordering::Relaxed);
         self.health.check()?;
         let result = (|| {
-            self.deadline_control.check()?;
+            // No CPUID here: it is slow on every CPU and exits under a
+            // hypervisor. The caller's `affinity` already proved this is the
+            // owning processor (its unique GS record and descriptors), whose
+            // leaves 0, 1 and 6 cannot change; ARAT matters only to the
+            // timer, and `rearm` checks it before every arm.
             // SAFETY: original owner and CPU remain held. Source checks
             // real control/power eligibility around the coherent read.
             let mut raw = unsafe { self.source.read()? };
