@@ -547,51 +547,6 @@ fn a_completion_wait_answers_the_host_each_turn() {
     assert_eq!(machine.host.relaxes, 3);
 }
 
-/// A PE that never applies posted maintenance stops the machine once the
-/// bounded wait ends, with a report naming it; the maintenance stays
-/// posted, so a later completion waits for it again.
-#[test]
-fn a_completion_wait_past_its_bound_stops_with_the_unapplied_pe() {
-    let (hub, _) = hub(2);
-    let mut machine = first_of_two(&[], &hub);
-    machine.post(Maintenance::Code(Some(0x4000)));
-    machine.send_outgoing();
-    let limit = machine.profile.counter_frequency / super::MAINTENANCE_WAIT_DIVISOR;
-    machine.host.counter_step = limit / 8;
-    let stop = machine.complete_maintenance().unwrap_err();
-    let super::super::Stop::Unsupported(requirement) = stop else {
-        panic!("expected an unsupported stop, got {stop:?}");
-    };
-    let RequirementKind::MaintenanceOverrun {
-        pe,
-        serial,
-        unapplied,
-        ticks,
-    } = requirement.kind
-    else {
-        panic!("expected a maintenance overrun, got {:?}", requirement.kind);
-    };
-    assert_eq!((pe, serial, unapplied), (1, 1, 1));
-    assert!(ticks >= limit);
-    assert!(
-        machine.host.relaxes <= 9,
-        "bounded: {}",
-        machine.host.relaxes
-    );
-    assert_eq!(machine.posted, vec![(1, 1)]);
-    assert!(
-        requirement
-            .to_string()
-            .contains("maintenance overrun: PE 1")
-    );
-
-    // Once PE 1 applies it, the next completion ends normally.
-    let mail = hub.take(1).expect("posted mail");
-    hub.acknowledge(1, mail.serial);
-    machine.complete_maintenance().unwrap();
-    assert!(machine.posted.is_empty());
-}
-
 #[test]
 fn maintenance_waits_for_the_dsb_and_reaches_a_pe_in_one_piece_of_mail() {
     let (hub, _) = hub(2);

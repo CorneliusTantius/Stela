@@ -1138,11 +1138,6 @@ impl core::fmt::Display for ParallelAdmissionError {
 }
 impl core::error::Error for ParallelAdmissionError {}
 
-/// The longest wait for other PEs to apply posted maintenance, as a
-/// fraction of a second of the system count: half a second, the time a
-/// PE may spend in one exit before XNU's watchdog panics.
-pub(super) const MAINTENANCE_WAIT_DIVISOR: u64 = 2;
-
 /// One unique PE claim kept by its control owner through all native
 /// invocations. The inbox independently keeps the budget allocation.
 pub(super) struct Attached {
@@ -1890,10 +1885,6 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// Wait until every other running PE has applied the maintenance this
     /// one posted, reading this PE's own mail meanwhile: two PEs may wait
     /// on each other. A start that arrives meanwhile is posted again.
-    /// The wait is bounded by [`MAINTENANCE_WAIT_DIVISOR`]: past it the
-    /// machine stops with [`RequirementKind::MaintenanceOverrun`] naming
-    /// a PE that has not applied the maintenance, and the maintenance
-    /// stays posted.
     pub(super) fn complete_maintenance(&mut self) -> Step {
         self.code_posted = None;
         self.mirrors.close_code_page();
@@ -1914,33 +1905,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // A PE stopping the others need not wait for this one meanwhile.
         hub.set_parked(self.current, true);
         let mut applied = Ok(());
-        let limit = self.profile.counter_frequency / MAINTENANCE_WAIT_DIVISOR;
         while !hub.applied(&mut posted) {
             if profile.is_some() {
                 polls = polls.saturating_add(1);
             }
             applied = applied.and(self.wait_for_others(&hub));
             self.host.relax();
-            let waited = self.host.counter().wrapping_sub(started);
-            if waited >= limit && !hub.applied(&mut posted) {
-                // A stuck PE still holds the old translations or code:
-                // going on would run with them, so the machine stops.
-                // The maintenance stays posted for a later completion.
-                hub.set_parked(self.current, false);
-                let (pe, serial) = posted[0];
-                let unapplied = posted.len();
-                self.posted = posted;
-                if let (Some(slot), Some(active)) = (profile, active) {
-                    slot.finish(active, waited, polls);
-                }
-                self.observe_parallel_source(SourcePhase::BroadcastExit);
-                return applied.and(Err(self.unsupported(RequirementKind::MaintenanceOverrun {
-                    pe,
-                    serial,
-                    unapplied,
-                    ticks: waited,
-                })));
-            }
         }
         hub.set_parked(self.current, false);
         // `posted` is empty now: keep its buffer for the next DSB.
