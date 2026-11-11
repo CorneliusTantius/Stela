@@ -368,6 +368,8 @@ impl<H: Host, D: Devices> Context for Access<'_, H, D> {
                         | Register::TPIDR_EL1
                         | Register::CONTEXTIDR_EL1
                         | Register::CONTEXTIDR_EL2
+                        | Register::TTBR0_EL1
+                        | Register::TTBR0_EL2
                 )
             {
                 self.plain.set(Some((register, index)));

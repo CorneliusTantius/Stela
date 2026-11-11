@@ -9073,6 +9073,7 @@ mod retire_cost;
 mod shared_code;
 mod sharing;
 mod stage2_syndrome;
+mod table_base;
 mod tagged;
 mod thread_switch;
 
