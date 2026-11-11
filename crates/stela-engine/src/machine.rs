@@ -3,8 +3,8 @@
 //! and System registers implemented here and the x86 mechanisms supplied by a
 //! [`Host`].
 pub mod amu;
-pub mod aon;
 pub mod amx;
+pub mod aon;
 mod capabilities;
 pub mod cpu;
 pub mod ctrr;
