@@ -639,7 +639,9 @@ fn a_part_of_interleaved_pages_retires_in_steps_that_visit_each_page_once() {
         "{visits} visits for {} blocks, {indexed} indexed",
         evicted.len()
     );
-    assert!(step <= 1024 + FETCH_PAGE / 4, "{step} visits in one step");
+    // A step stays within its budget, but for one page index list's share.
+    let budget = super::super::code_cache::STEP_VISITS;
+    assert!(step <= budget + FETCH_PAGE / 4, "{step} visits in one step");
     assert!(
         evicted
             .iter()

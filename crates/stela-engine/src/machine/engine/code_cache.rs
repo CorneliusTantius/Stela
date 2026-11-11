@@ -16,10 +16,11 @@ const EVICT_STEP: usize = 32;
 /// of the other PEs' fetches, links and installs, one every ~50 us per PE,
 /// that comes during a step waits for the rest of it, so the waits a
 /// retirement causes grow with the square of its step (build of run
-/// 20261111-025825: 1.2 s of `evict` holds, 4-7 s of waits per beat). A
-/// quarter of that keeps a step under the gap between one PE's
-/// acquisitions.
-pub(super) const STEP_VISITS: u64 = 256;
+/// 20261111-025825: 1.2 s of `evict` holds, 4-7 s of waits per beat). At
+/// 256 a sign-in measured 43 us a step against one acquisition every 37 us
+/// per PE (run 20261111-100711: 2.1 M a beat over 8 PEs); an eighth of the
+/// first keeps a step under that gap.
+pub(super) const STEP_VISITS: u64 = 128;
 
 /// Cells one step of an eviction releases under the board's lock.
 const CELL_STEP: usize = 256;
