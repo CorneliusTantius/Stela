@@ -11,6 +11,7 @@ use core::fmt;
 use stela_drivers::net::LinkError;
 
 pub mod http;
+pub mod ranges;
 pub mod stack;
 pub mod tls;
 
