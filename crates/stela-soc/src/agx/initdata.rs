@@ -86,7 +86,11 @@ impl Root {
         let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
         let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
         if u64_at(0) != magic {
-            return Err(refuse!("GFX initdata root lacks its magic"));
+            return Err(refuse!(
+                "GFX initdata root lacks its magic",
+                found = %format_args!("{:#018x}", u64_at(0)),
+                second = %format_args!("{:#018x}", u64_at(8))
+            ));
         }
         if (u32_at(0x28), u32_at(0x2c)) != ROOT_CONSTANTS {
             return Err(refuse!(
@@ -201,8 +205,8 @@ pub(crate) mod tests {
         kext_root(&mut memory);
         memory.put_u64(ROOT, 0);
         assert_eq!(
-            Root::read(&mut memory, ROOT, MAGIC),
-            Err(refuse!("GFX initdata root lacks its magic"))
+            Root::read(&mut memory, ROOT, MAGIC).unwrap_err().what(),
+            "GFX initdata root lacks its magic"
         );
     }
 

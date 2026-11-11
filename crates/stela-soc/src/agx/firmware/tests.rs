@@ -358,8 +358,13 @@ fn cold_start_status_owns_each_committed_word_across_faults_for_every_modeled_fa
                 )
                 .unwrap();
             assert_eq!(
-                protocol.0.borrow_mut().dma(&mut memory, &mut outbox),
-                Err(refuse!("GFX initdata root lacks its magic"))
+                protocol
+                    .0
+                    .borrow_mut()
+                    .dma(&mut memory, &mut outbox)
+                    .unwrap_err()
+                    .what(),
+                "GFX initdata root lacks its magic"
             );
             assert_eq!(memory.writes, expected);
             kext_root(&mut memory.flat);
@@ -957,8 +962,8 @@ fn each_family_reads_its_own_root_and_g13_refuses_dashboard_signals() {
     g14x.init((MSG_INIT << TYPE_SHIFT) | (ROOT & INIT_VA_BITS))
         .unwrap();
     assert_eq!(
-        g14x.dma(&mut memory, &mut Vec::new()),
-        Err(refuse!("GFX initdata root lacks its magic"))
+        g14x.dma(&mut memory, &mut Vec::new()).unwrap_err().what(),
+        "GFX initdata root lacks its magic"
     );
     assert_eq!(
         with_device_control_on(&G16X, &[]).err(),
@@ -1805,8 +1810,8 @@ fn the_root_must_be_the_kexts_before_any_doorbell_runs() {
         .init((MSG_INIT << TYPE_SHIFT) | (ROOT & INIT_VA_BITS))
         .unwrap();
     assert_eq!(
-        state.dma(&mut memory, &mut Vec::new()),
-        Err(refuse!("GFX initdata root lacks its magic"))
+        state.dma(&mut memory, &mut Vec::new()).unwrap_err().what(),
+        "GFX initdata root lacks its magic"
     );
     assert!(state.dma_pending());
     let mut early = State::new(&G14G);
