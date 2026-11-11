@@ -4540,3 +4540,50 @@ fn boot_log_scan_reads_the_usb_raw_before_the_system_disk() {
         "{error}"
     );
 }
+
+#[test]
+fn setup_boot_log_reads_the_usb_raw_when_its_folder_cannot_be_read() {
+    use crate::boot_log::tests::{fat_volume, region};
+    let mut f = fixture(64 * GIB, false);
+    add_installed_disk(&mut f, &[], &[]);
+    setup(&environment(&f.host), installed_command(&f)).unwrap();
+    let dir = f._dir.path().to_path_buf();
+    let usb_log = region(&["CHOICE 3 (Install macOS)\n"]);
+    raw_partition(&mut f.host, &dir, "disk5s1", &fat_volume(Some(&usb_log)));
+    // The folder holds no log file the host lets setup read.
+    fs::remove_file(f.esp.join(efi::BOOT_LOG)).unwrap();
+    let text = rerun(&f, |c| c.action = Action::BootLog).unwrap();
+    assert!(
+        text.starts_with("Boot log on the USB (Disk disk5 (137.4 GB, "),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "partition disk5s1, EFI/stela/boot.log, read directly): Stela boot log: 1 boots"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("CHOICE 3 (Install macOS)\n"), "{text}");
+    // Without the record, the whole disk is read.
+    fs::remove_file(f.esp.join(RECORD)).unwrap();
+    let text = rerun(&f, |c| c.action = Action::BootLog).unwrap();
+    assert!(text.starts_with("The setup on "), "{text}");
+    assert!(
+        text.contains("so its disk was read directly.\n\n"),
+        "{text}"
+    );
+    assert!(
+        text.ends_with("=== STELA BOOT 1 ===\nCHOICE 3 (Install macOS)\n"),
+        "{text}"
+    );
+    // Other actions still need the record.
+    assert!(rerun(&f, |c| c.action = Action::Status).is_err());
+    // A USB without a log on it names both reasons.
+    raw_partition(&mut f.host, &dir, "disk5s1", &fat_volume(None));
+    let error = format!(
+        "{:#}",
+        rerun(&f, |c| c.action = Action::BootLog).unwrap_err()
+    );
+    assert!(error.contains("has no setup"), "{error}");
+    assert!(error.contains("nor does Disk disk5"), "{error}");
+}

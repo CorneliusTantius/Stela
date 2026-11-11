@@ -707,7 +707,15 @@ impl Request {
             Action::Uninstall => return uninstall(environment, &self.usb, self.dry_run),
             _ => {}
         }
-        let mut record = read_record(environment, &self.usb)?;
+        let mut record = match read_record(environment, &self.usb) {
+            Ok(record) => record,
+            // The logs need no record: its folder may be refused, or its
+            // EFI partition not mounted.
+            Err(error) if matches!(action, Action::BootLog) => {
+                return state::raw_boot_log(environment.host, &self.usb, &error);
+            }
+            Err(error) => return Err(error),
+        };
         // A maintenance `--fetch` downloads the image of the model the setup
         // presents.
         self.model.get_or_insert_with(|| record.model.clone());
