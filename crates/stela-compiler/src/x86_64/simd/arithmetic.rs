@@ -24,9 +24,9 @@ use super::numerical::{
     commit_inexact_underflow, emit_opcode, environment, exponent_range, fpsr_has, jump,
     nonfinite_lane, prepare_vector_input_range, prepare_vector_result_range, read_inputs,
     read_numerical_right, read_numerical_vector, reject_other_status,
-    reject_other_status_but_underflow, resolve, restore_environment, scalar_range_or_zero,
-    sticky_inexact, sticky_result_check, test_control, vector_exponent_range,
-    vector_normal_or_zero_range, zero_product_check,
+    reject_other_status_but_underflow, resolve, restore_environment, scalar_ordered_range,
+    scalar_range_or_zero, sticky_inexact, sticky_result_check, test_control, vector_exponent_range,
+    vector_normal_or_zero_range, vector_ordered_range, zero_product_check,
 };
 use super::{Host, commit, packed, read_vector, shuffle};
 use crate::{
@@ -123,6 +123,9 @@ fn prepare_inputs(code: &mut Code, operand: &Operand) -> u8 {
                 shuffle(code, RIGHT_VECTOR, RIGHT_VECTOR, lanes);
             } else {
                 read_numerical_right(code, operand.format, operand.shape, right, Some(right_lane));
+                // Inactive lanes multiply zeros, so an infinite element
+                // raises no host invalid there.
+                packed(code, Host::MoveQword, RIGHT_VECTOR, RIGHT_VECTOR);
             }
             RIGHT_VECTOR
         }
@@ -144,7 +147,7 @@ fn prepare_inputs(code: &mut Code, operand: &Operand) -> u8 {
     }
 }
 
-/// FNMUL/FABD transform the rounded result. Only finite normal or zero results reach
+/// FNMUL/FABD transform the rounded result. Only normal, zero or infinite results reach
 /// this point, so AH's NaN sign policy stays on the exact helper path.
 fn result_sign(code: &mut Code, operand: &Operand) {
     let negate = match operand.operation {
@@ -239,7 +242,13 @@ fn zero_product(operation: BinaryOperation) -> bool {
 }
 
 /// The full path's status checks distinguish exact zeros from underflowed
-/// nonzero results. Division keeps its existing conservative domain.
+/// nonzero results, and infinite results of an infinite input from
+/// overflow: the host raises overflow for the latter, and invalid for
+/// infinity times zero (FMULX's two included) and infinity minus infinity,
+/// which `reject_other_status` sends to the helper. Neither side raises
+/// status for an infinity with a finite, non-subnormal operand, and its
+/// result is the same infinity in every rounding mode, FZ and AH. Division
+/// keeps its existing conservative domain.
 fn accepts_zero(operation: BinaryOperation) -> bool {
     match operation {
         BinaryOperation::Add
@@ -328,9 +337,10 @@ fn sticky_path(code: &mut Code, operand: &Operand, entry: Entry, target: TargetC
     let inline_end = code.checkpoint();
     let done = jump(code);
     let cold = code.checkpoint();
-    if zero_quotient(operand) {
-        // A zero quotient may be exact: the full path tells, from the
-        // dividend, rather than the helper.
+    if !zero_product(operand.operation) {
+        // A zero quotient may be exact, and an infinite sum or difference
+        // of an infinite input is: the full path tells, from its inputs
+        // and the host's status, rather than the helper.
         let mut full = full;
         full.push(rejected);
         return StickyPath {
@@ -343,16 +353,6 @@ fn sticky_path(code: &mut Code, operand: &Operand, entry: Entry, target: TargetC
         };
     }
     let mut crossing = vec![rejected];
-    if !zero_product(operand.operation) {
-        return StickyPath {
-            full,
-            helper: vec![rejected],
-            done,
-            cold,
-            inline_end,
-            crossing,
-        };
-    }
     let check = code.len();
     resolve(code, rejected, check);
     // With FPSR.UFC set too, a tiny or zero product adds no status, and its
@@ -457,7 +457,14 @@ fn emit_scalar(
     helper.push(branch(code, Condition::NotZero));
     let right = prepare_inputs(code, operand);
     for source in [LEFT_VECTOR, right] {
-        if accepts_zero(operand.operation) || (source == LEFT_VECTOR && zero_quotient(operand)) {
+        if accepts_zero(operand.operation) {
+            helper.push(scalar_ordered_range(
+                code,
+                operand.format,
+                source,
+                INPUT_MINIMUM_EXPONENT,
+            ));
+        } else if source == LEFT_VECTOR && zero_quotient(operand) {
             helper.push(scalar_range_or_zero(
                 code,
                 operand.format,
@@ -485,7 +492,15 @@ fn emit_scalar(
         resolve(code, *strict, strict_start);
     }
     helper.push(reject_other_status(code));
-    let success = if accepts_zero(operand.operation) || zero_quotient(operand) {
+    let success = if accepts_zero(operand.operation) {
+        helper.push(scalar_ordered_range(
+            code,
+            operand.format,
+            LEFT_VECTOR,
+            RESULT_MINIMUM_EXPONENT,
+        ));
+        jump(code)
+    } else if zero_quotient(operand) {
         helper.push(scalar_range_or_zero(
             code,
             operand.format,
@@ -561,7 +576,15 @@ fn emit_vector(
     let right = prepare_inputs(code, operand);
     prepare_vector_input_range(code, operand.format);
     for source in [LEFT_VECTOR, right] {
-        if accepts_zero(operand.operation) || (source == LEFT_VECTOR && zero_quotient(operand)) {
+        if accepts_zero(operand.operation) {
+            vector_ordered_range(
+                code,
+                operand.format,
+                operand.shape,
+                source,
+                ZERO_RANGE_SCRATCH,
+            );
+        } else if source == LEFT_VECTOR && zero_quotient(operand) {
             vector_normal_or_zero_range(
                 code,
                 operand.format,
@@ -602,7 +625,15 @@ fn emit_vector(
     }
     helper.push(reject_other_status(code));
     prepare_vector_result_range(code);
-    if accepts_zero(operand.operation) || zero_quotient(operand) {
+    if accepts_zero(operand.operation) {
+        vector_ordered_range(
+            code,
+            operand.format,
+            operand.shape,
+            LEFT_VECTOR,
+            ZERO_RANGE_SCRATCH,
+        );
+    } else if zero_quotient(operand) {
         vector_normal_or_zero_range(
             code,
             operand.format,

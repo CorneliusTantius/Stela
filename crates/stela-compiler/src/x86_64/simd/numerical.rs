@@ -587,7 +587,32 @@ pub(super) fn scalar_range_or_zero(
     source: u8,
     minimum: u8,
 ) -> usize {
+    scalar_range_or_special(code, format, source, minimum, false)
+}
+
+/// [`scalar_range_or_zero`] that also accepts an infinity of either sign:
+/// every ordered value but a subnormal. Preserves ECX.
+pub(super) fn scalar_ordered_range(
+    code: &mut Code,
+    format: Format,
+    source: u8,
+    minimum: u8,
+) -> usize {
+    scalar_range_or_special(code, format, source, minimum, true)
+}
+
+fn scalar_range_or_special(
+    code: &mut Code,
+    format: Format,
+    source: u8,
+    minimum: u8,
+    infinite: bool,
+) -> usize {
     assert!(format != Format::Half);
+    let infinity = infinite.then(|| {
+        infinity_scalar(code, format, source);
+        branch(code, Condition::Zero)
+    });
     zero_scalar(code, format, source);
     let zero = branch(code, Condition::Zero);
     let maximum = (format.exponent_mask() >> format.fraction_bits()) as u32;
@@ -609,6 +634,9 @@ pub(super) fn scalar_range_or_zero(
     let failed = branch(code, Condition::AboveOrEqual);
     let end = code.len();
     resolve(code, zero, end);
+    if let Some(infinity) = infinity {
+        resolve(code, infinity, end);
+    }
     failed
 }
 

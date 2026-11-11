@@ -186,14 +186,25 @@ fn native_domain(state: &GuestState, operand: &Operand) -> bool {
             | BinaryOperation::NegatedMultiply
             | BinaryOperation::MultiplyExtended
     ) && state.fpcr & (FPCR_FZ | FPCR_AH) == 0;
+    // Infinite inputs and their exact infinite results complete inline for
+    // every form that takes zeros; status of any kind (overflow, invalid)
+    // still exits.
+    let infinite = |raw| raw & !sign_mask(format) == exponent_mask(format);
     (0..operand.shape.lane_count(format)).all(|lane| {
         let (a, b) = inputs(state, operand, lane);
-        let valid = |raw| (1..maximum).contains(&exponent(raw)) || allows_zero && zero(raw);
+        let valid = |raw| {
+            (1..maximum).contains(&exponent(raw)) || allows_zero && (zero(raw) || infinite(raw))
+        };
         let zero_dividend = zero_quotient && zero(a);
         if !(valid(a) || zero_dividend) || !valid(b) {
             return false;
         }
         let outcome = evaluate(format, operand.operation, state.fpcr, a, b).unwrap();
+        // FMULX's infinity times zero is an exact two, but the host raises
+        // invalid for it.
+        if infinite(a) || infinite(b) {
+            return infinite(outcome.bits) && outcome.exceptions == 0;
+        }
         // Products below the minimum normal complete inline under FZ and AH
         // zero, with MXCSR underflow as UFC.
         if tiny_product && outcome.exceptions & !(INEXACT | UNDERFLOW) == 0 {
@@ -221,8 +232,34 @@ fn set_mxcsr(value: u32) {
     }
 }
 
-fn check(mapping: &Mapping, operand: &Operand, mut state: GuestState, caller: u32) -> bool {
-    let fast = native_domain(&state, operand);
+fn check(mapping: &Mapping, operand: &Operand, state: GuestState, caller: u32) -> bool {
+    check_path(mapping, operand, state, caller, false)
+}
+
+/// With `sticky` (default FPCR, IXC set) the sticky path also completes
+/// exact tiny sums inline, so the run decides the path; every lane of
+/// [`native_domain`] must still complete, and either path must match.
+fn check_path(
+    mapping: &Mapping,
+    operand: &Operand,
+    mut state: GuestState,
+    caller: u32,
+    sticky: bool,
+) -> bool {
+    let domain = native_domain(&state, operand);
+    let fast = if sticky {
+        let mut probe = state.clone();
+        let saved = mxcsr();
+        set_mxcsr(caller);
+        // SAFETY: as below.
+        let exit = unsafe { mapping.call_block(&mut probe) };
+        set_mxcsr(saved);
+        let fast = exit.unwrap().next_pc == PC + 12;
+        assert!(fast || !domain, "sticky {operand:?} {state:?}");
+        fast
+    } else {
+        domain
+    };
     let mut expected = state.clone();
     expected.x[8] += 1;
     if fast {
@@ -236,7 +273,9 @@ fn check(mapping: &Mapping, operand: &Operand, mut state: GuestState, caller: u3
     let exit = unsafe { mapping.call_block(&mut state) };
     let actual_csr = mxcsr();
     set_mxcsr(saved);
-    assert_eq!(actual_csr, caller, "MXCSR {operand:?}");
+    // The sticky path leaves host status flags, which nothing reads.
+    let status = if sticky { 0x3f } else { 0 };
+    assert_eq!(actual_csr & !status, caller, "MXCSR {operand:?}");
     let exit = exit.unwrap();
     assert_eq!(
         exit.next_pc,
@@ -312,6 +351,16 @@ fn full_path_zeros_rounding_aliases_and_host_environment_match_completion() {
                     (1 << 32, 0),
                     (exponent_mask(format), 0),
                     (exponent_mask(format) | 1, one),
+                    (exponent_mask(format), one),
+                    (one | sign, exponent_mask(format)),
+                    (exponent_mask(format) | sign, maximum),
+                    (exponent_mask(format), exponent_mask(format)),
+                    (exponent_mask(format), exponent_mask(format) | sign),
+                    (exponent_mask(format) | sign, exponent_mask(format) | sign),
+                    (sign, exponent_mask(format) | sign),
+                    (tiny_normal | sign, exponent_mask(format)),
+                    (exponent_mask(format), 1),
+                    (maximum, maximum | sign),
                 ]
                 .into_iter()
                 .enumerate()
@@ -327,16 +376,34 @@ fn full_path_zeros_rounding_aliases_and_host_environment_match_completion() {
                             FPCR_NEP | FPCR_FZ,
                             FPCR_FZ | FPCR_DN | FPCR_AHP | FPCR_FZ16,
                         ] {
-                            let state = input(&operand, a, b, controls | rc << FPCR_ROUNDING_SHIFT);
-                            if check(
-                                &mapping,
-                                &operand,
-                                state,
-                                [0x1f80, 0, 0xffff, 0x8040][case % 4],
-                            ) {
-                                native += 1;
-                            } else {
-                                helper += 1;
+                            let mut state =
+                                input(&operand, a, b, controls | rc << FPCR_ROUNDING_SHIFT);
+                            // Sticky IXC under default controls takes the
+                            // sticky path, whose rejections reach the full path.
+                            for sticky in [false, true] {
+                                if sticky {
+                                    if controls != 0 || rc != 0 {
+                                        continue;
+                                    }
+                                    state.fpsr |= INEXACT;
+                                }
+                                if check_path(
+                                    &mapping,
+                                    &operand,
+                                    state.clone(),
+                                    // The sticky path runs in the block
+                                    // ABI's power-on MXCSR.
+                                    if sticky {
+                                        0x1f80
+                                    } else {
+                                        [0x1f80, 0, 0xffff, 0x8040][case % 4]
+                                    },
+                                    sticky,
+                                ) {
+                                    native += 1;
+                                } else {
+                                    helper += 1;
+                                }
                             }
                         }
                     }
