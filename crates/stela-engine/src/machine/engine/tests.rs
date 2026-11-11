@@ -3608,6 +3608,8 @@ fn itlb_fills_name_why_the_page_was_missing() {
     assert_eq!(misses(&machine), expected);
     machine.forget_lookups(Reach::Containing(BASE), None);
     assert_eq!(machine.statistics.itlb_drops[..2], [0, 1]);
+    // The page translates at its fetch, not ahead (`refill_dropped`).
+    machine.dropped_refills.clear();
     fetch(&mut machine);
     expected[ItlbMiss::Forgotten as usize] += 1;
     assert_eq!(misses(&machine), expected);
@@ -3637,6 +3639,60 @@ fn itlb_fills_name_why_the_page_was_missing() {
     machine.translate_page(pages[0], key);
     expected[ItlbMiss::Evicted as usize] += 1;
     assert_eq!(misses(&machine), expected);
+}
+
+/// The pages a TLBI by VA drops of a live context walk again at the next
+/// fetch in it, through the translation then current, so no fetch misses on
+/// them: also after a translation change between the two (a new fetch
+/// epoch, the same context). A TLBI ALL renews the context: the new one
+/// takes none of its predecessor's dropped pages and its fetch misses.
+#[test]
+fn pages_a_tlbi_by_va_dropped_walk_again_at_the_next_fetch_in_their_context() {
+    use mmu::tlbi::{Everywhere, Reach};
+    const RET: u32 = 0xd65f_03c0;
+    let mut machine = machine(&[RET]);
+    let fetch = |machine: &mut Machine<FakeHost, NoDevices>| {
+        assert!(matches!(
+            machine.fetch_block(BASE, false),
+            Ok(Fetched::Block(_))
+        ));
+    };
+    let misses = |machine: &Machine<FakeHost, NoDevices>| machine.statistics.itlb_misses;
+    let refilled = |machine: &Machine<FakeHost, NoDevices>| {
+        machine.statistics.itlb_sources[ItlbSource::Refilled as usize]
+    };
+    let page = BASE & !(FETCH_PAGE - 1);
+    fetch(&mut machine);
+    let context = machine.chain.contexts()[chain::half(BASE)];
+    let (expected, mut refills) = (misses(&machine), refilled(&machine));
+    for epoch in [false, true] {
+        machine.forget_lookups(Reach::Containing(BASE), None);
+        assert!(machine.current_key(BASE).is_none());
+        assert_eq!(machine.dropped_refills.get(&context), Some(&vec![page]));
+        if epoch {
+            let generation = machine.translation_generation;
+            machine.permissions_changed();
+            assert_ne!(machine.translation_generation, generation);
+        }
+        fetch(&mut machine);
+        assert_eq!(machine.chain.contexts()[chain::half(BASE)], context);
+        assert_eq!(misses(&machine), expected);
+        refills += 1;
+        assert_eq!(refilled(&machine), refills);
+        assert!(machine.dropped_refills.is_empty());
+        assert!(machine.current_key(BASE).is_some());
+    }
+    machine.forget_lookups(Reach::Containing(BASE), None);
+    machine.tlb_maintained(Reach::All, Everywhere::All, None);
+    // The page translates at its fetch, not ahead (`refill_pages`).
+    machine.pending_refills.clear();
+    fetch(&mut machine);
+    assert_ne!(machine.chain.contexts()[chain::half(BASE)], context);
+    let mut expected = expected;
+    expected[ItlbMiss::Context as usize] += 1;
+    assert_eq!(misses(&machine), expected);
+    assert_eq!(refilled(&machine), refills);
+    assert_eq!(machine.dropped_refills.get(&context), Some(&vec![page]));
 }
 
 /// The live entries of the block table.
@@ -4219,6 +4275,8 @@ fn indirect_branches_go_through_lookups_that_check_the_target() {
     // its block's entry accepts what BTI c is compatible with.
     let unguarded = target_key(&machine, far);
     machine.forget_lookups(mmu::tlbi::Reach::Containing(far), None);
+    // The remap is the fetch cache's alone: no refill walks the tables.
+    machine.dropped_refills.clear();
     let slot = (far / FETCH_PAGE) as usize % FETCH_CACHE;
     machine.fetch[slot].as_mut().unwrap().guarded = true;
     let Ok(Fetched::Block(guarded)) = machine.fetch_block(far, false) else {
@@ -4818,6 +4876,8 @@ fn a_compiled_pac_landing_uses_the_current_sctlr_for_lookup_entries() {
     assert!(machine.fetch_block(pc, false).is_ok());
     // The page mapped guarded, which a TLBI makes known.
     machine.forget_lookups(mmu::tlbi::Reach::Containing(pc), None);
+    // The remap is the fetch cache's alone: no refill walks the tables.
+    machine.dropped_refills.clear();
     let slot = (pc / FETCH_PAGE) as usize % FETCH_CACHE;
     machine.fetch[slot].as_mut().unwrap().guarded = true;
     let Ok(Fetched::Block(index)) = machine.fetch_block(pc, false) else {
