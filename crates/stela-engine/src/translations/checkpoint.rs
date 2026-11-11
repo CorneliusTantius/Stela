@@ -181,9 +181,68 @@ impl Checkpoints {
     }
 }
 
+/// Which PEs waited for an interrupt lately: each PE notes its waits, lock
+/// free, and a look counts those that waited within a window, against the
+/// PEs that ever waited (every PE waits at some point of a boot).
+pub struct Waiters<const N: usize> {
+    /// Counter of each PE's last wait, plus one; zero for a PE never seen.
+    last: [core::sync::atomic::AtomicU64; N],
+}
+
+impl<const N: usize> Waiters<N> {
+    pub const fn new() -> Self {
+        Self {
+            last: [const { core::sync::atomic::AtomicU64::new(0) }; N],
+        }
+    }
+
+    /// PE `pe` waits at counter `now`. PEs past `N` are not counted.
+    pub fn note(&self, pe: usize, now: u64) {
+        if let Some(last) = self.last.get(pe) {
+            last.store(now.saturating_add(1), core::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// The PEs that waited within `window` ticks before `now`, and the PEs
+    /// ever seen waiting.
+    pub fn count(&self, now: u64, window: u64) -> (u32, u32) {
+        let (mut waiting, mut seen) = (0, 0);
+        for last in &self.last {
+            let last = last.load(core::sync::atomic::Ordering::Relaxed);
+            if last != 0 {
+                seen += 1;
+                if now.saturating_sub(last - 1) <= window {
+                    waiting += 1;
+                }
+            }
+        }
+        (waiting, seen)
+    }
+}
+
+impl<const N: usize> Default for Waiters<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waiters_count_the_pes_that_waited_within_the_window() {
+        let waiters: Waiters<4> = Waiters::new();
+        assert_eq!(waiters.count(100, 10), (0, 0));
+        waiters.note(0, 0);
+        waiters.note(1, 95);
+        waiters.note(3, 100);
+        waiters.note(9, 100);
+        assert_eq!(waiters.count(100, 10), (2, 3));
+        assert_eq!(waiters.count(200, 10), (0, 3));
+        waiters.note(0, 199);
+        assert_eq!(waiters.count(200, 10), (1, 3));
+    }
 
     const HZ: u64 = 1000;
 
