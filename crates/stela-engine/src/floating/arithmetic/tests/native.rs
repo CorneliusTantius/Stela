@@ -181,6 +181,12 @@ fn native_domain(state: &GuestState, operand: &Operand) -> bool {
     let zero_quotient = operand.operation == BinaryOperation::Divide
         && operand.shape == Shape::Scalar
         && matches!(operand.inputs, Inputs::Elementwise { .. });
+    let tiny_product = matches!(
+        operand.operation,
+        BinaryOperation::Multiply
+            | BinaryOperation::NegatedMultiply
+            | BinaryOperation::MultiplyExtended
+    ) && state.fpcr & (FPCR_FZ | FPCR_AH) == 0;
     (0..operand.shape.lane_count(format)).all(|lane| {
         let (a, b) = inputs(state, operand, lane);
         let valid = |raw| (1..maximum).contains(&exponent(raw)) || allows_zero && zero(raw);
@@ -189,6 +195,11 @@ fn native_domain(state: &GuestState, operand: &Operand) -> bool {
             return false;
         }
         let outcome = evaluate(format, operand.operation, state.fpcr, a, b).unwrap();
+        // Products below the minimum normal complete inline under FZ and AH
+        // zero, with MXCSR underflow as UFC.
+        if tiny_product && outcome.exceptions & !(INEXACT | UNDERFLOW) == 0 {
+            return exponent(outcome.bits) < maximum;
+        }
         outcome.exceptions & !INEXACT == 0
             && ((2..maximum).contains(&exponent(outcome.bits))
                 || (allows_zero || zero_dividend) && zero(outcome.bits))
