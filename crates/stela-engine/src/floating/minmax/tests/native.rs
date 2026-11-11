@@ -139,8 +139,10 @@ fn eligible(state: &GuestState, operand: &Operand) -> bool {
         (0..count).all(|lane| {
             let bits = read_lane(&state.v[usize::from(source)], format.bits(), lane);
             let exponent = bits & exponent_mask(format);
+            // S/D zeros and infinities (a zero fraction) stay native too.
             (exponent != 0 && exponent != exponent_mask(format))
-                || (format != Format::Half && bits & !sign_mask(format) == 0)
+                || (format != Format::Half
+                    && bits & !(sign_mask(format) | exponent_mask(format)) == 0)
         })
     };
     match *operand {
@@ -383,7 +385,9 @@ fn exceptional_active_lanes_and_enables_exit_before_any_effect() {
                 for (source, lane) in active_inputs(&operand) {
                     let mut state = input(&operand, 0, sign, fpcr);
                     write_lane(&mut state.v[usize::from(source)], format.bits(), lane, bad);
-                    assert!(!eligible(&state, &operand));
+                    // S/D infinities complete natively; `check` compares them.
+                    let infinite = format != Format::Half && bad & !sign == maximum;
+                    assert_eq!(eligible(&state, &operand), infinite);
                     check(&mapping, &operand, state, 0xe07f);
                 }
             }

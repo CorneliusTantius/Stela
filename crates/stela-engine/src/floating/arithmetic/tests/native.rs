@@ -176,10 +176,9 @@ fn native_domain(state: &GuestState, operand: &Operand) -> bool {
     let maximum = exponent_mask(format) >> fraction_bits(format);
     let zero = |raw| raw & !sign_mask(format) == 0;
     let allows_zero = operand.operation != BinaryOperation::Divide;
-    // A scalar quotient of a zero dividend over a normal divisor is an exact
+    // A lane's quotient of a zero dividend over a normal divisor is an exact
     // signed zero, which compiled code completes.
     let zero_quotient = operand.operation == BinaryOperation::Divide
-        && operand.shape == Shape::Scalar
         && matches!(operand.inputs, Inputs::Elementwise { .. });
     (0..operand.shape.lane_count(format)).all(|lane| {
         let (a, b) = inputs(state, operand, lane);
