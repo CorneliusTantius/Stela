@@ -1,13 +1,13 @@
-//! FP min/max: normal-or-zero S/D selection and normal H integer ordering.
+//! FP min/max: normal, zero or infinite S/D selection and normal H integer ordering.
 use super::super::isa::ShiftOpcode;
 use super::numerical::helper_section;
 use super::numerical::{
     Condition, INPUT_MINIMUM_EXPONENT, branch, clear_high_qword, clear_scalar, exponent_range,
     jump, prepare_vector_input_range, read_numerical_vector, resolve, test_control,
-    vector_exponent_range, vector_normal_or_zero_range, zero_scalar,
+    vector_exponent_range, vector_normal_zero_or_infinite_range,
 };
 use super::{Host, commit, packed, packed_imm, read_vector};
-use crate::x86_64::asm::{Code, Gpr, Rm, vector_extensions};
+use crate::x86_64::asm::{Code, Gpr, Rm, ShiftOp, Size, vector_extensions};
 use crate::x86_64::asm::{FloatLanes, FloatOp};
 use crate::{
     GuestAddress, TargetCpu,
@@ -178,10 +178,25 @@ fn exception_guard(code: &mut Code, helper: &mut Vec<usize>) {
     helper.push(branch(code, Condition::NotZero));
 }
 
+/// S/D lanes pass when normal, zero or infinite: MINPS/MAXPS order infinities
+/// as Arm does, without status. Half lanes must be normal (order key).
 fn input_guard(code: &mut Code, format: Format, shape: Shape, source: u8, helper: &mut Vec<usize>) {
     if shape == Shape::Scalar {
         let zero = if format != Format::Half {
-            zero_scalar(code, format, source);
+            // A zero fraction is a zero, an infinity or a normal value.
+            let double = format == Format::Double;
+            let mut asm = code.asm();
+            if double {
+                asm.movq_from_xmm(Gpr::Rax, source);
+            } else {
+                asm.movd_from_xmm(Gpr::Rax, source);
+            }
+            asm.shift_imm(
+                ShiftOp::Shl,
+                Size::of(double),
+                Gpr::Rax,
+                (format.bits() - format.fraction_bits()) as u8,
+            );
             Some(branch(code, Condition::Zero))
         } else {
             None
@@ -196,7 +211,7 @@ fn input_guard(code: &mut Code, format: Format, shape: Shape, source: u8, helper
         if format == Format::Half {
             vector_exponent_range(code, format, shape, source);
         } else {
-            vector_normal_or_zero_range(code, format, shape, source, PAIR_VECTOR);
+            vector_normal_zero_or_infinite_range(code, format, shape, source, PAIR_VECTOR);
         }
         helper.push(branch(code, Condition::NotZero));
     }
@@ -533,5 +548,244 @@ pub(in crate::x86_64) fn emit(
             pairwise_scalar(code, operation, format, destination, source, pc, target);
         }
         Operand::Reduction { .. } => reduction(code, operand, pc, target),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        GuestAddress, GuestState, Options, TargetCpu,
+        aarch64::floating::{FPCR_AH, Format, minmax::MinMaxOperation, minmax::evaluate},
+        block::{BlockProfile, CompilationPlan},
+        x86_64::native::run,
+    };
+    use alloc::vec::Vec;
+
+    const PC: GuestAddress = GuestAddress(0x1000_0000);
+    const RETURN: u64 = 0x4000;
+    const OPERATIONS: [MinMaxOperation; 4] = [
+        MinMaxOperation::Maximum,
+        MinMaxOperation::Minimum,
+        MinMaxOperation::MaximumNumber,
+        MinMaxOperation::MinimumNumber,
+    ];
+    const SINGLES: [u32; 7] = [
+        0x7f80_0000,
+        0xff80_0000,
+        0x3fc0_0000,
+        0xc000_0000,
+        0,
+        0x8000_0000,
+        0x7f7f_ffff,
+    ];
+    const DOUBLES: [u64; 7] = [
+        0x7ff0_0000_0000_0000,
+        0xfff0_0000_0000_0000,
+        0x3ff8_0000_0000_0000,
+        0xc000_0000_0000_0000,
+        0,
+        0x8000_0000_0000_0000,
+        0x7fef_ffff_ffff_ffff,
+    ];
+
+    #[derive(Clone, Copy)]
+    enum Form {
+        Binary,
+        Scalar,
+        Pairwise,
+        PairwiseScalar,
+        Reduction,
+    }
+
+    /// The `form` word for `operation` with Vd = 0, Vn = 1, Vm = 2.
+    fn word(form: Form, operation: MinMaxOperation, double: bool) -> u32 {
+        let minimum = matches!(
+            operation,
+            MinMaxOperation::Minimum | MinMaxOperation::MinimumNumber
+        );
+        let number = matches!(
+            operation,
+            MinMaxOperation::MaximumNumber | MinMaxOperation::MinimumNumber
+        );
+        let registers = 2 << 16 | 1 << 5;
+        match form {
+            Form::Binary | Form::Pairwise => {
+                let base: u32 = if matches!(form, Form::Binary) {
+                    0x4e20_f400
+                } else {
+                    0x6e20_f400
+                };
+                let base = if number { base & !0x3000 } else { base };
+                base | u32::from(minimum) << 23 | u32::from(double) << 22 | registers
+            }
+            Form::Scalar => {
+                let opcode = match (minimum, number) {
+                    (false, false) => 0x4800,
+                    (true, false) => 0x5800,
+                    (false, true) => 0x6800,
+                    (true, true) => 0x7800,
+                };
+                0x1e20_0000 | opcode | u32::from(double) << 22 | registers
+            }
+            Form::PairwiseScalar | Form::Reduction => {
+                let base: u32 = if matches!(form, Form::Reduction) {
+                    0x6e30_f800
+                } else {
+                    0x7e30_f800
+                };
+                let base = if number { base & !0x3000 } else { base };
+                base | u32::from(minimum) << 23 | u32::from(double) << 22 | 1 << 5
+            }
+        }
+    }
+
+    fn targets() -> Vec<TargetCpu> {
+        let host = TargetCpu::detect();
+        let mut targets: Vec<TargetCpu> = [
+            TargetCpu::Baseline,
+            TargetCpu::X86_64_V2,
+            TargetCpu::X86_64_V3,
+        ]
+        .into_iter()
+        .filter(|target| host.supports(*target))
+        .collect();
+        targets.push(host);
+        targets
+    }
+
+    fn compile(word: u32, target: TargetCpu) -> Vec<u8> {
+        let source = [word, 0xd65f_03c0].map(u32::to_le_bytes).concat();
+        CompilationPlan::new(&source, PC, &Options::new(BlockProfile::ORDINARY, target))
+            .unwrap()
+            .compile()
+            .unwrap()
+            .native
+            .x86_64_code
+    }
+
+    fn lanes(vector: [u64; 2], double: bool) -> Vec<u64> {
+        if double {
+            vector.to_vec()
+        } else {
+            vector
+                .iter()
+                .flat_map(|limb| [limb & 0xffff_ffff, limb >> 32])
+                .collect()
+        }
+    }
+
+    fn pack(values: &[u64], double: bool) -> [u64; 2] {
+        let mut vector = [0u64; 2];
+        let per_limb = if double { 1 } else { 2 };
+        for (lane, value) in values.iter().enumerate() {
+            vector[lane / per_limb] |= value << (64 / per_limb * (lane % per_limb));
+        }
+        vector
+    }
+
+    fn expected(
+        form: Form,
+        operation: MinMaxOperation,
+        double: bool,
+        fpcr: u32,
+        n: [u64; 2],
+        m: [u64; 2],
+    ) -> [u64; 2] {
+        let format = if double {
+            Format::Double
+        } else {
+            Format::Single
+        };
+        let lane = |left: u64, right: u64| {
+            let outcome = evaluate(format, operation, fpcr, left, right).unwrap();
+            assert_eq!(outcome.exceptions, 0);
+            outcome.bits
+        };
+        let (n, m) = (lanes(n, double), lanes(m, double));
+        let values: Vec<u64> = match form {
+            Form::Binary => n.iter().zip(&m).map(|(&a, &b)| lane(a, b)).collect(),
+            Form::Scalar => [lane(n[0], m[0])].to_vec(),
+            Form::Pairwise => n
+                .chunks(2)
+                .chain(m.chunks(2))
+                .map(|pair| lane(pair[0], pair[1]))
+                .collect(),
+            Form::PairwiseScalar => [lane(n[0], n[1])].to_vec(),
+            Form::Reduction => [lane(lane(n[0], n[1]), lane(n[2], n[3]))].to_vec(),
+        };
+        pack(&values, double)
+    }
+
+    #[test]
+    fn infinite_lanes_complete_inline_and_match_the_reference() {
+        let forms: [(Form, bool); 9] = [
+            (Form::Binary, false),
+            (Form::Binary, true),
+            (Form::Scalar, false),
+            (Form::Scalar, true),
+            (Form::Pairwise, false),
+            (Form::Pairwise, true),
+            (Form::PairwiseScalar, false),
+            (Form::PairwiseScalar, true),
+            (Form::Reduction, false),
+        ];
+        for target in targets() {
+            for (form, double) in forms {
+                for operation in OPERATIONS {
+                    let word = word(form, operation, double);
+                    let code = compile(word, target);
+                    for fpcr in [0, FPCR_AH] {
+                        for case in 0..343usize {
+                            let pick = |lane: usize| {
+                                let index = (case / 7usize.pow(lane as u32 % 3) + lane) % 7;
+                                if double {
+                                    DOUBLES[index]
+                                } else {
+                                    u64::from(SINGLES[index])
+                                }
+                            };
+                            let count = if double { 2 } else { 4 };
+                            let n: Vec<u64> = (0..count).map(pick).collect();
+                            let m: Vec<u64> = (count..2 * count).map(pick).collect();
+                            let (n, m) = (pack(&n, double), pack(&m, double));
+                            let mut initial = GuestState {
+                                fpcr,
+                                ..GuestState::default()
+                            };
+                            initial.x[30] = RETURN;
+                            initial.v[1] = n;
+                            initial.v[2] = m;
+                            initial.v[0] = [u64::MAX; 2];
+                            let mut actual = initial.clone();
+                            let exit = run(&code, &mut actual);
+                            let context =
+                                alloc::format!("{word:08x} {n:x?} {m:x?} {fpcr:#x} {target:?}");
+                            assert_eq!(exit, RETURN, "{context}");
+                            let mut want = initial.clone();
+                            want.v[0] = expected(form, operation, double, fpcr, n, m);
+                            assert_eq!(actual, want, "{context}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nan_and_subnormal_lanes_still_exit() {
+        for target in targets() {
+            for operation in OPERATIONS {
+                let code = compile(word(Form::Binary, operation, false), target);
+                for special in [0x7fc0_0000u64, 0x0000_0001] {
+                    let mut state = GuestState::default();
+                    state.x[30] = RETURN;
+                    state.v[1] = [0x7f80_0000 | special << 32, 0x3f80_0000];
+                    state.v[2] = [0xff80_0000_ff80_0000, 0x3f80_0000];
+                    let initial = state.clone();
+                    assert_eq!(run(&code, &mut state), PC.0);
+                    assert_eq!(state, initial);
+                }
+            }
+        }
     }
 }

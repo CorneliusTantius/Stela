@@ -864,6 +864,32 @@ pub(super) fn vector_normal_or_zero_range(
     source: u8,
     scratch: u8,
 ) {
+    normal_or_zero_fraction_range(code, format, shape, source, scratch, SIGN_BITS);
+}
+
+/// [`vector_normal_or_zero_range`] that also accepts infinities: a lane
+/// passes when it is normal or its fraction is zero. Subnormals and NaNs
+/// carry a nonzero fraction and still fail.
+pub(super) fn vector_normal_zero_or_infinite_range(
+    code: &mut Code,
+    format: Format,
+    shape: Shape,
+    source: u8,
+    scratch: u8,
+) {
+    let fraction_shift = (format.bits() - format.fraction_bits()) as u8;
+    normal_or_zero_fraction_range(code, format, shape, source, scratch, fraction_shift);
+}
+
+/// Accept normal lanes and lanes whose bits shifted left by `shift` are zero.
+fn normal_or_zero_fraction_range(
+    code: &mut Code,
+    format: Format,
+    shape: Shape,
+    source: u8,
+    scratch: u8,
+    shift: u8,
+) {
     assert!(
         ![
             source,
@@ -881,7 +907,7 @@ pub(super) fn vector_normal_or_zero_range(
         Format::Single => (ShiftOpcode::LeftDword, Host::EqualDword),
         Format::Half => (ShiftOpcode::LeftWord, Host::EqualWord),
     };
-    left.emit(code, VALIDITY_VECTOR, SIGN_BITS);
+    left.emit(code, VALIDITY_VECTOR, shift);
     // The result-range lower bound is one rather than zero. Use an independent
     // zero so output classification still recognizes both signed zeros.
     packed(code, Host::Xor, scratch, scratch);
