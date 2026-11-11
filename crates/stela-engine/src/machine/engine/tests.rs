@@ -3708,10 +3708,11 @@ fn two_address_spaces_mapping_one_frame_share_an_entry() {
     assert_eq!(machine.statistics.fetches[1], fetches[1] + 1);
     assert_eq!(machine.statistics.fetches[4], fetches[4]);
     assert_eq!(table_entries(&machine), entries);
-    // The ITLB holds the page in both contexts, with the one key.
+    // The ITLB holds the page in both contexts, with the one key and the
+    // mark of its global leaf.
     for context in [first, second] {
         let held = machine.itlb.entry(machine.itlb.page_slot(BASE, context));
-        assert_eq!(held, chain::LookupEntry::page(BASE, context, key));
+        assert_eq!(held, chain::LookupEntry::global_page(BASE, context, key));
     }
     // An IC IVAU of the frame forgets the entry for both: the next fetch
     // in either compiles the page again.
