@@ -398,6 +398,43 @@ impl Set {
     }
 }
 
+/// What a boot does with the staged answers on its USB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Use {
+    /// No complete set: Apple's signing server answers over the network.
+    Network,
+    /// A complete set for an erase install whose image downloads: checked
+    /// before the guest starts, with the network open for the image.
+    Checked,
+    /// A complete set for an erase install from the USB's image: checked
+    /// before the guest starts, and no network is opened.
+    Offline,
+    /// An update: the set holds the erase install's requests, which an
+    /// update does not send, so it needs the signing server.
+    Update,
+}
+
+impl Use {
+    pub fn of(set: Option<&Set>, update: bool, remote_image: bool) -> Self {
+        match (set.is_some_and(Set::complete), update, remote_image) {
+            (false, _, _) => Self::Network,
+            (true, true, _) => Self::Update,
+            (true, false, true) => Self::Checked,
+            (true, false, false) => Self::Offline,
+        }
+    }
+
+    /// Whether the install opens no network.
+    pub fn offline(self) -> bool {
+        self == Self::Offline
+    }
+
+    /// Whether the set's dry run ([`Set::check`]) runs before the guest.
+    pub fn checks(self) -> bool {
+        matches!(self, Self::Checked | Self::Offline)
+    }
+}
+
 /// Hears each stored answer a [`Staging`] transport uses: its kind and the
 /// SHA-256 of the request body.
 pub type Report = Box<dyn FnMut(Kind, &str)>;

@@ -721,6 +721,7 @@ impl Experiment {
             signing_network,
         } = services;
         let manifest = inventory(handoff)?;
+        let remote = source.remote.is_some();
         let purpose = match mode {
             Mode::Update => Purpose::Update,
             Mode::Install | Mode::DevelopmentInstall | Mode::Study => Purpose::Erase,
@@ -762,7 +763,6 @@ impl Experiment {
                 Verify::OnRead => "on-read",
             }
         ));
-        let remote = source.remote.is_some();
         let mut store = Store::open(source, manifest, identity)
             .map_err(|error| refuse!("restore store: {error}", %error))?;
         store.set_verify(verify);
@@ -821,8 +821,20 @@ impl Experiment {
                 .ok_or(refuse!("install: the bundle has no boot manifest"))?;
             answers.boot_with(booted.to_vec()).map_err(|error| refuse!("install: the bundle's boot manifest is not personalized for this machine: {error}", %error))?;
             // Before the guest starts, so before the install erases anything.
-            // A partial set is a network install's (`open_host` opened one).
-            if let Some(set) = staged_answers(handoff).filter(|set| set.complete()) {
+            // A partial set is a network install's (`open_host` opened one),
+            // and an update's requests are not the ones staged.
+            let staged = staged_answers(handoff);
+            let used = stela_runtime::restore::tss::staged::Use::of(
+                staged.as_ref(),
+                mode == Mode::Update,
+                remote,
+            );
+            if used == stela_runtime::restore::tss::staged::Use::Update {
+                output::arguments(format_args!(
+                    "TSS STAGED not used: an update's signing requests are not the staged erase install's\n"
+                ));
+            }
+            if let Some(set) = staged.filter(|_| used.checks()) {
                 let ecid = answers.signer.as_ref().map_or(0, |signer| signer.ecid);
                 check_staged(
                     handoff,

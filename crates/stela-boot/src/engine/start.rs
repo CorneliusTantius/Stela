@@ -359,10 +359,15 @@ fn open_host(
     // medium partition also streams its remote image.
     let remote_image = options.install.is_some() && options.install_source.is_none();
     // macOS on the USB and Apple's answers to every signing request the
-    // install makes: the install needs no network, so none is opened.
+    // erase install makes: the install needs no network, so none is opened.
+    // An update sends other requests and needs the signing server.
     let offline = options.install.is_some()
-        && !remote_image
-        && restore::staged_answers(handoff).is_some_and(|set| set.complete());
+        && stela_runtime::restore::tss::staged::Use::of(
+            restore::staged_answers(handoff).as_ref(),
+            options.update_restore,
+            remote_image,
+        )
+        .offline();
     if offline {
         output::arguments(format_args!(
             "INSTALL OFFLINE macOS and Apple's signing answers are on the USB; no network is opened\n"

@@ -358,6 +358,36 @@ fn an_incomplete_or_damaged_set_is_not_complete_or_refuses() {
 }
 
 #[test]
+fn an_update_neither_checks_the_staged_set_nor_goes_offline_with_it() {
+    let mut set = Set::default();
+    for (kind, body) in [
+        (Kind::Cryptex, b"a"),
+        (Kind::RecoveryRoot, b"b"),
+        (Kind::RecoveryPolicy, b"c"),
+    ] {
+        set.insert(kind, body, b"answer".to_vec()).unwrap();
+    }
+    let partial = set.clone();
+    set.policy_nonce = Some([1; 32]);
+    // An update with a complete erase set: no dry run (it would report a
+    // mismatch), and a network for the update's own requests.
+    for remote in [false, true] {
+        let update = Use::of(Some(&set), true, remote);
+        assert_eq!(update, Use::Update);
+        assert!(!update.checks() && !update.offline());
+    }
+    assert_eq!(Use::of(Some(&set), false, false), Use::Offline);
+    assert!(Use::Offline.checks() && Use::Offline.offline());
+    assert_eq!(Use::of(Some(&set), false, true), Use::Checked);
+    assert!(Use::Checked.checks() && !Use::Checked.offline());
+    for update in [false, true] {
+        assert_eq!(Use::of(Some(&partial), update, false), Use::Network);
+        assert_eq!(Use::of(None, update, false), Use::Network);
+    }
+    assert!(!Use::Network.checks() && !Use::Network.offline());
+}
+
+#[test]
 fn a_cryptex_udid_is_the_chip_and_ecid() {
     assert_eq!(
         udid(0x8112, 0x0102_0304_0506_0708).unwrap(),
