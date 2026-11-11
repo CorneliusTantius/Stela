@@ -28,8 +28,9 @@ pub const HEAP_CEILING: u64 = 16 * GIB;
 /// heap's peak past its window's block records does not grow with the
 /// guest: 2111 MiB with 6.7 GiB of guest DRAM and 1987 MiB with 10.4 GiB
 /// (`BEAT peak=2815M` with a 704 MiB window, `peak=2963M` with 976 MiB),
-/// both under the floor's 2304 MiB. (A sixteenth, 1816 MiB, was once too
-/// little for a 16 GiB guest, under today's floor.)
+/// both under the 2304 MiB the floor keeps past its 512 MiB window. (A
+/// sixteenth, 1816 MiB, was once too little for a 16 GiB guest, under
+/// today's floor.)
 const HEAP_SHARE: u64 = 24;
 /// Heap bytes per byte of the board's code window: the shared block records,
 /// successors, recovery rows, index and lookup of the blocks it holds,
