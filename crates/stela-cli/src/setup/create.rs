@@ -496,8 +496,9 @@ pub(super) const SIGNING_NOTE: &str = "Apple's signing service (gs.apple.com) re
     the boot files, and the install asks only for what the USB lacks.";
 
 /// The full installer's promise, and its limit.
-pub(super) const OFFLINE_NOTE: &str = "Full installer: macOS is on the USB, the install needs \
-    no network.";
+pub(super) const OFFLINE_NOTE: &str = "Full installer: macOS and Apple's signing answers are \
+    on the USB. The install checks the answers before it changes a disk and needs a network only \
+    if they do not fit it.";
 /// What is not known yet about the installed system without a network.
 pub(super) const FIRST_START_NOTE: &str = "After the install, macOS may ask for a network the \
     first time it starts: whether Setup Assistant's activation finishes without one is not \
@@ -514,8 +515,8 @@ fn staged(directory: &Path) -> bool {
 
 /// The full installer's promise before setup has asked Apple: it holds only
 /// once every signing answer is on the USB.
-pub(super) const FULL_BEFORE_NOTE: &str = "Full installer: macOS goes on the USB; the install \
-    needs no network once Apple's signing answers are fetched.";
+pub(super) const FULL_BEFORE_NOTE: &str = "Full installer: macOS goes on the USB; once Apple's \
+    signing answers are fetched, the install needs a network only if they do not fit it.";
 
 /// What the wizard says about the network before setup asks Apple; the plan
 /// says the final answer from the written bundles ([`network_notes`]).
@@ -542,8 +543,8 @@ pub(super) fn network_status(remote: bool, restore_bundles: &[PathBuf]) -> &'sta
 }
 
 /// `status`'s install line for a USB that installs without a network.
-pub(super) const STATUS_OFFLINE: &str =
-    "needs no network: macOS and every signing answer are on the USB";
+pub(super) const STATUS_OFFLINE: &str = "macOS and every signing answer are on the USB; the \
+    install checks the answers before it starts and needs a network only if they do not fit";
 
 /// What the plan says about the network: none needed for the install with
 /// macOS and every signing answer on the USB, else why it is needed.

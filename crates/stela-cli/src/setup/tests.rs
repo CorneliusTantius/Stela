@@ -4360,3 +4360,17 @@ fn a_usb_named_by_its_mounted_volume_gets_the_installer_its_size_allows() {
         assert_eq!(!plan.contains("file list only"), full, "{bytes}: {plan}");
     }
 }
+
+#[test]
+fn the_no_network_promise_says_the_install_checks_the_answers_first() {
+    // Setup cannot run the install's dry run (it needs the install's own
+    // nonce and machine), so no message promises more than the check.
+    for message in [
+        create::OFFLINE_NOTE,
+        create::STATUS_OFFLINE,
+        create::FULL_BEFORE_NOTE,
+    ] {
+        assert!(!message.contains("needs no network"), "{message}");
+        assert!(message.contains("only if they do not fit"), "{message}");
+    }
+}

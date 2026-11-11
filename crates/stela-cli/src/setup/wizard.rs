@@ -332,8 +332,8 @@ fn configure_inner(command: &mut Request, host: &dyn Host) -> Result<bool> {
                 ),
                 match full {
                     true => {
-                        "Full · macOS goes on the USB; the install needs no network once \
-                         Apple's signing answers are fetched"
+                        "Full · macOS goes on the USB; the install needs a network only if \
+                         Apple's signing answers do not fit it"
                     }
                     false => "Network · macOS downloads during installation",
                 },
