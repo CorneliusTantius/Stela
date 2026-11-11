@@ -344,6 +344,8 @@ pub struct Counts {
     /// on other PEs ([`super::Statistics::sync_ticks`]), and its waits.
     pub sleep_ticks: u64,
     pub spin_ticks: u64,
+    /// Of `sleep_ticks`, those in the host halt ([`super::Statistics::halt_ticks`]).
+    pub halt_ticks: u64,
     pub sync_ticks: u64,
     pub waits: u64,
     pub broadcasts: u64,
@@ -1867,6 +1869,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             line_ticks: statistics.line_ticks,
             sleep_ticks: statistics.sleep_ticks,
             spin_ticks: statistics.spin_ticks,
+            halt_ticks: statistics.halt_ticks,
             sync_ticks: statistics.sync_ticks,
             waits: statistics.waits,
             broadcasts: statistics.broadcasts,

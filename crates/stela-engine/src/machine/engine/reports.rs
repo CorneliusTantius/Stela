@@ -633,6 +633,10 @@ pub struct Statistics {
     /// granule sends.
     pub sleep_ticks: u64,
     pub spin_ticks: u64,
+    /// Of `sleep_ticks`, those from the timer's arming to the wake in the
+    /// host halt itself, past the halt-poll (`poll_for_wake`): the rest of
+    /// `sleep_ticks` the host core spun.
+    pub halt_ticks: u64,
     /// With every PE on a core of its own: maintenance this PE broadcast,
     /// device accesses it forwarded to the home machine, and the counter
     /// ticks it spent waiting on other PEs for those or parked while the
@@ -708,6 +712,7 @@ impl core::ops::AddAssign for Statistics {
             degraded,
             sleep_ticks,
             spin_ticks,
+            halt_ticks,
             broadcasts,
             forwards,
             sync_ticks,
@@ -835,6 +840,7 @@ impl core::ops::AddAssign for Statistics {
             (&mut self.degraded, degraded),
             (&mut self.sleep_ticks, sleep_ticks),
             (&mut self.spin_ticks, spin_ticks),
+            (&mut self.halt_ticks, halt_ticks),
             (&mut self.broadcasts, broadcasts),
             (&mut self.forwards, forwards),
             (&mut self.sync_ticks, sync_ticks),

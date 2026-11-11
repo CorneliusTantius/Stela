@@ -6611,6 +6611,46 @@ fn idle_polling_follows_how_long_waits_last() {
     assert_eq!(machine.idle_poll, 0);
 }
 
+/// A wait's idle time splits into the halt-poll spin and the host halt:
+/// `halt_ticks` holds only the halt (FakeHost's halt adds 1000 counts).
+#[test]
+fn a_wait_counts_its_host_halt_apart_from_its_poll() {
+    use super::parallel::{Hub, Kick};
+    struct NoKick;
+    impl Kick for NoKick {
+        fn kick(&self, _pe: usize) {}
+    }
+    const WFIT_X1: u32 = 0xd503_1021;
+    // Serialized: no poll, the whole wait is the halt.
+    let mut machine = machine_on(stela_contracts::Chip::AppleM4, &[]);
+    machine.cpu.state.x[1] = 500;
+    wait(&mut machine, WFIT_X1).unwrap();
+    let statistics = &machine.statistics;
+    assert_eq!(
+        (statistics.sleep_ticks, statistics.halt_ticks),
+        (1000, 1000)
+    );
+    // Parallel with a poll of 300 counts read 10 apart: the poll spins
+    // first, and only the halt after it is halted time.
+    let mut machine = machine_on(stela_contracts::Chip::AppleM4, &[]);
+    let hub = Hub::new(1, NoKick);
+    hub.set_live(0, true);
+    machine.enter_parallel(hub).unwrap();
+    machine.host.counter_step = 10;
+    machine.idle_poll = 300;
+    // The timeout falls past the poll, inside the one halt.
+    machine.cpu.state.x[1] = 800;
+    wait(&mut machine, WFIT_X1).unwrap();
+    let statistics = &machine.statistics;
+    assert_eq!(statistics.waits, 1, "{statistics:?}");
+    assert!(
+        (1000..1100).contains(&statistics.halt_ticks),
+        "{statistics:?}"
+    );
+    let spun = statistics.sleep_ticks - statistics.halt_ticks;
+    assert!((300..400).contains(&spun), "{statistics:?}");
+}
+
 /// A RETAB's PAC thunk ends its completion with the exit to the target
 /// in RAX, which the first return through it redirects into a lookup.
 /// Neither the check failures after a block's last exit nor a side exit

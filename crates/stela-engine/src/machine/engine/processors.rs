@@ -439,11 +439,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 };
                 let slept = self.host.counter();
                 if !self.poll_for_wake(slept, until) {
-                    let blocked = self.outside_run(|machine| {
+                    let (blocked, halted) = self.outside_run(|machine| {
+                        let halt = machine.host.counter();
                         machine.host.arm_timer(Some(until));
                         machine.sleep();
-                        machine.host.counter().wrapping_sub(slept)
+                        let woke = machine.host.counter();
+                        (woke.wrapping_sub(slept), woke.wrapping_sub(halt))
                     });
+                    self.statistics.halt_ticks += halted;
                     armed = true;
                     self.tune_idle_poll(blocked);
                 }
