@@ -977,6 +977,9 @@ pub(super) fn identify(
     cpu.pmu = own
         .and_then(|identity| identity.clock)
         .and_then(|clock| Pmu::for_chip(profile.chip, clock, profile.counter_frequency));
+    cpu.aon = own
+        .and_then(|identity| identity.clock)
+        .and_then(|clock| crate::machine::aon::CoreActivity::new(clock, profile.counter_frequency));
     // The activity monitors count the board's core clock, or the counter's
     // frequency where the board gives none (`machine::amu`).
     cpu.amu = (cpu.registers.implemented(Feature::FEAT_AMUv1) == Ok(true)).then(|| {

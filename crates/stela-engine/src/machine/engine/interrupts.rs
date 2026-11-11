@@ -171,12 +171,19 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let retired = self.cpu.retired;
         let pmu_timed = self.cpu.pmu.as_ref().map(|monitor| monitor.timed());
         let amu_timed = self.cpu.amu.as_ref().map(|monitors| monitors.timed());
-        if pmu_timed.is_none() && amu_timed.is_none() {
+        let aon_controls = self
+            .cpu
+            .aon
+            .as_ref()
+            .map(|_| self.cpu.apple.impdef.aon_controls());
+        let aon_counting = self.cpu.aon.as_ref().is_some_and(|aon| aon.counting())
+            || aon_controls.is_some_and(|controls| controls.enabled);
+        if pmu_timed.is_none() && amu_timed.is_none() && !aon_counting {
             return;
         }
         // Without a cycle counter nothing counts time, so the count need not
         // be read.
-        let now = if pmu_timed == Some(true) || amu_timed == Some(true) {
+        let now = if pmu_timed == Some(true) || amu_timed == Some(true) || aon_counting {
             self.now()
         } else {
             0
@@ -186,6 +193,35 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         if let Some(monitors) = self.cpu.amu.as_mut() {
             monitors.sync(now, retired, context.waiting);
+        }
+        if let (Some(aon), Some(controls)) = (self.cpu.aon.as_mut(), aon_controls) {
+            aon.sync(now, retired, context.waiting, controls);
+            self.publish_core_counts();
+        }
+    }
+
+    /// Add the CLPC core performance counts since the last call to the
+    /// board's storage of each counter (`machine::aon`), which the PE's
+    /// native reads and other PEs' window loads read.
+    fn publish_core_counts(&mut self) {
+        let Some(aon) = self.cpu.aon.as_mut() else {
+            return;
+        };
+        let counts = aon.take();
+        for (count, encoding) in counts.into_iter().zip(crate::machine::impdef::AON_COUNTERS) {
+            if count == 0 {
+                continue;
+            }
+            let Some(address) = self.devices.register_storage(self.current, encoding) else {
+                continue;
+            };
+            // SAFETY: `Devices::register_storage` gives the address of the
+            // aligned 64-bit word the register reads, valid for the board's
+            // life (`LocalRegisters::storage`); the board keeps each counter
+            // as an atomic word (`platform::apple::core_counters`), which
+            // other PEs load concurrently, so it is accessed atomically.
+            let word = unsafe { core::sync::atomic::AtomicU64::from_ptr(address as *mut u64) };
+            word.fetch_add(count, core::sync::atomic::Ordering::Relaxed);
         }
     }
 
