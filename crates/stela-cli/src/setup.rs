@@ -593,10 +593,24 @@ fn revision_mismatch(environment: &Environment<'_>, record: &Record) -> Option<S
 
 impl Request {
     fn run(mut self) -> Result<()> {
-        // A Windows relaunch opens its own window, which only the wizard wants.
-        let elevate = cfg!(unix) || self.usb.as_os_str().is_empty();
+        // A Windows relaunch opens its own window, which only the wizard
+        // and `boot-log`, whose raw disk reads need administrator rights,
+        // want.
+        let boot_log = matches!(self.action, Action::BootLog);
+        let elevate = cfg!(unix) || self.usb.as_os_str().is_empty() || boot_log;
         if elevate && !self.dry_run && elevation::relaunch()? {
+            if boot_log {
+                eprintln!(
+                    "Reading the disks needs administrator rights: the boot log opens in a new \
+                     window."
+                );
+            }
             return Ok(());
+        }
+        // Without a USB, `boot-log` reads every disk.
+        if boot_log && self.usb.as_os_str().is_empty() {
+            let logs = crate::boot_log::scan(&host::System)?;
+            return crate::boot_log::write_logs(&logs, true, self.output.as_deref());
         }
         debug_assert_eq!(
             stela_loader::boot_bundle::SCHEMA_VERSION,

@@ -53,7 +53,8 @@ enum Command {
     #[command(subcommand)]
     State(State),
     /// Print the boot logs: the USB's own, then the one stela.efi keeps in
-    /// the install's machine state.
+    /// the install's machine state. Without --usb, every disk of this
+    /// computer is read directly.
     BootLog(BootLog),
     /// Change the settings of an existing setup.
     Configure(Configure),
@@ -254,11 +255,21 @@ impl Machine {
     }
 }
 
-/// `boot-log`: an install's machine state, and where the report goes.
+/// `boot-log`: the setup and install to read, and where the report goes.
 #[derive(Args)]
 struct BootLog {
-    #[command(flatten)]
-    machine: Machine,
+    /// The USB's EFI partition, or another mounted volume of the same USB.
+    /// Without it, every disk of this computer is read directly, so the USB
+    /// only needs to be plugged in.
+    #[arg(long, value_parser = clap::builder::OsStringValueParser::new().map(PathBuf::from))]
+    usb: Option<PathBuf>,
+    /// With --usb: the install to read (the default install otherwise).
+    #[arg(long, requires = "usb")]
+    install: Option<String>,
+    /// The install's machine-state partition, when this computer names it
+    /// differently than setup found it by its GUID and disk serial.
+    #[arg(long, value_parser = partition_name, requires = "usb", hide = true)]
+    nor: Option<String>,
     /// Write the logs to this file instead of the terminal, to attach to a
     /// report.
     #[arg(short, long, value_name = "FILE")]
@@ -268,8 +279,12 @@ struct BootLog {
 impl BootLog {
     fn request(self) -> Request {
         Request {
+            action: Action::BootLog,
+            usb: self.usb.unwrap_or_default(),
+            install: self.install,
+            nor: self.nor,
             output: self.output,
-            ..self.machine.request(Action::BootLog)
+            ..Request::default()
         }
     }
 }

@@ -4420,6 +4420,28 @@ fn boot_log_report_goes_to_the_output_file() {
     assert!(save_report(&dir.path().join("no/such/file"), "").is_err());
 }
 
+#[test]
+fn boot_log_without_a_usb_reads_every_disk() {
+    use clap::Parser as _;
+    let parse = |words: &[&str]| {
+        crate::Cli::try_parse_from(["stela", "setup", "boot-log"].iter().chain(words)).map(|cli| {
+            match cli.command {
+                crate::Command::Setup(setup) => setup.request(),
+                _ => panic!("not a setup"),
+            }
+        })
+    };
+    let request = parse(&["-o", "log.txt"]).unwrap();
+    assert!(matches!(request.action, Action::BootLog));
+    assert!(request.usb.as_os_str().is_empty());
+    assert_eq!(request.output.as_deref(), Some(Path::new("log.txt")));
+    // An install is chosen on a setup's USB only.
+    assert!(parse(&["--install", "macOS"]).is_err());
+    let request = parse(&["--usb", "E:\\", "--install", "macOS"]).unwrap();
+    assert_eq!(request.usb, Path::new("E:\\"));
+    assert_eq!(request.install.as_deref(), Some("macOS"));
+}
+
 /// Partition `identifier` of its disk, backed by an image file holding
 /// `bytes`.
 fn raw_partition(host: &mut FakeHost, dir: &Path, identifier: &str, bytes: &[u8]) {
