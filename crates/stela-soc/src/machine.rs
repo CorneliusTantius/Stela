@@ -16,7 +16,7 @@ mod usb;
 pub use transfer_times::{PartTime, TRANSFER_PARTS};
 
 use crate::Result;
-pub use crate::pmu::RtcEpoch;
+pub use crate::pmu::{RtcAnchor, RtcEpoch};
 use crate::usb::{
     Function, Speed,
     ecm::Ecm,
@@ -243,6 +243,12 @@ pub struct AppleDevices {
     rtc_clock: Option<pmu::RtcClock>,
     /// Every PMU's oscillator, the RTC's among them.
     pmu_clocks: Vec<pmu::RtcClock>,
+    /// The host's wall time and the machine state's anchor this boot's
+    /// upcount started from, for the anchors it keeps (`rtc_anchor`).
+    rtc_origin: Option<(
+        Option<stela_soc_data::pmu::WallClock>,
+        Option<pmu::RtcAnchor>,
+    )>,
     /// The latest count a board entry was given, and the entry; the first
     /// entry given an earlier count, with it, for the stop it causes.
     time_seen: Cell<(u64, &'static str)>,
@@ -668,6 +674,7 @@ impl AppleDevices {
             sleep: sleep::SocSleep::for_boot_processor(boot_processor),
             rtc_clock: None,
             pmu_clocks: Vec::new(),
+            rtc_origin: None,
             time_seen: Cell::new((0, "start")),
             time_regression: Cell::new(None),
             inline_keys: crate::inline_key::Engine::default(),
