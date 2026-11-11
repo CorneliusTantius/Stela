@@ -575,6 +575,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let context = stored
             .is_some()
             .then(|| self.stored_context(variant, &preparation, page));
+        // Compiled at another PC of the same page content before: proven
+        // once compiled here ([`super::rebase`]).
+        let mut prove = false;
         if let (Some((key, record)), Some(context)) = (&stored, &context) {
             // The machine's buffers take the entry's relocated code: an
             // install from the store allocates nothing.
@@ -631,6 +634,45 @@ impl<H: Host, D: Devices> Machine<H, D> {
                         )
                         .map(Some);
                 }
+            }
+            // The same page content, compiled at another address of this
+            // boot: its proven entry, rebased to this page.
+            match self.code.rebases.look(key, offset as u16, context, pc) {
+                super::rebase::Found::Entry(entry) => {
+                    if entry.input.len() > available && !whole {
+                        return Ok(None);
+                    }
+                    let mut relocated = core::mem::take(&mut self.relocated);
+                    if entry.relocate(page, source, &mut relocated) {
+                        if usize::from(entry.source_bytes) > available {
+                            self.relocated = relocated;
+                            return Ok(None);
+                        }
+                        self.code.rebases.hit();
+                        self.count_store_source(StoreSource::Rebased);
+                        let origin = Arc::new(recovery::StoredOrigin {
+                            key: *key,
+                            context: *context,
+                            page,
+                            preparation: preparation.clone(),
+                            kept: Some(entry.clone()),
+                        });
+                        let installed = self
+                            .install(
+                                pc,
+                                physical,
+                                variant,
+                                source,
+                                recovery::Template::stored(&entry, &relocated, origin),
+                            )
+                            .map(Some);
+                        self.relocated = relocated;
+                        return installed;
+                    }
+                    self.relocated = relocated;
+                }
+                super::rebase::Found::Prove => prove = true,
+                super::rebase::Found::Compile => {}
             }
         }
         let started = self.host.counter();
@@ -693,6 +735,22 @@ impl<H: Host, D: Devices> Machine<H, D> {
             compiled,
             preparation,
         ));
+        if prove
+            && !self.host.memory_low()
+            && let (Some((key, _)), Some(context)) = (&stored, &context)
+        {
+            let proving = self.host.counter();
+            let entry = Offer::prove_block(
+                &emission.block,
+                &emission.input,
+                page,
+                pc,
+                *context,
+                &emission.preparation,
+            );
+            self.code.rebases.keep(key, offset as u16, context, entry);
+            self.statistics.compile_ticks += self.host.counter().wrapping_sub(proving);
+        }
         // An offer is kept until the store proves it. With memory low the
         // store holds no more for proof, but the other PEs still take the
         // block: this one retains the emission anyway, and each reuse saves

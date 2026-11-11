@@ -1198,10 +1198,12 @@ impl Heartbeat {
             // Per PE: its installs at EL0 and then above EL0 by where the
             // block came from: compiled in a page the store keys (offered
             // to it), compiled where it keys none (one instruction, a
-            // device-site page), taken from the pack, taken from another PE.
+            // device-site page), taken from the pack, taken from another
+            // PE, rebased from an entry proven at another address during
+            // the boot.
             let mut store = String::from(concat!(
-                "PES STORE user_compiled/user_unstorable/user_pack/user_shared",
-                "/kernel_compiled/kernel_unstorable/kernel_pack/kernel_shared",
+                "PES STORE user_compiled/user_unstorable/user_pack/user_shared/user_rebased",
+                "/kernel_compiled/kernel_unstorable/kernel_pack/kernel_shared/kernel_rebased",
             ));
             let mut stamped = String::from(
                 "PES STAMPED hits/miss_epoch/miss_context/miss_interrupt/restamped/changed/promoted",
@@ -1582,7 +1584,8 @@ fn board_code(
     let churn = now.churn.since(&was.churn);
     let churn = format!(
         " churn=new/ring/ivau/slot/other:{}/{}/{}/{}/{} same_bytes={} \
-         ages=turn/four/older:{}/{}/{} aliases=pc/variant:{}/{} ghosts_overwritten={}",
+         ages=turn/four/older:{}/{}/{} aliases=pc/variant:{}/{} ghosts_overwritten={} \
+         rebased=hits/proven/unprovable/kib:{}/{}/{}/{}",
         churn.new,
         churn.again[0],
         churn.again[1],
@@ -1595,6 +1598,12 @@ fn board_code(
         churn.aliases,
         churn.variants,
         churn.overwritten,
+        now.rebases.hits.saturating_sub(was.rebases.hits),
+        now.rebases.proven.saturating_sub(was.rebases.proven),
+        now.rebases
+            .unprovable
+            .saturating_sub(was.rebases.unprovable),
+        now.rebases.bytes / 1024,
     );
     // The parts young and tenured code hold, installs sent to the tenured
     // generation, and parts taken away: the oldest young one, the tenured

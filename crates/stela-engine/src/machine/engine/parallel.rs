@@ -318,7 +318,7 @@ pub struct Counts {
     pub loops: [u64; 3],
     /// Its installs at EL0 and above by where the block came from
     /// ([`super::Statistics::store_sources`]).
-    pub store_sources: [[u64; 4]; 2],
+    pub store_sources: [[u64; 5]; 2],
     /// Blocks it holds, the slots its block table has, the pages its
     /// index finds blocks in, and the parts of its code arena it released
     /// for heap pressure.

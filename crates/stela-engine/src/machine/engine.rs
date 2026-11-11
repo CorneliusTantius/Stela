@@ -66,9 +66,11 @@ pub use parallel::{
     LockTimes, MaterializedSource, ParallelAdmissionError, SharedDevices, SourceObservation,
     SourcePhase,
 };
+pub use rebase::RebaseCounts;
 pub use stela_contracts::dma::{DmaError, TransferFault};
 mod pointer;
 mod prepare;
+mod rebase;
 pub use device_read::{CanonicalDeviceMemory, ConsumedScalar, DeviceReadRequest, DeviceReadShape};
 pub use device_write::{
     CanonicalDeviceWrite, CanonicalWriteMemory, ConsumedWrite, DeviceWriteRequest, DeviceWriteShape,

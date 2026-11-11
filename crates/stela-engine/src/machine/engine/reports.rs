@@ -369,13 +369,16 @@ pub(super) enum StoreSource {
     Pack,
     /// Compiled by another PE of this boot and installed here.
     Shared,
+    /// Relocated from an entry proven during this boot, compiled at
+    /// another address of the same page content ([`super::rebase`]).
+    Rebased,
 }
 
 impl StoreSource {
-    pub(super) const COUNT: usize = 4;
+    pub(super) const COUNT: usize = 5;
 }
 
-const _: () = assert!(StoreSource::Shared as usize + 1 == StoreSource::COUNT);
+const _: () = assert!(StoreSource::Rebased as usize + 1 == StoreSource::COUNT);
 
 /// Why the ITLB lacked a page it then took ([`Statistics::itlb_misses`]): a
 /// fill of another page took its entry's place, a TLBI by VA dropped it,
