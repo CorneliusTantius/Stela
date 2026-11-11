@@ -574,6 +574,8 @@ impl Igc {
                     let link = self.device.read32(ICR) & IMS_LSC != 0;
                     self.device.write32(EIMS, 1 << VECTOR);
                     if link {
+                        // This read cleared the cause the watchdog reads.
+                        self.link.link_changed();
                         self.watchdog()?;
                     }
                 }
