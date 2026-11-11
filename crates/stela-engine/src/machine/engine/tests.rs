@@ -6574,31 +6574,24 @@ fn what_follows_a_pac_exit_keeps_its_thunk() {
     }
 }
 
+/// The patch point of block `index`'s exit to the target in RAX.
+fn dynamic_point(machine: &Machine<FakeHost, NoDevices>, index: usize) -> u64 {
+    chain::dynamic_patch(machine.code.blocks[index].dynamic_site.unwrap().get())
+}
+
+/// A plain RET's exit goes through a lookup tail to the table probe: its
+/// sites are the most numerous and the most often polymorphic.
 #[test]
-fn pac_returns_go_through_a_lookup_dispatcher() {
-    const RETAB: u32 = 0xd65f_0fff;
-    let mut machine = machine(&[RETAB]);
+fn plain_returns_go_through_a_lookup_dispatcher() {
+    const RET: u32 = 0xd65f_03c0;
+    let mut machine = machine(&[RET]);
     let base = machine.cpu.pc;
     machine.host.exits = vec![NativeExit::Exit {
         next_pc: base + 0x2000,
         kind: ExitKind::Return as u64,
     }];
     machine.step().unwrap();
-    let thunk = x86_64_pointer::thunk(
-        x86_64_pointer::Form::of(block::PointerAuthenticationOperation::ReturnIbSp).unwrap(),
-        GuestAddress(base),
-        TAGS,
-        SERVICE as usize as u64,
-    );
-    let at = machine
-        .host
-        .installed
-        .iter()
-        .position(|code| *code == thunk.code)
-        .unwrap()
-        + 1;
-    let at = at * NATIVE_CODE_STRIDE;
-    let site = chain::dynamic_patch((at + thunk.dynamic.unwrap()) as u64);
+    let site = dynamic_point(&machine, 0);
     // The probes, then the RET's own tail, which calls the table probe.
     let installed = machine.host.installed.len();
     let dispatcher = chain::dispatching_dispatcher(0, machine.target).unwrap();
@@ -6623,103 +6616,202 @@ fn pac_returns_go_through_a_lookup_dispatcher() {
         ),
         (1, 0)
     );
-    assert!(!machine.code.blocks.record(0).dynamic_open());
+    let record = machine.code.blocks.record(0);
+    assert!(!record.dynamic_open() && !record.ways_open());
+    assert!(machine.code.cache().ways.is_empty());
 }
 
-/// The first branch through a BRAA X16, X17's PAC thunk gives its exit a
-/// tail of its own that predicts the authenticated target: its direct exit
-/// to it is linked through a cell, with the probes of the branch's BTYPE,
-/// before the exit jumps to the tail; any other target takes the table
-/// probe, as a lookup tail sends it.
+/// The first transfer through a RETAB's or a BRAA X16, X17's PAC thunk, or
+/// a plain BR's exit, gives the exit an inline cache of its targets: the
+/// miss, which exits to the engine and holds the lookup tail, then a way
+/// for the target, whose direct exit is linked through a cell with the
+/// probes of the branch's BTYPE, before the exit jumps to the way.
 #[test]
-fn pac_branches_take_a_predicted_tail_linked_through_a_cell() {
+fn branches_take_ways_linked_through_cells() {
+    const RETAB: u32 = 0xd65f_0fff;
     const BRAA: u32 = 0xd71f_0a11; // braa x16, x17
-    let mut machine = machine(&[BRAA]);
-    let base = machine.cpu.pc;
-    let target = base + 0x2000;
-    machine.host.exits = vec![NativeExit::Exit {
-        next_pc: target,
-        kind: ExitKind::Indirect as u64,
-    }];
-    machine.step().unwrap();
-    let thunk = x86_64_pointer::thunk(
-        x86_64_pointer::Form::of(block::PointerAuthenticationOperation::Branch {
-            key: block::PointerAuthenticationKey::Ia,
-            target: 16,
-            modifier: block::PointerAuthenticationModifier::Register(17),
-            link: false,
-        })
-        .unwrap(),
-        GuestAddress(base),
-        TAGS,
-        SERVICE as usize as u64,
-    );
-    let at = machine
-        .host
-        .installed
-        .iter()
-        .position(|code| *code == thunk.code)
-        .unwrap()
-        + 1;
-    let at = at * NATIVE_CODE_STRIDE;
-    let site = chain::dynamic_patch((at + thunk.dynamic.unwrap()) as u64);
-    // The probes of BTYPE 0b01, the predicted tail, then its exit's cell
-    // tail.
-    let installed = machine.host.installed.len();
-    assert_eq!(
-        machine.host.installed[installed - 3],
-        chain::dispatching_dispatcher(0b01, machine.target).unwrap()
-    );
-    let probes = ((installed - 2) * NATIVE_CODE_STRIDE) as u64;
-    let tail = ((installed - 1) * NATIVE_CODE_STRIDE) as u64;
-    let cell_tail = (installed * NATIVE_CODE_STRIDE) as u64;
-    let predicted = chain::predicted_tail(
-        tail,
-        GuestAddress(target),
-        ExitKind::Indirect,
-        1,
-        probes + chain::PROBE_ENTRY as u64,
-    )
-    .unwrap();
-    let exit = chain::direct_patch(tail + chain::PREDICTED_EXIT as u64);
-    let cell = machine
-        .code
-        .cache()
-        .targets
-        .site_cell(exit)
-        .expect("the predicted exit's cell");
-    assert_eq!(cell.pc, target);
-    let patches = machine.host.patches.len();
-    let linked = &machine.host.patches[patches - 4..];
-    assert_eq!(linked[0], (tail as usize, predicted.to_vec()));
-    assert_eq!(linked[1].0, cell_tail as usize);
-    assert_eq!(linked[1].1.len(), chain::CELL_TAIL_BYTES);
-    assert_eq!(
-        linked[2],
-        (
-            exit as usize,
-            chain::jump(exit, cell_tail).unwrap().to_vec()
-        )
-    );
-    assert_eq!(
-        linked[3],
-        (site as usize, chain::jump(site, tail).unwrap().to_vec())
-    );
-    assert_eq!(
-        (
-            machine.statistics.lookups,
-            machine.statistics.predicted_tails,
-            machine.statistics.links
-        ),
-        (1, 1, 1)
-    );
-    assert!(!machine.code.blocks.record(0).dynamic_open());
+    const BR: u32 = 0xd61f_0100; // br x8
+    for (word, kind, btype) in [
+        (RETAB, ExitKind::Return, 0),
+        (BRAA, ExitKind::Indirect, 0b01),
+        (BR, ExitKind::Indirect, 0b01),
+    ] {
+        let mut machine = machine(&[word]);
+        let base = machine.cpu.pc;
+        let target = base + 0x2000;
+        machine.host.exits = vec![NativeExit::Exit {
+            next_pc: target,
+            kind: kind as u64,
+        }];
+        machine.step().unwrap();
+        let site = dynamic_point(&machine, 0);
+        // The probes of the BTYPE, the miss, the way, then its exit's cell
+        // tail.
+        let installed = machine.host.installed.len();
+        assert_eq!(
+            machine.host.installed[installed - 4],
+            chain::dispatching_dispatcher(btype, machine.target).unwrap(),
+            "{word:#x}"
+        );
+        let probes = ((installed - 3) * NATIVE_CODE_STRIDE) as u64;
+        let miss = ((installed - 2) * NATIVE_CODE_STRIDE) as u64;
+        let way = ((installed - 1) * NATIVE_CODE_STRIDE) as u64;
+        let cell_tail = (installed * NATIVE_CODE_STRIDE) as u64;
+        let miss_code = chain::way_miss(miss, kind, 1, probes + chain::PROBE_ENTRY as u64).unwrap();
+        let (way_code, point) = chain::way(way, GuestAddress(target), kind, miss).unwrap();
+        let exit = chain::direct_patch(way + chain::WAY_EXIT as u64);
+        let cell = machine
+            .code
+            .cache()
+            .targets
+            .site_cell(exit)
+            .expect("the way's exit's cell");
+        assert_eq!(cell.pc, target);
+        let patches = machine.host.patches.len();
+        let linked = &machine.host.patches[patches - 5..];
+        assert_eq!(linked[0], (miss as usize, miss_code.to_vec()));
+        assert_eq!(linked[1], (way as usize, way_code.to_vec()));
+        assert_eq!(linked[2].0, cell_tail as usize);
+        assert_eq!(linked[2].1.len(), chain::CELL_TAIL_BYTES);
+        assert_eq!(
+            linked[3],
+            (
+                exit as usize,
+                chain::jump(exit, cell_tail).unwrap().to_vec()
+            )
+        );
+        assert_eq!(
+            linked[4],
+            (site as usize, chain::jump(site, way).unwrap().to_vec())
+        );
+        assert_eq!(
+            (
+                machine.statistics.lookups,
+                machine.statistics.predicted_tails,
+                machine.statistics.links
+            ),
+            (1, 1, 1)
+        );
+        let record = machine.code.blocks.record(0);
+        assert!(!record.dynamic_open() && record.ways_open());
+        let ways = machine.code.cache().ways[&0];
+        assert_eq!(
+            (ways.site, ways.next, ways.miss),
+            (site, way + point as u64, miss)
+        );
+        assert_eq!((ways.held, ways.targets[0]), (1, target));
+    }
 }
 
-/// A hot BRAA X16, X17 exit's predicted direct exit gets a stamped tail
-/// that names its BTYPE with the block, through the probes of that BTYPE,
-/// but only while the block it would enter accepts the BTYPE; else it
-/// keeps its cell tail, whose probe refuses the block.
+/// A BRAA X16, X17 whose targets each return to it: each new target its
+/// ways' miss sends to the engine gets a way after the others, a target
+/// they hold gets none, and one past `chain::WAYS` targets sends the exit
+/// to the miss's lookup tail for good. Ways a block before it in the slot
+/// left are dropped instead.
+#[test]
+fn ways_fill_on_misses_then_give_way_to_the_lookup() {
+    const BRAA: u32 = 0xd71f_0a11; // braa x16, x17
+    const RET: u32 = 0xd65f_03c0;
+    for stale in [false, true] {
+        let pages = chain::WAYS + 2;
+        let mut words = vec![0; 1024 * pages + 1];
+        words[0] = BRAA;
+        let targets: Vec<usize> = (1..pages).collect();
+        for &page in &targets {
+            words[1024 * page] = RET;
+        }
+        let mut machine = machine(&words);
+        let base = machine.cpu.pc;
+        let target = |page: usize| base + 0x1000 * page as u64;
+        // Each target, then the first again, which a way holds.
+        let order: Vec<usize> = (1..pages).take(2).chain([1]).chain(2..pages).collect();
+        machine.host.exits = order
+            .iter()
+            .flat_map(|&page| {
+                [
+                    NativeExit::Exit {
+                        next_pc: target(page),
+                        kind: ExitKind::Indirect as u64,
+                    },
+                    NativeExit::Exit {
+                        next_pc: base,
+                        kind: ExitKind::Return as u64,
+                    },
+                ]
+            })
+            .collect();
+        let mut held = Vec::new();
+        for &page in &order {
+            if stale && held.len() == 1 {
+                machine.code.cache().ways.get_mut(&0).unwrap().incarnation ^= 1;
+            }
+            let before = machine.code.cache().ways.get(&0).copied();
+            machine.step().unwrap();
+            let site = dynamic_point(&machine, 0);
+            let record = machine.code.blocks.record(0);
+            if stale && before.is_some_and(|ways| ways.held == 1) {
+                // No way was added; the exit keeps the way it has.
+                assert!(!record.ways_open());
+                assert!(machine.code.cache().ways.is_empty());
+                assert_eq!(machine.statistics.ways_added, 0);
+                break;
+            }
+            if !held.contains(&target(page)) {
+                held.push(target(page));
+            }
+            if held.len() <= chain::WAYS {
+                let ways = machine.code.cache().ways[&0];
+                assert_eq!(ways.targets[..held.len()], held[..]);
+                assert_eq!(machine.statistics.ways_added, held.len() as u64 - 1);
+                assert!(record.ways_open());
+                if held.len() > 1
+                    && let Some(before) = before
+                    && before.held != ways.held
+                {
+                    // The last way's patch point jumped to the new way.
+                    let patches = &machine.host.patches;
+                    let way = patches
+                        .iter()
+                        .rfind(|(_, bytes)| bytes.len() == chain::WAY_BYTES)
+                        .unwrap()
+                        .0 as u64;
+                    assert_eq!(
+                        patches.last().unwrap(),
+                        &(
+                            before.next as usize,
+                            chain::jump(before.next, way).unwrap().to_vec()
+                        )
+                    );
+                }
+            } else {
+                // Demoted: the exit jumps to the miss's lookup tail.
+                let before = before.unwrap();
+                assert_eq!(
+                    machine.host.patches.last().unwrap(),
+                    &(
+                        site as usize,
+                        chain::jump(site, before.miss + chain::MISS_LOOKUP as u64)
+                            .unwrap()
+                            .to_vec()
+                    )
+                );
+                assert_eq!(machine.statistics.ways_demoted, 1);
+                assert!(!record.ways_open());
+                assert!(machine.code.cache().ways.is_empty());
+            }
+            machine.step().unwrap();
+        }
+        if !stale {
+            assert_eq!(machine.statistics.ways_demoted, 1);
+            assert_eq!(machine.statistics.ways_added, chain::WAYS as u64 - 1);
+        }
+    }
+}
+
+/// A hot BRAA X16, X17 way's direct exit gets a stamped tail that names
+/// its BTYPE with the block, through the probes of that BTYPE, but only
+/// while the block it would enter accepts the BTYPE; else it keeps its
+/// cell tail, whose probe refuses the block.
 #[test]
 fn hot_pac_branches_get_stamped_tails_for_blocks_that_accept_their_btype() {
     const BRAA: u32 = 0xd71f_0a11; // braa x16, x17
@@ -6742,14 +6834,14 @@ fn hot_pac_branches_get_stamped_tails_for_blocks_that_accept_their_btype() {
         machine.step().unwrap();
         assert_eq!(machine.statistics.predicted_tails, 1);
         let target_key = machine.current_key(far).expect("a translated page");
-        let tail = machine
+        let way = machine
             .host
             .patches
             .iter()
-            .find(|(_, bytes)| bytes.len() == chain::PREDICTED_TAIL_BYTES)
-            .expect("the predicted tail")
+            .find(|(_, bytes)| bytes.len() == chain::WAY_BYTES)
+            .expect("the way")
             .0 as u64;
-        let site = chain::direct_patch(tail + chain::PREDICTED_EXIT as u64);
+        let site = chain::direct_patch(way + chain::WAY_EXIT as u64);
         let (number, cells, held) = {
             let mut cache = machine.code.cache();
             assert_eq!(cache.targets.site_cell(site).map(|cell| cell.pc), Some(far));

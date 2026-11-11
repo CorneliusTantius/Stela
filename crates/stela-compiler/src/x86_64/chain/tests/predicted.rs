@@ -1,15 +1,16 @@
-//! PAC branch thunks whose exit takes a predicted tail, against the same
-//! thunks whose exit takes a lookup tail: for RETAB, BRAA through X16 and
-//! through another register, BLRAB and BLRAAZ, over random signed, forged
-//! and stale-key pointers and modifiers, key switches, closed and disabled
+//! PAC branch thunks whose exit takes a per-site inline cache of one to
+//! four targets (`way`s, then a `way_miss`), against the same thunks
+//! whose exit takes a lookup tail: for RETAB, BRAA through X16 and through
+//! another register, BLRAB and BLRAAZ, over random signed, forged and
+//! stale-key pointers and modifiers, key switches, closed and disabled
 //! keys, ITLB, block table and cell changes, entries that refuse the
-//! branch's BTYPE, contexts, budgets and interruptions, the predicted tail
-//! (its direct exit unlinked, through a cell tail or through a stamped
-//! tail) completes the same instruction, takes the same transfer into the
-//! same block or the same exit, and leaves the guest state, the memo and
-//! the control the same, but for the table probe's count of its own
-//! transfers. An unlinked direct exit returns what the thunk's own exit
-//! returns.
+//! branch's BTYPE, contexts, budgets and interruptions, a way that holds
+//! the target (its direct exit through a cell tail or a stamped tail)
+//! completes the same instruction, takes the same transfer into the same
+//! block or the same exit, and leaves the guest state, the memo and the
+//! control the same, but for the table probe's count of its own transfers.
+//! A target no way holds, and ways whose direct exits are unlinked, return
+//! what the thunk's own exit returns; a demoted site's miss is the lookup.
 use super::super::*;
 use crate::block::{
     PointerAuthenticationKey as Key, PointerAuthenticationModifier as Modifier,
@@ -183,11 +184,22 @@ enum Way {
     Bare,
     /// A lookup tail.
     Lookup,
-    /// A predicted tail whose direct exit returns.
+    /// Ways whose direct exits return, then the miss.
     Unlinked,
-    /// A predicted tail whose direct exit takes a cell or stamped tail.
+    /// Ways whose direct exits take a cell or stamped tail, then the miss.
     Linked,
+    /// Past its ways' targets: the miss's lookup tail.
+    Demoted,
 }
+
+/// Where way `index` of a site lies, and its exit's cell or stamped tail.
+const fn way_at(index: usize) -> usize {
+    TAIL + 64 * index
+}
+const fn cell_tail_at(index: usize) -> usize {
+    CELL_TAIL + 160 * index
+}
+const MISS: usize = CELL_TAIL + 160 * WAYS;
 
 /// A thunk, its tail and the probes of `btype`, entered as a block is.
 struct Run {
@@ -197,7 +209,7 @@ struct Run {
 }
 
 impl Run {
-    fn new(thunk: &pointer::Thunk, btype: u8, way: Way, predicted: u64, word: ExitWord) -> Self {
+    fn new(thunk: &pointer::Thunk, btype: u8, shape: Way, targets: &[u64], word: ExitWord) -> Self {
         let region = pages(REGION);
         let mut body = vec![0xe9];
         let entered_len = crate::x86_64::pinned::entered(&[0; 5]).len();
@@ -209,19 +221,35 @@ impl Run {
         put(&region, PROBES, &lookup_dispatcher(btype).unwrap());
         let point = dynamic_patch(region.at(THUNK + thunk.dynamic.unwrap()));
         let probe = region.at(PROBES + PROBE_ENTRY);
-        let tail = region.at(TAIL);
-        match way {
-            Way::Bare => {}
-            Way::Lookup => put(&region, TAIL, &lookup_tail(tail, word, RAN, probe).unwrap()),
-            Way::Unlinked | Way::Linked => put(
-                &region,
-                TAIL,
-                &predicted_tail(tail, GuestAddress(predicted), word, RAN, probe).unwrap(),
-            ),
-        }
-        if way != Way::Bare {
+        let miss = region.at(MISS);
+        put(&region, MISS, &way_miss(miss, word, RAN, probe).unwrap());
+        let first = match shape {
+            Way::Bare => None,
+            Way::Lookup => {
+                let tail = region.at(TAIL);
+                put(&region, TAIL, &lookup_tail(tail, word, RAN, probe).unwrap());
+                Some(tail)
+            }
+            Way::Demoted => Some(miss + MISS_LOOKUP as u64),
+            Way::Unlinked | Way::Linked => {
+                // Each way's patch point goes on to the next, the last's to
+                // the miss, as the engine adds them.
+                for (index, &target) in targets.iter().enumerate() {
+                    let at = region.at(way_at(index));
+                    let (code, next) = way(at, GuestAddress(target), word, miss).unwrap();
+                    put(&region, way_at(index), &code);
+                    if index + 1 < targets.len() {
+                        let point = at + next as u64;
+                        let to = region.at(way_at(index + 1));
+                        put(&region, way_at(index) + next, &jump(point, to).unwrap());
+                    }
+                }
+                Some(region.at(way_at(0)))
+            }
+        };
+        if let Some(first) = first {
             let offset = (point - region.0 as u64) as usize;
-            put(&region, offset, &jump(point, tail).unwrap());
+            put(&region, offset, &jump(point, first).unwrap());
         }
         let memo = vec![MemoEntry::default(); MEMO_ENTRIES];
         let service = Box::new(Service {
@@ -239,24 +267,31 @@ impl Run {
         run
     }
 
-    /// The predicted tail's exit, which a link of `way` Linked patches.
-    fn exit_point(&self) -> u64 {
-        direct_patch(self.region.at(TAIL + PREDICTED_EXIT))
+    /// Way `index`'s direct exit's patch point.
+    fn exit_point(&self, index: usize) -> u64 {
+        direct_patch(self.region.at(way_at(index) + WAY_EXIT))
     }
 
-    /// Link the predicted tail's exit through `cell` of the table, by a
-    /// stamped tail while it held `linked` when linked, else a cell tail.
-    fn link(&self, table: &LookupTable, linked: Option<LookupEntry>, word: ExitWord, btype: u8) {
-        let site = self.exit_point();
+    /// Link way `index`'s exit through its cell of the table, by a stamped
+    /// tail while it held `linked` when linked, else a cell tail.
+    fn link(
+        &self,
+        index: usize,
+        table: &LookupTable,
+        linked: Option<LookupEntry>,
+        word: ExitWord,
+        btype: u8,
+    ) {
+        let site = self.exit_point(index);
         let number = table.site_cell_number(site).unwrap();
         let cell = LookupTable::cell_slot(&table.cells, number) as *const Slot as u64;
-        let at = self.region.at(CELL_TAIL);
+        let at = self.region.at(cell_tail_at(index));
         let code = match linked {
             Some(linked) => stamped_branch_tail(
                 at,
                 cell,
                 number,
-                predicted_of(table, site),
+                table.site_cell(site).unwrap().pc,
                 word,
                 RAN,
                 linked.block,
@@ -276,7 +311,7 @@ impl Run {
             .unwrap()
             .to_vec(),
         };
-        put(&self.region, CELL_TAIL, &code);
+        put(&self.region, cell_tail_at(index), &code);
         let offset = (site - self.region.0 as u64) as usize;
         put(&self.region, offset, &jump(site, at).unwrap());
     }
@@ -296,10 +331,6 @@ impl Run {
         };
         (result as u64, (result >> 64) as u64)
     }
-}
-
-fn predicted_of(table: &LookupTable, site: u64) -> u64 {
-    table.site_cell(site).unwrap().pc
 }
 
 /// A case: the instruction, its exit's kind and the BTYPE it sets, and
@@ -402,20 +433,29 @@ fn entry_of(blocks: &Pages, block: usize, pc: u64, key: u64, targets: u32) -> Lo
 }
 
 #[test]
-fn predicted_tails_complete_pac_branches_as_lookup_tails() {
+fn ways_complete_pac_branches_as_lookup_tails() {
     let blocks = blocks();
     let mut rng = Rng(0x2545_f491_4f6c_dd1d);
-    let mut totals = [0u32; 7];
+    let mut totals = [0u32; 8];
+    // Ways per case: one to all of the PCs.
+    let held = [2, 3, 4, 1, 3];
     for (number, case) in cases().into_iter().enumerate() {
         let form = pointer::Form::of(case.operation).unwrap();
         let tags = Place::new(Anchor::Pointer, core::mem::offset_of!(Service, tags));
         let routine: ServiceRoutine = service;
         let thunk = pointer::thunk(form, GuestAddress(PC), tags, routine as usize as u64);
         let word = ExitWord::from(case.kind);
-        // The predicted target: the first of a page in either half.
-        let predicted = PCS[2 * (number % 2)];
-        let ways = [Way::Lookup, Way::Linked, Way::Unlinked, Way::Bare];
-        let mut runs = ways.map(|way| Run::new(&thunk, case.btype, way, predicted, word));
+        let targets: Vec<u64> = (0..held[number])
+            .map(|way| PCS[(number + way) % PCS.len()])
+            .collect();
+        let ways = [
+            Way::Lookup,
+            Way::Linked,
+            Way::Unlinked,
+            Way::Bare,
+            Way::Demoted,
+        ];
+        let mut runs = ways.map(|shape| Run::new(&thunk, case.btype, shape, &targets, word));
         let mut table = LookupTable::with_entries(MIN_LOOKUP_ENTRIES);
         let mut itlb = LookupTable::itlb();
         let cells = table.stamped_cells();
@@ -435,17 +475,23 @@ fn predicted_tails_complete_pac_branches_as_lookup_tails() {
                 );
             }
         }
-        let site = runs[1].exit_point();
-        let relink = |table: &mut LookupTable, key: u64| {
-            let held = table.find(table.slot(predicted, key), predicted, key);
-            let current = (held.pc == predicted && held.key == key).then_some(held);
-            table.link_cell(site, predicted, current);
+        let sites: Vec<u64> = (0..targets.len())
+            .map(|way| runs[1].exit_point(way))
+            .collect();
+        let relink = |table: &mut LookupTable, way: usize, key: u64| {
+            let target = targets[way];
+            let held = table.find(table.slot(target, key), target, key);
+            let current = (held.pc == target && held.key == key).then_some(held);
+            table.link_cell(sites[way], target, current);
             // As the engine links: a stamped tail only for a block that
             // accepts the BTYPE.
             current.filter(|entry| entry.targets & 1 << case.btype != 0)
         };
-        let mut linked = relink(&mut table, KEYS[0]);
-        runs[1].link(&table, linked, word, case.btype);
+        let mut linked = [None; WAYS];
+        for (way, held) in linked.iter_mut().enumerate().take(targets.len()) {
+            *held = relink(&mut table, way, KEYS[0]);
+            runs[1].link(way, &table, *held, word, case.btype);
+        }
         let mut contexts = [CONTEXTS[0], CONTEXTS[1]];
         let mut keys = BTreeMap::new();
         for &pc in &PCS {
@@ -500,8 +546,9 @@ fn predicted_tails_complete_pac_branches_as_lookup_tails() {
                     table.forget_frames(frame..=frame, |_| rng.below(3) == 0);
                 }
                 8 => {
-                    linked = relink(&mut table, KEYS[rng.below(2) as usize]);
-                    runs[1].link(&table, linked, word, case.btype);
+                    let way = rng.below(targets.len() as u64) as usize;
+                    linked[way] = relink(&mut table, way, KEYS[rng.below(2) as usize]);
+                    runs[1].link(way, &table, linked[way], word, case.btype);
                 }
                 9 => contexts[rng.below(2) as usize] = CONTEXTS[rng.below(3) as usize],
                 10 => contexts = [CONTEXTS[0], CONTEXTS[1]],
@@ -521,7 +568,7 @@ fn predicted_tails_complete_pac_branches_as_lookup_tails() {
             // The operands: a pointer signed under the current key, under
             // another generation's, forged, or unsigned.
             let target = if rng.below(3) == 0 {
-                predicted
+                targets[rng.below(targets.len() as u64) as usize]
             } else {
                 PCS[rng.below(4) as usize]
             };
@@ -565,103 +612,116 @@ fn predicted_tails_complete_pac_branches_as_lookup_tails() {
             // SAFETY: the table made the stamps, which live with it.
             let hits_of = || unsafe { stamp_counts(stamps) }[StampCount::Hits as usize];
             let stamped_hits = hits_of();
-            let mut controls = [base; 4];
-            let mut states = [(); 4].map(|_| state.clone());
-            let mut results = [(0, 0); 4];
+            let mut controls = [base; 5];
+            let mut states = [(); 5].map(|_| state.clone());
+            let mut results = [(0, 0); 5];
             // In a random order: stamps one run leaves serve the next.
-            let first = rng.below(4) as usize;
-            for index in (0..4).map(|step| (first + step) % 4) {
+            let first = rng.below(5) as usize;
+            for index in (0..5).map(|step| (first + step) % 5) {
                 let run = &mut runs[index];
                 run.service.tags = tag_words;
                 results[index] = run.run(&mut states[index], &mut controls[index]);
             }
-            let [lookup, linked_way, unlinked, bare] = results;
+            let [lookup, linked_way, unlinked, bare, demoted] = results;
             let stamped = hits_of() != stamped_hits;
-            // The one difference the stamped tail may make, as in the
-            // stamped tails' test: the cell probe misses a page this ITLB
-            // put out for another (a capacity eviction, not a drop) and the
-            // stamped tail enters the cell's block while the page tables
-            // still map the page to the cell's key.
-            let page = predicted & !0xfff;
-            let context = contexts[half(predicted)];
-            let resident = itlb.find(itlb.page_slot(predicted, context), page, context);
-            let cell = table.site_cell(site).unwrap();
-            let evicted = stamped
-                && !(resident.pc == page && resident.key == context)
-                && keys.get(&(page, context)) == Some(&cell.key)
-                && lookup.0 == predicted
-                && linked.is_some_and(|linked| linked.entry == cell.entry);
-            // And the one difference a cell makes: the table put the
-            // target's entry out of its set for another (a capacity
-            // eviction, not a forget), and the cell, which keeps it,
-            // enters its block where the table probe exits for a refill.
-            let resident_key = (resident.pc == page && resident.key == context)
-                .then_some(resident.entry)
-                .or_else(|| keys.get(&(page, context)).copied().filter(|_| stamped));
-            let held = resident_key
-                .map(|key| table.find(table.slot(predicted, key), predicted, key))
-                .unwrap_or_default();
-            let exit = (
-                predicted,
-                u64::from(word.encoded() | RAN << ExitWord::RAN_SHIFT),
-            );
-            let entered = ChainControl {
-                budget: base.budget.wrapping_sub(1),
-                retired: base.retired + u64::from(RAN),
-                block: u64::from(cell.block) | u64::from(case.btype) << BLOCK_BTYPE_SHIFT,
-                ..base
-            };
-            let put_out = resident_key == Some(cell.key)
-                && cell.pc == predicted
-                && !(held.pc == predicted && held.key == cell.key)
-                && lookup == exit
-                && controls[0] == base
-                && if base.budget == 0 {
-                    linked_way == exit && controls[1].budget == u64::MAX
-                } else {
-                    linked_way == (0x7700 + u64::from(cell.block), 99)
-                        && ChainControl {
-                            hits: entered.hits,
-                            ..controls[1]
-                        } == entered
-                };
-            if evicted || put_out {
-                totals[6] += 1;
-            } else {
-                assert_eq!(
-                    linked_way, lookup,
-                    "case {number} trial {trial}: target {target:#x} operand {operand:#x}"
-                );
-                let mut linked_control = controls[1];
-                // A table probe counts its own transfers; the cell and the
-                // stamped tail do not.
-                assert!(controls[0].hits - linked_control.hits <= 1);
-                if controls[0].hits != linked_control.hits {
-                    totals[1] += 1;
-                }
-                linked_control.hits = controls[0].hits;
-                assert_eq!(linked_control, controls[0], "case {number} trial {trial}");
-                assert_eq!(states[1].x, states[0].x, "case {number} trial {trial}");
-                assert_eq!(states[1].sp, states[0].sp);
-            }
-            // An unlinked direct exit returns what the thunk's exit does.
-            let expected = if bare == (predicted, u64::from(word.encoded())) {
-                totals[2] += 1;
-                bare
-            } else {
-                lookup
-            };
-            assert_eq!(unlinked, expected, "case {number} trial {trial}");
-            assert_eq!(
-                controls[2],
-                if expected == bare {
-                    controls[3]
-                } else {
-                    controls[0]
-                }
-            );
+            // A demoted site's miss is a lookup tail.
+            assert_eq!(demoted, lookup, "case {number} trial {trial}");
+            assert_eq!(controls[4], controls[0], "case {number} trial {trial}");
+            assert_eq!(states[4].x, states[0].x);
+            // Ways whose direct exits return, and a miss that exits to the
+            // engine, return what the thunk's exit does.
+            assert_eq!(unlinked, bare, "case {number} trial {trial}");
+            assert_eq!(controls[2], controls[3], "case {number} trial {trial}");
             assert_eq!(states[2].x, states[0].x);
             assert_eq!(states[3].x, states[0].x);
+            // The way the target takes, if one holds it.
+            let exited = bare.1 == u64::from(word.encoded());
+            let way = targets
+                .iter()
+                .position(|&held| held == bare.0)
+                .filter(|_| exited);
+            if let Some(way) = way {
+                totals[2] += 1;
+                let predicted = targets[way];
+                let site = sites[way];
+                let linked = linked[way];
+                // The one difference the stamped tail may make, as in the
+                // stamped tails' test: the cell probe misses a page this
+                // ITLB put out for another (a capacity eviction, not a
+                // drop) and the stamped tail enters the cell's block while
+                // the page tables still map the page to the cell's key.
+                let page = predicted & !0xfff;
+                let context = contexts[half(predicted)];
+                let resident = itlb.find(itlb.page_slot(predicted, context), page, context);
+                let cell = table.site_cell(site).unwrap();
+                let evicted = stamped
+                    && !(resident.pc == page && resident.key == context)
+                    && keys.get(&(page, context)) == Some(&cell.key)
+                    && lookup.0 == predicted
+                    && linked.is_some_and(|linked| linked.entry == cell.entry);
+                // And the one difference a cell makes: the table put the
+                // target's entry out of its set for another (a capacity
+                // eviction, not a forget), and the cell, which keeps it,
+                // enters its block where the table probe exits for a refill.
+                let resident_key = (resident.pc == page && resident.key == context)
+                    .then_some(resident.entry)
+                    .or_else(|| keys.get(&(page, context)).copied().filter(|_| stamped));
+                let held = resident_key
+                    .map(|key| table.find(table.slot(predicted, key), predicted, key))
+                    .unwrap_or_default();
+                let exit = (
+                    predicted,
+                    u64::from(word.encoded() | RAN << ExitWord::RAN_SHIFT),
+                );
+                let entered = ChainControl {
+                    budget: base.budget.wrapping_sub(1),
+                    retired: base.retired + u64::from(RAN),
+                    block: u64::from(cell.block) | u64::from(case.btype) << BLOCK_BTYPE_SHIFT,
+                    ..base
+                };
+                let put_out = resident_key == Some(cell.key)
+                    && cell.pc == predicted
+                    && !(held.pc == predicted && held.key == cell.key)
+                    && lookup == exit
+                    && controls[0] == base
+                    && if base.budget == 0 {
+                        linked_way == exit && controls[1].budget == u64::MAX
+                    } else {
+                        linked_way == (0x7700 + u64::from(cell.block), 99)
+                            && ChainControl {
+                                hits: entered.hits,
+                                ..controls[1]
+                            } == entered
+                    };
+                if evicted || put_out {
+                    totals[6] += 1;
+                } else {
+                    assert_eq!(
+                        linked_way, lookup,
+                        "case {number} trial {trial}: target {target:#x} operand {operand:#x}"
+                    );
+                    let mut linked_control = controls[1];
+                    // A table probe counts its own transfers; the cell and
+                    // the stamped tail do not.
+                    assert!(controls[0].hits - linked_control.hits <= 1);
+                    if controls[0].hits != linked_control.hits {
+                        totals[1] += 1;
+                    }
+                    linked_control.hits = controls[0].hits;
+                    assert_eq!(linked_control, controls[0], "case {number} trial {trial}");
+                    assert_eq!(states[1].x, states[0].x, "case {number} trial {trial}");
+                    assert_eq!(states[1].sp, states[0].sp);
+                }
+            } else {
+                // No way holds it: the miss exits to the engine as the
+                // thunk's exit does, and a failure never reaches the ways.
+                if exited {
+                    totals[7] += 1;
+                }
+                assert_eq!(linked_way, bare, "case {number} trial {trial}");
+                assert_eq!(controls[1], controls[3], "case {number} trial {trial}");
+                assert_eq!(states[1].x, states[0].x);
+            }
             if stamped {
                 totals[3] += 1;
             }
@@ -680,24 +740,26 @@ fn predicted_tails_complete_pac_branches_as_lookup_tails() {
         assert!(runs.iter().all(|run| run.memo == runs[0].memo));
         assert!(runs[0].service.calls > 1000, "{}", runs[0].service.calls);
     }
-    // Key switches, cell transfers, direct exits taken, stamped hits, PAC
-    // exits and transfers into blocks all happened often.
+    // Key switches, cell transfers, ways taken, stamped hits, PAC exits,
+    // transfers into blocks and misses all happened often.
     let [
         switches,
         cell_transfers,
-        predicted_exits,
+        way_exits,
         stamped,
         failures,
         entered,
         _,
+        misses,
     ] = totals;
     assert!(
-        switches > 7_000
-            && cell_transfers > 1_300
-            && predicted_exits > 30_000
-            && stamped > 500
-            && failures > 20_000
-            && entered > 5_000,
+        switches > 10_000
+            && cell_transfers > 3_000
+            && way_exits > 80_000
+            && stamped > 700
+            && failures > 30_000
+            && entered > 7_000
+            && misses > 30_000,
         "{totals:?}"
     );
 }
@@ -762,31 +824,44 @@ fn branch_cell_probes_take_entries_that_accept_their_btype() {
     }
 }
 
-/// A predicted tail's bytes: the compare, its direct exit to the target,
-/// aligned for its patch point where it lands, and the lookup tail.
+/// A way's bytes: the compare, its direct exit to the target, aligned for
+/// its patch point where it lands, then the patch point to the next code;
+/// a miss's: the engine exit, then the lookup tail.
 #[test]
-fn predicted_tails_hold_a_direct_exit_and_a_lookup_tail() {
+fn ways_hold_a_direct_exit_and_a_patch_point_and_misses_a_lookup_tail() {
     for at in (0x1000..0x1010).map(|at| 0x7f00_0000_0000 + at) {
         let target = GuestAddress(0xffff_fe00_1234_0010);
         let word = ExitWord::from(ExitKind::Return);
-        let probe = 0x7f00_0010_0000;
-        let tail = predicted_tail(at, target, word, 3, probe).unwrap();
-        let exit = &tail[PREDICTED_EXIT..PREDICTED_EXIT + DIRECT_EXIT_BYTES];
+        let next = 0x7f00_0010_0000;
+        let (code, point) = way(at, target, word, next).unwrap();
+        let exit = &code[WAY_EXIT..WAY_EXIT + DIRECT_EXIT_BYTES];
         assert!(is_direct_exit(exit, target, word));
-        assert!(exit_ready(&tail, PREDICTED_EXIT, at, 0));
-        assert!(patchable(direct_patch(at + PREDICTED_EXIT as u64)));
-        let lookup = at + (PREDICTED_EXIT + DIRECT_EXIT_BYTES) as u64;
+        assert!(exit_ready(&code, WAY_EXIT, at, 0));
+        assert!(patchable(direct_patch(at + WAY_EXIT as u64)));
+        assert!(point >= WAY_EXIT + DIRECT_EXIT_BYTES);
+        assert!(patchable(at + point as u64), "{at:#x} {point}");
         assert_eq!(
-            tail[PREDICTED_EXIT + DIRECT_EXIT_BYTES..],
-            lookup_tail(lookup, word, 3, probe).unwrap()
+            code[point..point + JUMP_BYTES],
+            jump(at + point as u64, next).unwrap()
         );
-        // movabs r8, target; cmp rax, r8; jne over the direct exit.
-        assert_eq!(tail[..2], [0x49, 0xb8]);
-        assert_eq!(tail[2..10], target.0.to_le_bytes());
+        assert!(code[point + JUMP_BYTES..].iter().all(|&byte| byte == 0xcc));
+        // movabs r8, target; cmp rax, r8; jne to the patch point.
+        assert_eq!(code[..2], [0x49, 0xb8]);
+        assert_eq!(code[2..10], target.0.to_le_bytes());
+        assert_eq!(code[10..14], [0x4c, 0x39, 0xc0, 0x75]);
+        assert_eq!(usize::from(code[14]), point - WAY_EXIT);
+        let probe = 0x7f00_0020_0000;
+        let miss = way_miss(at, word, 3, probe).unwrap();
         assert_eq!(
-            tail[10..15],
-            [0x4c, 0x39, 0xc0, 0x75, DIRECT_EXIT_BYTES as u8]
+            miss[..MISS_LOOKUP],
+            exit_word_bytes(word.encoded(), patch_pad(at + 5))
+        );
+        assert!(patchable(dynamic_patch(at)));
+        assert_eq!(
+            miss[MISS_LOOKUP..],
+            lookup_tail(at + MISS_LOOKUP as u64, word, 3, probe).unwrap()
         );
     }
-    assert!(predicted_tail(0, GuestAddress(0), ExitKind::Return, 1 << 12, 0).is_none());
+    assert!(way(0, GuestAddress(0), ExitKind::Return, 1 << 40).is_none());
+    assert!(way_miss(0, ExitKind::Return, 1 << 12, 0).is_none());
 }

@@ -806,7 +806,7 @@ fn cell_bucket(pc: u64) -> usize {
 /// What an exit through a stamped cell was linked with
 /// ([`LookupTable::note_link`]): its patch point, its target, the
 /// instructions its block ran, its word and the BTYPE its branch sets (0
-/// but for the exit of a [`predicted_tail`] of a BR or BLR form).
+/// but for the exit of a [`way`] of a BR or BLR form).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CellLink {
     pub site: u64,
@@ -2561,7 +2561,7 @@ fn entered_btype(asm: &mut crate::x86_64::asm::Asm, register: Gpr, btype: u8) {
 /// tells the sites of the shared jump apart by the branches since each
 /// tail's jump, and one more costs a misprediction a transfer. The jumps to
 /// the table probe with the key in R8, and to its start for a torn read.
-/// A probe of a nonzero `btype` (the exits of [`predicted_tail`]s of BR and
+/// A probe of a nonzero `btype` (the exits of [`way`]s of BR and
 /// BLR forms) takes the cell's entry only when it accepts that BTYPE, and
 /// names it in `block`, as the table probe does; BTYPE 0 adds nothing.
 fn cell_probe(
@@ -2736,7 +2736,7 @@ pub fn stamped_tail(
     )
 }
 
-/// A [`stamped_tail`] for the direct exit of a [`predicted_tail`] of a
+/// A [`stamped_tail`] for the direct exit of a [`way`] of a
 /// branch that sets `btype`: its hit names the BTYPE in `block` as the
 /// table probe does, and `probe` is the stamping cell probe of the
 /// dispatcher of `btype`, which takes only entries that accept it. The
@@ -2965,40 +2965,72 @@ pub fn cell_tail(
     code.try_into().ok()
 }
 
-/// Where a [`predicted_tail`]'s direct exit to its predicted target begins:
-/// its patch point is [`direct_patch`] of the tail's address plus this.
-pub const PREDICTED_EXIT: usize = 15;
-/// Bytes in a [`predicted_tail`]: the compare, the direct exit and a
-/// [`lookup_tail`].
-pub const PREDICTED_TAIL_BYTES: usize = PREDICTED_EXIT + DIRECT_EXIT_BYTES + TAIL_BYTES;
+/// Targets a site's [`way`]s hold at most: a site that reaches one more is
+/// sent to its [`way_miss`]'s lookup tail for good.
+pub const WAYS: usize = 4;
+/// Where a [`way`]'s direct exit to its target begins: its patch point is
+/// [`direct_patch`] of the way's address plus this.
+pub const WAY_EXIT: usize = 15;
+/// Bytes of a [`way`]: the compare, the direct exit, then the padded patch
+/// point to the next way.
+pub const WAY_BYTES: usize = 48;
+/// Bytes of a [`way_miss`]: the exit to the engine, then a lookup tail at
+/// [`MISS_LOOKUP`].
+pub const MISS_BYTES: usize = DYNAMIC_EXIT_BYTES + TAIL_BYTES;
+pub const MISS_LOOKUP: usize = DYNAMIC_EXIT_BYTES;
 
-/// The tail at host address `at` of an exit to the target in RAX that the
-/// engine predicts is `target`: a one-target inline cache. When RAX is
-/// `target` it takes a direct exit to `target` of `word`
-/// ([`PREDICTED_EXIT`]), which returns RAX and EDX exactly as the
-/// redirected exit does and which the engine links like a block's direct
-/// exit, through a cell ([`cell_tail`], [`stamped_branch_tail`]); any other
-/// target takes the [`lookup_tail`] to `probe` after it. Both leave EDX as
-/// the redirected exit or its lookup tail would, so whichever runs, the
-/// transfer or exit is the one the lookup tail makes. `None` as for a
-/// [`lookup_tail`].
-pub fn predicted_tail(
+/// One way of a per-site inline cache of the targets of an exit to the
+/// target in RAX (RET, BR, BLR and their PAC forms), at host address `at`.
+/// When RAX is `target` it takes a direct exit to `target` of `word` (at
+/// [`WAY_EXIT`]), which returns RAX and EDX exactly as the redirected exit
+/// does and which the engine links like a block's direct exit, through a
+/// cell ([`cell_tail`], [`stamped_branch_tail`]). Any other target goes on
+/// at the way's patch point (the offset returned), a `jmp` to `next`: the
+/// site's [`way_miss`] until the engine adds a way after it and points it
+/// there. `None` when `next` is out of a 32-bit jump's reach.
+pub fn way(
     at: u64,
     target: GuestAddress,
     word: impl Into<ExitWord>,
-    ran: u32,
-    probe: u64,
-) -> Option<[u8; PREDICTED_TAIL_BYTES]> {
+    next: u64,
+) -> Option<([u8; WAY_BYTES], usize)> {
     let word = word.into();
     let mut code = Code::new();
     let mut asm = code.asm();
     asm.mov_imm64(R8, target.0);
     asm.alu(Alu::Cmp, Qword, Rax, R8);
     let other = asm.jcc8(Cond::Ne);
-    debug_assert_eq!(asm.len(), PREDICTED_EXIT);
-    let exit = at + PREDICTED_EXIT as u64;
-    asm.fixed(&direct_exit_at(exit, target, word));
+    debug_assert_eq!(asm.len(), WAY_EXIT);
+    asm.fixed(&direct_exit_at(at + WAY_EXIT as u64, target, word));
+    let pad = patch_pad(at + asm.len() as u64);
+    asm.fixed(NOPS[pad]);
     asm.bind(other);
+    let point = code.len();
+    let jump = jump(at + point as u64, next)?;
+    let mut asm = code.asm();
+    asm.fixed(&jump);
+    while code.len() < WAY_BYTES {
+        code.asm().int3();
+    }
+    Some((code.try_into().ok()?, point))
+}
+
+/// The end of a site's [`way`]s, at host address `at`: a target none of
+/// them holds exits to the engine with RAX and EDX as the redirected exit
+/// leaves them, so that the engine adds a way for it; then, at
+/// [`MISS_LOOKUP`], the [`lookup_tail`] to `probe` that the site's patch
+/// point jumps to once its targets outnumber [`WAYS`]. `None` as for a
+/// [`lookup_tail`].
+pub fn way_miss(
+    at: u64,
+    word: impl Into<ExitWord>,
+    ran: u32,
+    probe: u64,
+) -> Option<[u8; MISS_BYTES]> {
+    let word = word.into();
+    let mut code = Code::new();
+    code.asm()
+        .fixed(&exit_word_bytes(word.encoded(), patch_pad(at + 5)));
     tail(&mut code, at, word, ran, probe)?;
     code.try_into().ok()
 }

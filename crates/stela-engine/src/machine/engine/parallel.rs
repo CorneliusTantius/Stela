@@ -373,8 +373,9 @@ pub struct Counts {
     pub itlb_sources: [u64; 12],
     /// Its stamped transfers ([`chain::StampCount`]'s order), the exits it
     /// gave a stamped tail, how many exits had one when it last looked, then
-    /// the PAC branch exits it gave a predicted tail.
-    pub stamped: [u64; chain::STAMP_COUNTS + 3],
+    /// the dynamic exits it gave ways ([`chain::way`]), the ways it added
+    /// after their first and the sites it sent to their lookup for good.
+    pub stamped: [u64; chain::STAMP_COUNTS + 5],
     /// TSC ticks in each engine phase ([`step_timing::Phase`]), while
     /// step timing is enabled.
     pub phases: [u64; step_timing::Phase::COUNT],
@@ -1832,11 +1833,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 misses
             },
             stamped: {
-                let mut stamped = [0; chain::STAMP_COUNTS + 3];
+                let mut stamped = [0; chain::STAMP_COUNTS + 5];
                 stamped[..chain::STAMP_COUNTS].copy_from_slice(&self.chain.stamp_counts());
                 stamped[chain::STAMP_COUNTS] = statistics.stamped_tails;
                 stamped[chain::STAMP_COUNTS + 1] = statistics.stamped_in_use;
                 stamped[chain::STAMP_COUNTS + 2] = statistics.predicted_tails;
+                stamped[chain::STAMP_COUNTS + 3] = statistics.ways_added;
+                stamped[chain::STAMP_COUNTS + 4] = statistics.ways_demoted;
                 stamped
             },
             phases: self

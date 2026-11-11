@@ -1207,7 +1207,7 @@ impl Heartbeat {
                 "PES STAMPED hits/miss_epoch/miss_context/miss_interrupt/restamped/changed/promoted",
             );
             let mut stamped_in_use = 0;
-            let mut predicted = 0;
+            let mut predicted = [0u64; 3];
             let deltas = |line: &mut String, pe: usize, now: &[u64], before: &[u64]| {
                 line.push_str(&format!(" {pe}:"));
                 for (slot, (now, before)) in now.iter().zip(before).enumerate() {
@@ -1332,7 +1332,10 @@ impl Heartbeat {
                     &before.stamped[..promoted],
                 );
                 stamped_in_use = stamped_in_use.max(now.stamped[promoted]);
-                predicted += now.stamped[promoted + 1].saturating_sub(before.stamped[promoted + 1]);
+                for (way, total) in predicted.iter_mut().enumerate() {
+                    let at = promoted + 1 + way;
+                    *total += now.stamped[at].saturating_sub(before.stamped[at]);
+                }
                 deltas(
                     &mut store,
                     pe,
@@ -1504,8 +1507,12 @@ impl Heartbeat {
             if machine.step_timing().is_some() {
                 line.push_str(&dynamic_sites(&self.dynamic));
             }
-            // Exits of PAC branch thunks given a predicted tail this beat.
-            line.push_str(&format!(" predicted={predicted}"));
+            // Dynamic exits given ways this beat, ways added after their
+            // first, and sites sent to their lookup for good.
+            let [predicted, added, demoted] = predicted;
+            line.push_str(&format!(
+                " predicted={predicted} ways={added} demoted={demoted}"
+            ));
             output::arguments(format_args!("{line}\n"));
         }
         // Self-loops since boot, every PE together: compiled, then with

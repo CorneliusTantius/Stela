@@ -368,6 +368,9 @@ pub(super) struct Cache {
     /// Why blocks the board held before are installed again
     /// ([`super::churn`]).
     pub(super) churn: super::ChurnCounts,
+    /// The inline caches of dynamic exits that may still take a way, by
+    /// block slot ([`super::scheduler::Ways`]).
+    pub(super) ways: alloc::collections::BTreeMap<usize, super::scheduler::Ways>,
 }
 
 /// How a board's code lock was taken, counted under it: no atomic beyond
@@ -623,6 +626,7 @@ impl Cache {
             targets_raced: 0,
             census: None,
             churn: super::ChurnCounts::default(),
+            ways: alloc::collections::BTreeMap::new(),
         }
     }
 }
@@ -775,6 +779,7 @@ impl Code {
         cache.index.clear();
         cache.code_slots = CodeSlots::default();
         cache.dispatchers.clear();
+        cache.ways.clear();
     }
 }
 
@@ -803,6 +808,9 @@ pub(super) struct Record {
     used: AtomicU64,
     /// Its dynamic exit is served by a lookup dispatcher.
     dynamic: AtomicBool,
+    /// Its dynamic exit's inline cache may still take a way
+    /// (`Cache::ways`).
+    ways: AtomicBool,
     /// Its install lost to another PE's of the same block: never reachable.
     lost: AtomicBool,
     /// Jump cache hits that found no block table entry of it and went for
@@ -826,6 +834,7 @@ impl Default for Record {
             settled: AtomicU64::new(0),
             used: AtomicU64::new(0),
             dynamic: AtomicBool::new(false),
+            ways: AtomicBool::new(false),
             lost: AtomicBool::new(false),
             remembers: AtomicU32::new(0),
             recovery: Mutex::new(None),
@@ -971,6 +980,20 @@ impl Record {
         self.dynamic.store(true, Ordering::Release);
     }
 
+    /// Whether its dynamic exit's inline cache may still take a way: a
+    /// check before the board's lock, made again under it.
+    pub(super) fn ways_open(&self) -> bool {
+        self.ways.load(Ordering::Acquire)
+    }
+
+    pub(super) fn open_ways(&self) {
+        self.ways.store(true, Ordering::Release);
+    }
+
+    pub(super) fn close_ways(&self) {
+        self.ways.store(false, Ordering::Release);
+    }
+
     /// Whether its install lost to another PE's ([`Self::mark_lost`]).
     pub(super) fn lost(&self) -> bool {
         self.lost.load(Ordering::Acquire)
@@ -1076,6 +1099,7 @@ impl Blocks {
         record.settled.store(0, Ordering::Relaxed);
         record.used.store(0, Ordering::Relaxed);
         record.dynamic.store(false, Ordering::Relaxed);
+        record.ways.store(false, Ordering::Relaxed);
         record.lost.store(false, Ordering::Relaxed);
         record.remembers.store(0, Ordering::Relaxed);
         record.incarnation.fetch_add(1, Ordering::Release);

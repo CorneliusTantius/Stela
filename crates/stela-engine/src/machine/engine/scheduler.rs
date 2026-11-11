@@ -662,25 +662,29 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// page and 0b01 elsewhere. Blocks are compiled per guarded page, so
     /// the page's BTYPE is the block's.
     ///
-    /// The exit of a BRA* thunk, which just authenticated `target`, first
-    /// compares the target with it ([`chain::predicted_tail`]): an arm64e
-    /// auth stub's BRAA X16, X17 has one target, and most BRA* transfers are
-    /// at such sites, so an equal target takes a direct exit linked through
-    /// a cell, which a hot site turns into a direct jump into the target's
-    /// block ([`chain::stamped_branch_tail`]). The thunk's memo still
-    /// authenticates every transfer: only which block an authenticated
-    /// target enters is cached, and validated as every cell is. RETA* and
-    /// BLRA* sites mostly see several targets, where the compare would cost
-    /// a mispredicted branch at each predicted one: they keep the lookup.
+    /// The exit of a BR or BLR form, plain or PAC, or of a RETA*, which
+    /// just went to `target`, gets a per-site inline cache of its targets
+    /// instead ([`chain::way`]): each way compares the target with one the
+    /// site went to and takes a direct exit linked through a cell, which a
+    /// hot site turns into a direct jump into the target's block
+    /// ([`chain::stamped_branch_tail`]), so a site with few targets needs no
+    /// table probe and no indirect jump. A target no way holds exits to the
+    /// engine, which adds a way for it ([`Self::add_way`]); a site that
+    /// reaches more than [`chain::WAYS`] targets is sent to the lookup tail
+    /// for good, as it would be without ways. A PAC thunk's memo still
+    /// authenticates every transfer: only which block a target enters is
+    /// cached, and validated as every cell is. Plain RET keeps the lookup:
+    /// its sites are the most numerous and the most often polymorphic.
     pub(super) fn link_dynamic(&mut self, index: usize, btype: u8, target: u64) {
         // Decided on the board borrowed: nearly every such exit has its
         // dispatcher already, and a clone of the board's `Arc` would write
         // a count every PE's exits write.
-        let (point, kind, retired, predicted) = {
+        let (point, kind, retired, cached) = {
             let block = &self.code.blocks[index];
             let record = self.code.blocks.record(index);
+            let open = record.dynamic_open();
             let Some(site) = block.dynamic_site.filter(|_| {
-                !self.variants[block.variant.0 as usize].single && record.dynamic_open()
+                !self.variants[block.variant.0 as usize].single && (open || record.ways_open())
             }) else {
                 return;
             };
@@ -700,76 +704,165 @@ impl<H: Host, D: Devices> Machine<H, D> {
             let retired = u32::from(block.instructions);
             // Bit 11 selects the PAC forms of RET, BR and BLR, whose exit
             // is their thunk's.
-            let predicted = matches!(
-                dynamic_branch(block.terminal),
-                Some((ExitKind::Indirect, _))
-            ) && block.terminal & 1 << 11 != 0;
-            (chain::dynamic_patch(site.get()), kind, retired, predicted)
+            let cached = match dynamic_branch(block.terminal) {
+                Some((ExitKind::Return, _)) => block.terminal & 1 << 11 != 0,
+                Some(_) => true,
+                None => false,
+            };
+            (chain::dynamic_patch(site.get()), kind, retired, cached)
         };
         let code = Arc::clone(&self.code);
         let record = code.blocks.record(index);
         // Another PE may serve it meanwhile: checked again under the lock.
         let mut cache = code.cache_at(board::LockSite::Dynamic);
-        if !record.dynamic_open() || !record.live() {
+        if !record.live() {
             return;
         }
         let word = kind.into();
-        if (predicted
-            && self.redirect_through_prediction(&mut cache, point, retired, word, btype, target))
-            || self.redirect_through_lookup(&mut cache, point, retired, word, btype)
-        {
+        if !record.dynamic_open() {
+            if record.ways_open() {
+                self.add_way(&mut cache, index, point, target);
+            }
+            return;
+        }
+        let site = Ways {
+            incarnation: record.incarnation(),
+            site: point,
+            next: 0,
+            miss: 0,
+            targets: [0; chain::WAYS],
+            held: 0,
+            retired,
+            word,
+            btype,
+        };
+        if cached && self.arm_ways(&mut cache, index, site, target) {
+            record.open_ways();
+            record.close_dynamic();
+        } else if self.redirect_through_lookup(&mut cache, point, retired, word, btype) {
             record.close_dynamic();
         }
     }
 
-    /// Send the exit of `word` whose patch point is at host address `site`,
-    /// from a block that ran `retired` instructions by a branch that sets
-    /// `btype`, to a [`chain::predicted_tail`] of its own for `target`: its
-    /// direct exit to `target` is linked through a cell before the point
-    /// jumps to the tail, and any other target takes the tail's lookup, as
-    /// [`Self::redirect_through_lookup`] would send it. False, with the
-    /// exit as it was, when the tail or the cell link cannot be made.
-    fn redirect_through_prediction(
+    /// Give the exit of `site` its ways: the miss after them, then the way
+    /// of `target`, its direct exit linked through a cell before the exit's
+    /// patch point jumps to it. False, with the exit as it was, when the
+    /// code or the cell link cannot be made.
+    fn arm_ways(
         &mut self,
         cache: &mut board::Cache,
-        site: u64,
-        retired: u32,
-        word: ExitWord,
-        btype: u8,
+        index: usize,
+        mut site: Ways,
         target: u64,
     ) -> bool {
-        if !chain::patchable(site) {
+        if !chain::patchable(site.site) {
             return false;
         }
-        let Some((probe, tail)) =
-            self.probe_and_tail(cache, site, btype, chain::PREDICTED_TAIL_BYTES)
+        let Some((probe, miss)) =
+            self.probe_and_tail(cache, site.site, site.btype, chain::MISS_BYTES)
         else {
             return false;
         };
-        let at = tail.0 as u64;
-        let (Some(code), Some(jump)) = (
-            chain::predicted_tail(
-                at,
-                GuestAddress(target),
-                word,
-                retired,
-                probe + chain::PROBE_ENTRY as u64,
-            ),
-            chain::jump(site, at),
+        let miss = miss.0 as u64;
+        let Some(code) = chain::way_miss(
+            miss,
+            site.word,
+            site.retired,
+            probe + chain::PROBE_ENTRY as u64,
         ) else {
             return false;
         };
-        // Nothing reaches the tail before the point's jump: its direct exit
-        // is linked first, so no predicted transfer returns to the engine.
-        self.patch_native(tail, &code);
-        let exit = chain::direct_patch(at + chain::PREDICTED_EXIT as u64);
-        if !self.link_through_cell(cache, exit, target, retired, word, btype) {
+        self.patch_native(NativeCode(miss as usize), &code);
+        site.miss = miss;
+        let Some(way) = self.new_way(cache, &site, site.site, target) else {
             return false;
-        }
-        self.patch_point(NativeCode(site as usize), jump);
+        };
+        let Some(jump) = chain::jump(site.site, way.0) else {
+            return false;
+        };
+        self.patch_point(NativeCode(site.site as usize), jump);
+        site.next = way.1;
+        site.targets[0] = target;
+        site.held = 1;
+        cache.ways.insert(index, site);
         self.statistics.lookups += 1;
         self.statistics.predicted_tails += 1;
         true
+    }
+
+    /// A way of `site` for `target`, written and its direct exit linked
+    /// through a cell, which nothing reaches yet; code at `from` will jump
+    /// to it. Its address and its patch point's.
+    fn new_way(
+        &mut self,
+        cache: &mut board::Cache,
+        site: &Ways,
+        from: u64,
+        target: u64,
+    ) -> Option<(u64, u64)> {
+        let (_, way) = self.probe_and_tail(cache, from, site.btype, chain::WAY_BYTES)?;
+        let at = way.0 as u64;
+        let (code, point) = chain::way(at, GuestAddress(target), site.word, site.miss)?;
+        self.patch_native(way, &code);
+        let exit = chain::direct_patch(at + chain::WAY_EXIT as u64);
+        self.link_through_cell(cache, exit, target, site.retired, site.word, site.btype)
+            .then_some((at, at + point as u64))
+    }
+
+    /// The exit of block `index`, whose patch point is `point`, went to
+    /// `target` through its ways' miss: a way for it after the others, or,
+    /// past [`chain::WAYS`] targets or when the way cannot be made, the
+    /// miss's lookup tail for good.
+    /// Under the board's lock (`cache`).
+    pub(super) fn add_way(
+        &mut self,
+        cache: &mut board::Cache,
+        index: usize,
+        point: u64,
+        target: u64,
+    ) {
+        let code = Arc::clone(&self.code);
+        let record = code.blocks.record(index);
+        let Some(mut site) = cache
+            .ways
+            .get(&index)
+            .copied()
+            .filter(|site| site.incarnation == record.incarnation() && site.site == point)
+        else {
+            // A block before it in the slot left these ways.
+            cache.ways.remove(&index);
+            record.close_ways();
+            return;
+        };
+        let held = usize::from(site.held);
+        if site.targets[..held].contains(&target) {
+            // Another PE added it, or the way's own exit returned.
+            return;
+        }
+        // Past the last way, or when no way can be made for the target, the
+        // exit goes to the miss's lookup tail for good rather than exit to
+        // the engine at every miss. In reach: the miss was placed for it.
+        let added = if held < chain::WAYS {
+            self.new_way(cache, &site, site.next, target)
+                .and_then(|(way, next)| Some((chain::jump(site.next, way)?, next)))
+        } else {
+            None
+        };
+        let Some((jump, next)) = added else {
+            if let Some(jump) = chain::jump(point, site.miss + chain::MISS_LOOKUP as u64) {
+                self.patch_point(NativeCode(point as usize), jump);
+                self.statistics.ways_demoted += 1;
+            }
+            cache.ways.remove(&index);
+            record.close_ways();
+            return;
+        };
+        self.patch_point(NativeCode(site.next as usize), jump);
+        site.next = next;
+        site.targets[held] = target;
+        site.held += 1;
+        cache.ways.insert(index, site);
+        self.statistics.ways_added += 1;
     }
 
     /// Send the exit of `word` whose patch point is at host address `site`
@@ -823,7 +916,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// sends the transfer to the table probe. The cell goes with the exit's
     /// code ([`Self::evict_code`]), and its entry with the block's.
     ///
-    /// The direct exit of a [`chain::predicted_tail`] of a branch that sets
+    /// The direct exit of a [`chain::way`] of a branch that sets
     /// a nonzero `btype` uses the probes of `btype`, whose cell probes take
     /// only entries that accept it, and gets a stamped tail only for a block
     /// that accepts it.
@@ -1014,4 +1107,23 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.lookup_dispatchers[usize::from(btype)] = Some(installed);
         Some(installed.0 as u64)
     }
+}
+
+/// A site's inline cache of targets ([`Machine::link_dynamic`]), kept by
+/// block slot under the board's lock while it may still take a way.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Ways {
+    /// The incarnation of the slot's block it serves.
+    pub(super) incarnation: u32,
+    /// The exit's patch point, which jumps to the first way.
+    pub(super) site: u64,
+    /// The last way's patch point, which jumps to the miss.
+    pub(super) next: u64,
+    /// The miss after the ways ([`chain::way_miss`]).
+    pub(super) miss: u64,
+    pub(super) targets: [u64; chain::WAYS],
+    pub(super) held: u8,
+    pub(super) retired: u32,
+    pub(super) word: ExitWord,
+    pub(super) btype: u8,
 }
