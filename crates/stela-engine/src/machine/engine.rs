@@ -996,6 +996,9 @@ pub struct Machine<H: Host, D: Devices> {
     /// The latest serial of the maintenance this PE posted to each other PE
     /// and has not yet seen applied, which its next DSB waits for.
     posted: Vec<(usize, u64)>,
+    /// The emptied buffer of the last mail this PE read, which the next read
+    /// leaves in its inbox so neither side allocates per mail.
+    mail_spare: Vec<parallel::Maintenance>,
     /// The direct exit within its page the last native run left by, when
     /// its target had no block to link to: the block, the target and the
     /// exit's word. The next fetch, if it is the target's, links it
@@ -1389,6 +1392,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             forwarded_power: Vec::new(),
             deferred_code: Vec::new(),
             posted: Vec::new(),
+            mail_spare: Vec::new(),
             direct_exit: None,
             publishing_target: None,
             outgoing: Vec::new(),
