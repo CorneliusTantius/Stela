@@ -1405,20 +1405,31 @@ impl LookupTable {
             }
             self.note_rekey(slot, &entry);
         }
-        // An entry the set does not hold yet, or none in place of one: a
-        // table probe of its PC may find another block than before, or
-        // none, as an older entry of the PC and key may have been put out
-        // of the set and still be in a dispatch cache. Another PC put out
-        // of the slot is a capacity eviction, which its block outlives,
-        // unless the neighbour holds another entry of that PC and key,
-        // which a table probe of it finds from now on.
+        // None in place of an entry, or an entry in place of another of
+        // its PC and key: a table probe of that PC finds another block
+        // than before, or none. An entry new to the set needs nothing: a
+        // dispatch cache holds only blocks a probe found, a block it holds
+        // stays a translation of its PC and key until the block is
+        // forgotten (`forget_block`, `forget_frames`, `clear`, which make
+        // every cache stale), and contexts, pages and acknowledgements
+        // make the owner's cache stale themselves. So another PC put out
+        // of the slot, or an older entry of this PC and key put out of
+        // the set earlier, leaves a block that is still good to enter.
+        // Every PE's cache follows the board's table, and new entries
+        // arrive at the rate blocks are compiled, which kept every cache
+        // cold. The neighbour holding another entry of the PC and key put
+        // out is one a table probe of it finds from now on.
         let replaced = self.grouping == Grouping::Frame && {
             let resident = self.sets.get(slot).load();
             let beside = self.sets.get(neighbour(slot)).load();
+            let supersedes = |held: LookupEntry| {
+                held.key != 0 && (held.pc, held.key) == (entry.pc, entry.key) && held != entry
+            };
             if entry.key == 0 {
                 resident.key != 0
             } else {
-                (resident != entry && beside != entry)
+                (supersedes(resident) && beside != entry)
+                    || (supersedes(beside) && resident != entry)
                     || (resident.key != 0
                         && resident != entry
                         && (beside.pc, beside.key) == (resident.pc, resident.key)

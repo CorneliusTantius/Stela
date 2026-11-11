@@ -356,7 +356,8 @@ fn dispatch_caches_complete_transfers_as_table_probes() {
                 }
             }
             if (found, dispatched) != (lookup, probed) {
-                // A capacity eviction: the table probe missed, and the
+                // A capacity eviction or a newer entry of the PC and key:
+                // the table probe missed or found another block, and the
                 // slot's block is one the tables would give with room for
                 // all.
                 let page = pc & !0xfff;
@@ -392,7 +393,9 @@ fn dispatch_caches_complete_transfers_as_table_probes() {
                     )
                 };
                 assert!(
-                    valid && lookup == exit && probed == base && (found, dispatched) == expected,
+                    valid
+                        && (entered || (lookup == exit && probed == base))
+                        && (found, dispatched) == expected,
                     "target {target:?} trial {trial} btype {btype} pc {pc:#x}: \
                      lookup {lookup:x?} found {found:x?}\n{probed:x?}\n{dispatched:x?}"
                 );
@@ -458,4 +461,32 @@ fn dispatch_slots_and_probe_layout() {
         }
     }
     assert!(dispatching_dispatcher(4, crate::TargetCpu::X86_64_V2).is_none());
+}
+
+/// An entry new to the block table leaves dispatch caches as they are: a
+/// block they hold stays good until it is forgotten. Another block of the
+/// same PC and key in its place, or none, makes them stale.
+#[test]
+fn new_table_entries_keep_dispatch_caches() {
+    let mut table = LookupTable::with_entries(MIN_LOOKUP_ENTRIES);
+    let cache = Arc::new(DispatchCache::new());
+    table.add_dispatch(&cache);
+    let entry = |pc: u64, block: u32| LookupEntry {
+        pc,
+        key: KEYS[0],
+        entry: 0x1000 + u64::from(block) * 0x40,
+        block,
+        targets: 0xf,
+    };
+    let generation = cache.generation();
+    for (block, pc) in PCS.into_iter().enumerate() {
+        table.insert(table.slot(pc, KEYS[0]), entry(pc, block as u32));
+    }
+    assert_eq!(cache.generation(), generation, "new entries");
+    let pc = PCS[0];
+    table.insert(table.slot(pc, KEYS[0]), entry(pc, 9));
+    assert!(cache.generation() > generation, "a newer block of the PC");
+    let generation = cache.generation();
+    table.set(table.slot(pc, KEYS[0]), LookupEntry::default());
+    assert!(cache.generation() > generation, "an entry removed");
 }
