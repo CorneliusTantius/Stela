@@ -19,6 +19,7 @@ pub mod bluetooth_dsbr;
 pub mod boot_progress;
 pub mod bounded_spin;
 pub mod bundle;
+pub mod bundle_repair;
 pub mod chain_check;
 pub mod console_lines;
 #[cfg(feature = "native-acpi")]
