@@ -839,7 +839,7 @@ fn show_reset(otherwise: &str, action: &str, hold: u64) {
 /// [`show_stop`], then halt until the PC is turned off.
 fn stop_here(text: &str, code: u32) -> ! {
     show_stop(text);
-    crate::status::info(output::STOPPED);
+    crate::status::info(output::stopped_text());
     output::terminate(code)
 }
 
