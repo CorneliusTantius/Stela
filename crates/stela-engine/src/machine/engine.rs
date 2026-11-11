@@ -324,17 +324,22 @@ impl Watch {
 }
 
 /// The guest context branch predictions must not cross (FEAT_CSV2): the
-/// translation regime, its table bases (with the ASID one carries),
-/// CONTEXTIDR_ELx and VTTBR_EL2 (the VMID). A change of any of these is a
-/// guest context switch, at which the engine has the host isolate its
-/// predictions ([`Host::isolate_predictions`]). An exception or return
-/// that keeps them, between EL0 and EL1 of one address space, is not one.
+/// translation regime, its table bases (with the ASID one carries) and
+/// VTTBR_EL2 (the VMID). A change of any of these is a guest context
+/// switch, at which the engine has the host isolate its predictions
+/// ([`Host::isolate_predictions`]). An exception or return that keeps
+/// them, between EL0 and EL1 of one address space, is not one.
+/// CONTEXTIDR_ELx is not part of it: Arm's execution context for CSV2 is
+/// the Security state, Exception level, VMID and ASID (and SCXTNUM_ELx with
+/// CSV2_2, see `identification`), and CONTEXTIDR only names the context to
+/// debug and trace. A kernel writes it at each address space switch beside
+/// TTBR0, whose ASID already isolates there, so it would only double the
+/// barrier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PredictionContext {
     pub host: bool,
     pub ttbr0: u64,
     pub ttbr1: u64,
-    pub contextidr: u64,
     pub vttbr: u64,
 }
 
@@ -342,24 +347,15 @@ impl PredictionContext {
     fn of(cpu: &Cpu) -> Self {
         use crate::machine::cpu::TranslationRegime;
         let host = cpu.regime() == TranslationRegime::El20;
-        let (ttbr0, ttbr1, contextidr) = if host {
-            (
-                SystemRegister::TTBR0_EL2,
-                SystemRegister::TTBR1_EL2,
-                SystemRegister::CONTEXTIDR_EL2,
-            )
+        let (ttbr0, ttbr1) = if host {
+            (SystemRegister::TTBR0_EL2, SystemRegister::TTBR1_EL2)
         } else {
-            (
-                SystemRegister::TTBR0_EL1,
-                SystemRegister::TTBR1_EL1,
-                SystemRegister::CONTEXTIDR_EL1,
-            )
+            (SystemRegister::TTBR0_EL1, SystemRegister::TTBR1_EL1)
         };
         Self {
             host,
             ttbr0: cpu.read(ttbr0),
             ttbr1: cpu.read(ttbr1),
-            contextidr: cpu.read(contextidr),
             vttbr: cpu.read(SystemRegister::VTTBR_EL2),
         }
     }

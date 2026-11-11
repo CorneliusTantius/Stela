@@ -397,14 +397,9 @@ impl<H: Host, D: Devices> Context for Access<'_, H, D> {
         if watches(register) {
             self.regime = true;
         }
-        // A CONTEXTIDR write changes the guest's prediction context
-        // (`PredictionContext`) without changing translation.
-        if matches!(
-            register,
-            Register::CONTEXTIDR_EL1 | Register::CONTEXTIDR_EL2
-        ) {
-            self.machine.sync_host_regime();
-        }
+        // A CONTEXTIDR write changes neither translation nor the prediction
+        // context (`PredictionContext`): context-aware breakpoints read it
+        // live (`debug::breakpoint`) and watchpoints do not compare it.
         Ok(())
     }
 
