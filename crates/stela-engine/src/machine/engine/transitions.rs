@@ -91,7 +91,12 @@ pub(super) struct Start {
     pstate: Pstate,
     prediction: Option<PredictionContext>,
     watch: Watch,
+    pointer: PointerUse,
 }
+
+/// How PAC instructions act at a level: the four address keys' enables
+/// (`Machine::pointer_key_enables`) and whether EL2 traps them.
+type PointerUse = (u64, bool);
 
 impl<H: Host, D: Devices> Machine<H, D> {
     /// GENTER, GEXIT, SVC or ERET (`kind`) is about to take the engine
@@ -175,13 +180,30 @@ impl<H: Host, D: Devices> Machine<H, D> {
             pstate: self.cpu.pstate,
             prediction: self.prediction_context,
             watch: self.watch,
+            pointer: self.pointer_use(),
         }
+    }
+
+    /// PAC's behavior at the current level: native transitions keep the PAC
+    /// service, which the engine path reopens at the new level
+    /// (`Machine::reopen_pointers`), so both levels must agree. Above EL0,
+    /// APCTL's kernel-keys bit enables every key whatever SCTLR says.
+    fn pointer_use(&self) -> PointerUse {
+        use PointerAuthenticationKey::{Da, Db, Ia, Ib};
+        let keys = [Ia, Ib, Da, Db].into_iter().fold(0, |keys, key| {
+            keys | pointer_authentication::key_enable_bit(key)
+        });
+        (
+            self.pointer_key_enables() & keys,
+            self.pointer_authentication_trapped(),
+        )
     }
 
     /// GENTER, GEXIT, SVC or ERET (`kind`) completed in the engine from
     /// `start`, with the `spsr` and `aspsr` the note keeps. Only transitions
     /// with neither MTE (TCO stays) nor monitor tracing (whose events native
-    /// code would not report) make records: GENTER and GEXIT at EL2, where
+    /// code would not report), and with PAC acting alike on both sides
+    /// ([`Self::pointer_use`]), make records: GENTER and GEXIT at EL2, where
     /// HACR traps none; SVC and ERET between EL0 and EL2 of the host
     /// (HCR_EL2.E2H and TGE: one translation regime, PAC keys and controls,
     /// and no fine-grained trap of either) or within EL2, unguarded, with
@@ -215,6 +237,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             && plain(from)
             && plain(to)
             && from.tco == to.tco
+            && start.pointer == self.pointer_use()
             && !self.cpu.mte()
             && match kind {
                 GUARDED_EXIT => spsr & EXIT_CLEAR == 0,
@@ -449,7 +472,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// ([`Self::transitioned`]) for the `counts` native code made, the
     /// last block's `ending` instructions not yet retired. The PAC service
     /// stays: records are made only where both states take the same keys,
-    /// version and controls (one EL). With counters that tell the levels
+    /// version and controls and PAC acts alike at both levels (key
+    /// enables and traps, [`Self::pointer_use`]). With counters that tell the levels
     /// apart a run ends at its first transition, so the counts before it
     /// stay the old level's.
     pub(super) fn adopt_transitions(&mut self, counts: [u64; KINDS], ending: u64) {

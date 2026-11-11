@@ -83,7 +83,7 @@ fn observed(machine: &Machine<FakeHost, NoDevices>) -> alloc::string::String {
     let read = |register| cpu.registers.get(register, 0);
     alloc::format!(
         "{:?} {:?} pc={:#x} spsr={:#x} elr={:#x} esr={:#x} sp={:#x},{:#x} state={} \
-         event={} monitor={:?} exceptions={}",
+         event={} monitor={:?} exceptions={} pointer={:x?}",
         cpu.pstate,
         state,
         cpu.pc,
@@ -96,6 +96,7 @@ fn observed(machine: &Machine<FakeHost, NoDevices>) -> alloc::string::String {
         cpu.event_is_set(),
         cpu.monitor.is_some(),
         machine.statistics.exceptions,
+        machine.pointer.tags,
     )
 }
 
@@ -112,7 +113,8 @@ fn thunks() -> (x86_64_pointer::Thunk, x86_64_pointer::Thunk) {
 /// ERET to EL0 and SVC back complete natively from the records as the
 /// engine completes them: PSTATE (EL, SP selection, masks, NZCV, PAN, DIT,
 /// UAO, SSBS), SPSR, ELR and ESR, both stacks, the cells' state, the event
-/// register, the local monitor and the exception count.
+/// register, the local monitor, the exception count and the PAC service
+/// native PAC instructions run on.
 #[test]
 fn native_svc_and_eret_match_the_engine_path() {
     let (mut engine, mut native) = (host(), host());
@@ -240,4 +242,152 @@ fn uncovered_svc_and_eret_take_the_normal_exit() {
         assert_eq!(exit, (pc, ExitKind::System as u64), "{name}");
         assert_eq!(observed(&machine), before, "{name}");
     }
+}
+
+/// SCTLR_EL2's four PAC key enables.
+const KEY_ENABLES: u64 = 1 << 31 | 1 << 30 | 1 << 27 | 1 << 13;
+
+/// With APCTL's kernel-keys bit, EL2 signs with every key while EL0 of a
+/// process without JOP keys (SCTLR's enables clear) does not: the engine
+/// path reopens the PAC service at each level, which a native SVC or ERET
+/// would not, so neither makes a record. With SCTLR enabling the keys too,
+/// both levels sign alike and the records hold.
+#[test]
+fn svc_and_eret_make_records_only_where_pac_acts_alike() {
+    for (enables, recorded) in [(0, false), (KEY_ENABLES, true)] {
+        let mut machine = host();
+        let sctlr = machine.cpu.registers.get(SystemRegister::SCTLR_EL2, 0);
+        machine
+            .cpu
+            .registers
+            .set(SystemRegister::SCTLR_EL2, 0, sctlr & !KEY_ENABLES | enables);
+        machine.cpu.apple.apctl[1] = 1 << 4;
+        machine.sync_regime();
+        for _ in 0..2 {
+            prepare(&mut machine);
+            machine.system_instruction(ERET).unwrap();
+            machine.finish_transition(1);
+            machine.system_instruction(SVC_WORD).unwrap();
+            machine.finish_transition(1);
+        }
+        let table = &machine.mirrors.transitions;
+        for (state, kind) in [(0, SUPERVISOR_CALL), (2, EXCEPTION_RETURN)] {
+            let made = table.records[state][kind].generation == table.generation;
+            assert_eq!(made, recorded, "enables {enables:#x} kind {kind}");
+        }
+    }
+}
+
+/// MSR TTBR0_EL1, X1: TTBR0_EL2 in the host.
+const MSR_TTBR0: u32 = 0xd518_2001;
+
+/// A process switch (TTBR0) or an SPRR_PERM write changes the lookup
+/// contexts of the level returned to, which records do not forget: the
+/// ERET to EL0 then completes but ends its run rather than look its target
+/// up in the previous process's context, and the next native entry at EL0
+/// gives the record the new contexts.
+#[test]
+fn svc_and_eret_records_take_new_contexts_after_ttbr0_and_permission_writes() {
+    for case in ["TTBR0", "SPRR_PERM"] {
+        let mut machine = host();
+        warm(&mut machine);
+        let current = |machine: &Machine<FakeHost, NoDevices>| {
+            let table = &machine.mirrors.transitions;
+            let record = &table.records[2][EXCEPTION_RETURN];
+            assert_eq!(record.generation, table.generation, "{case}");
+            record.contexts_generation == table.contexts_generation
+        };
+        assert!(current(&machine), "{case}");
+        if case == "TTBR0" {
+            machine.cpu.state.x[1] = 0x0001_0000_8000_0000;
+            machine.system_instruction(MSR_TTBR0).unwrap();
+            assert_eq!(
+                machine.cpu.registers.get(SystemRegister::TTBR0_EL2, 0),
+                0x0001_0000_8000_0000
+            );
+        } else {
+            machine.permissions_changed();
+        }
+        assert!(!current(&machine), "{case}");
+        machine.cpu.pstate = Pstate {
+            el: 0,
+            sp: false,
+            ..machine.cpu.pstate
+        };
+        machine.refresh_transition_contexts(1);
+        assert!(current(&machine), "{case}");
+    }
+}
+
+/// The twin round trip where EL2 keeps every key on (APCTL) and EL0 of a
+/// process without JOP keys has only IB: after an ERET to EL0 and an SVC
+/// back, the PAC service native PAC code runs on is the engine's at each
+/// level (IA, DA and DB off at EL0), whichever path completed them.
+#[test]
+fn svc_and_eret_leave_the_pac_service_of_the_level_entered() {
+    let configure = |machine: &mut Machine<FakeHost, NoDevices>| {
+        let sctlr = machine.cpu.registers.get(SystemRegister::SCTLR_EL2, 0);
+        machine
+            .cpu
+            .registers
+            .set(SystemRegister::SCTLR_EL2, 0, sctlr & !KEY_ENABLES | 1 << 30);
+        machine.cpu.apple.apctl[1] = 1 << 4;
+        use SystemRegister as R;
+        for (index, register) in [
+            R::APIAKeyLo_EL1,
+            R::APIAKeyHi_EL1,
+            R::APIBKeyLo_EL1,
+            R::APIBKeyHi_EL1,
+            R::APDAKeyLo_EL1,
+            R::APDAKeyHi_EL1,
+            R::APDBKeyLo_EL1,
+            R::APDBKeyHi_EL1,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let half = crate::machine::pointer_keys::Register::architectural(register).unwrap();
+            let value = 0x0123_4567_89ab_cdef_u64.rotate_left(8 * index as u32);
+            machine.cpu.apple.pointer_keys.write(half, value);
+        }
+        machine.sync_regime();
+        // The service a first PAC exit opens.
+        let inputs = PointerInputs {
+            keys: machine.pointer_keys(),
+            version: machine.pointer_version().unwrap(),
+            tcr: machine.cpu.regime_tcr(),
+        };
+        machine.pointer.open(inputs);
+        machine.revalidate_pointers();
+        assert!(machine.pointer.any_open());
+        for _ in 0..2 {
+            prepare(machine);
+            machine.system_instruction(ERET).unwrap();
+            machine.finish_transition(1);
+            machine.system_instruction(SVC_WORD).unwrap();
+            machine.finish_transition(1);
+        }
+    };
+    let (mut engine, mut native) = (host(), host());
+    configure(&mut engine);
+    configure(&mut native);
+    let (eret, svc) = thunks();
+    // Native where a record holds, else the engine path, as a run would.
+    let complete = |machine: &mut Machine<FakeHost, NoDevices>, code: &[u8], word| {
+        let pc = machine.cpu.pc;
+        if run_native(machine, code) == (pc, ExitKind::System as u64) {
+            machine.system_instruction(word).unwrap();
+        }
+    };
+    for machine in [&mut engine, &mut native] {
+        prepare(machine);
+    }
+    native.mirrors.lines_until = u64::MAX;
+    assert_eq!(observed(&engine), observed(&native));
+    engine.system_instruction(ERET).unwrap();
+    complete(&mut native, &eret.code, ERET);
+    assert_eq!(observed(&engine), observed(&native));
+    engine.system_instruction(SVC_WORD).unwrap();
+    complete(&mut native, &svc.code, SVC_WORD);
+    assert_eq!(observed(&engine), observed(&native));
 }
