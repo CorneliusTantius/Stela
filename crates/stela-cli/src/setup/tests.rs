@@ -1082,7 +1082,9 @@ fn setup_erases_usb_and_refuses_internal_disk() {
 fn preparation_preflights_signing_and_capacity() {
     let mut f = fixture(64 * GIB, true);
     let before = (snapshot(&f.esp), snapshot(&f.data));
-    let opted = command(&f, Path::new("disk5"));
+    // Confirmed, so the preflights run without a terminal to ask at.
+    let mut opted = command(&f, Path::new("disk5"));
+    opted.confirmed = true;
     let fail = |_: prepare::RamdiskOptions<'_>| bail!("signing service unavailable");
     let env = Environment {
         prepare_restore: &fail,
@@ -1098,7 +1100,8 @@ fn preparation_preflights_signing_and_capacity() {
         .find(|d| d.identifier == "disk5")
         .unwrap()
         .bytes = 1;
-    let opted = command(&f, Path::new("disk5"));
+    let mut opted = command(&f, Path::new("disk5"));
+    opted.confirmed = true;
     let error = setup(&environment(&f.host), opted).unwrap_err();
     assert!(
         error.to_string().contains("needs a USB of at least"),
