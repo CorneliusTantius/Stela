@@ -1061,10 +1061,21 @@ fn setup_erases_usb_and_refuses_internal_disk() {
     // Without an image, the USB is left as it was: no erase is tried.
     let mut no_image = command(&f, Path::new("disk5"));
     no_image.ipsw = None;
+    no_image.confirmed = true;
     let error = setup(&environment(&f.host), no_image)
         .unwrap_err()
         .to_string();
     assert!(error.contains("pass --ipsw"), "{error}");
+    // Without a terminal and without the model or size typed back, a USB
+    // is not erased.
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        let mut unasked = command(&f, Path::new("disk5"));
+        unasked.ipsw = None;
+        let error = setup(&environment(&f.host), unasked)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("without a terminal"), "{error}");
+    }
 }
 
 #[test]
