@@ -54,7 +54,7 @@ enum Command {
     State(State),
     /// Print the boot logs: the USB's own, then the one stela.efi keeps in
     /// the install's machine state.
-    BootLog(Machine),
+    BootLog(BootLog),
     /// Change the settings of an existing setup.
     Configure(Configure),
     /// Install host-device firmware for the PC onto an existing USB.
@@ -71,7 +71,7 @@ impl Command {
             Self::Uninstall(command) => command.request(Action::Uninstall),
             Self::Nvram(command) => command.request(),
             Self::State(command) => command.request(),
-            Self::BootLog(command) => command.request(Action::BootLog),
+            Self::BootLog(command) => command.request(),
             Self::Configure(command) => command.request(),
             Self::HostFirmware(command) => command.request(),
         }
@@ -250,6 +250,26 @@ impl Machine {
             install: self.install,
             nor: self.nor,
             ..self.usb.request(action)
+        }
+    }
+}
+
+/// `boot-log`: an install's machine state, and where the report goes.
+#[derive(Args)]
+struct BootLog {
+    #[command(flatten)]
+    machine: Machine,
+    /// Write the logs to this file instead of the terminal, to attach to a
+    /// report.
+    #[arg(short, long, value_name = "FILE")]
+    output: Option<PathBuf>,
+}
+
+impl BootLog {
+    fn request(self) -> Request {
+        Request {
+            output: self.output,
+            ..self.machine.request(Action::BootLog)
         }
     }
 }

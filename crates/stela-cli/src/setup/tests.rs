@@ -285,6 +285,7 @@ fn command(f: &Fixture, usb: &Path) -> Request {
         dns: None,
         automatic_ipv4: false,
         automatic_dns: false,
+        output: None,
     }
 }
 
@@ -4387,6 +4388,36 @@ fn the_no_network_promise_says_the_install_checks_the_answers_first() {
         assert!(!message.contains("needs no network"), "{message}");
         assert!(message.contains("only if they do not fit"), "{message}");
     }
+}
+
+#[test]
+fn boot_log_report_goes_to_the_output_file() {
+    use clap::Parser as _;
+    let dir = tempfile::tempdir().unwrap();
+    let output = dir.path().join("boot-log.txt");
+    let crate::Command::Setup(setup) = crate::Cli::try_parse_from([
+        "stela".as_ref(),
+        "setup".as_ref(),
+        "boot-log".as_ref(),
+        "--usb".as_ref(),
+        "/Volumes/EFI".as_ref(),
+        "-o".as_ref(),
+        output.as_os_str(),
+    ])
+    .unwrap()
+    .command
+    else {
+        panic!("not a setup");
+    };
+    let request = setup.request();
+    assert!(matches!(request.action, Action::BootLog));
+    assert_eq!(request.output.as_deref(), Some(output.as_path()));
+    save_report(&output, "=== STELA BOOT 1 ===\nline\n").unwrap();
+    assert_eq!(
+        fs::read_to_string(&output).unwrap(),
+        "=== STELA BOOT 1 ===\nline\n"
+    );
+    assert!(save_report(&dir.path().join("no/such/file"), "").is_err());
 }
 
 /// Partition `identifier` of its disk, backed by an image file holding

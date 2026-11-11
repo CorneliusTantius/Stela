@@ -258,6 +258,16 @@ fn split_report(result: Result<String>) -> (String, Result<()>) {
     }
 }
 
+/// Write `report` to `path` instead of the terminal, and say where it went.
+fn save_report(path: &Path, report: &str) -> Result<()> {
+    fs::write(path, report).with_context(|| format!("cannot write {}", path.display()))?;
+    println!(
+        "Saved the report to {}",
+        crate::boot_log::shown(path).display()
+    );
+    Ok(())
+}
+
 /// The startup choice that restores with a bundle of `kind` on a setup
 /// with one install.
 fn restore_choice_name(kind: Kind) -> &'static str {
@@ -386,6 +396,8 @@ struct Request {
     dns: Option<Vec<std::net::IpAddr>>,
     automatic_ipv4: bool,
     automatic_dns: bool,
+    /// `boot-log`: the file the report goes to instead of the terminal.
+    output: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -631,6 +643,7 @@ impl Request {
         }
         let dry_run = self.dry_run;
         let profile = self.profile;
+        let output = self.output.take();
         let (report, result) = split_report(self.dispatch(&environment));
         if let Err(error) = result {
             print!("{report}");
@@ -660,6 +673,8 @@ impl Request {
                 ),
             )?;
             cliclack::outro("Your installer USB is ready")?;
+        } else if let Some(path) = output {
+            save_report(&path, &report)?;
         } else {
             print!("{report}");
         }

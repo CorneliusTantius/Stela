@@ -37,6 +37,10 @@ pub(crate) struct BootLog {
     /// computer is read directly (with sudo for disks only root may read),
     /// so the USB Stela booted from only needs to be plugged in.
     file: Option<PathBuf>,
+    /// Write the logs to this file instead of the terminal, as the boot
+    /// wrote them, to attach to a report.
+    #[arg(short, long, value_name = "FILE")]
+    output: Option<PathBuf>,
     /// Only the machine-state partition with this unique GUID in FILE's
     /// GPT.
     #[arg(long, conflicts_with = "offset", requires = "file", hide = true)]
@@ -63,7 +67,7 @@ impl BootLog {
             }
             Some(file) => (vec![(String::new(), self.load(file)?)], false),
         };
-        write_logs(&logs, headings)
+        write_logs(&logs, headings, self.output.as_deref())
     }
 
     fn load(&self, path: &Path) -> Result<Log> {
@@ -114,25 +118,57 @@ impl BootLog {
 }
 
 /// Print `logs` in order, each after a heading naming its place when
-/// `headings`. Each stream is written as the boot wrote it, oldest boot
-/// first; each log's one-line summary goes to standard error.
-pub(crate) fn write_logs(logs: &[(String, Log)], headings: bool) -> Result<()> {
-    let mut stdout = std::io::stdout();
+/// `headings`, or write them to `output` and say where they went. Each
+/// stream is written as the boot wrote it, oldest boot first; each log's
+/// one-line summary goes to standard error.
+pub(crate) fn write_logs(
+    logs: &[(String, Log)],
+    headings: bool,
+    output: Option<&Path>,
+) -> Result<()> {
+    let mut sink: Box<dyn Write> = match output {
+        Some(path) => Box::new(
+            File::create(path).with_context(|| format!("cannot create {}", path.display()))?,
+        ),
+        None => Box::new(std::io::stdout().lock()),
+    };
     for (place, log) in logs {
         let mut written = Ok(());
         if headings {
             eprint!("{place}: ");
-            written = writeln!(stdout, "=== {place} ===");
+            written = writeln!(sink, "=== {place} ===");
         }
         eprint!("{}", summary(log));
-        match written.and_then(|()| stdout.write_all(&log.stream)) {
+        match written.and_then(|()| sink.write_all(&log.stream)) {
             // A reader that closed the pipe early (`| head`) has what it
             // asked for.
-            Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => return Ok(()),
-            result => result?,
+            Err(error) if output.is_none() && error.kind() == std::io::ErrorKind::BrokenPipe => {
+                return Ok(());
+            }
+            result => result.context("cannot write the boot log")?,
         }
     }
+    match sink.flush() {
+        Err(error) if output.is_none() && error.kind() == std::io::ErrorKind::BrokenPipe => {}
+        result => result.context("cannot write the boot log")?,
+    }
+    if let Some(path) = output {
+        eprintln!("{}", saved(logs.len(), path));
+    }
     Ok(())
+}
+
+/// Where `count` logs were written, as the full path to attach.
+fn saved(count: usize, path: &Path) -> String {
+    match count {
+        1 => format!("Saved the boot log to {}", shown(path).display()),
+        _ => format!("Saved {count} boot logs to {}", shown(path).display()),
+    }
+}
+
+/// `path` in full, as a file to attach is found again.
+pub(crate) fn shown(path: &Path) -> PathBuf {
+    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Every boot log in FILE, each with where it is: the file itself when it
@@ -610,6 +646,7 @@ pub(crate) mod tests {
     fn command(file: &Path, partition: Option<&str>, offset: Option<u64>) -> BootLog {
         BootLog {
             file: Some(file.into()),
+            output: None,
             partition: partition.map(Into::into),
             offset,
             in_target: false,
@@ -905,5 +942,28 @@ pub(crate) mod tests {
         // A blank copy holds nothing to print.
         std::fs::write(&path, vec![0u8; boot_log::LOG_BYTES as usize]).unwrap();
         assert!(find(&path).is_err());
+    }
+
+    #[test]
+    fn boot_log_output_holds_the_streams_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("log.txt");
+        let mut log = boot_log::read(&region(&["caf\u{e9} \x01\n"])).unwrap();
+        log.stream.push(0xff);
+        let logs = [
+            (String::from("USB"), log.clone()),
+            (String::from("disk"), log),
+        ];
+        write_logs(&logs, true, Some(&output)).unwrap();
+        let mut expected = b"=== USB ===\n".to_vec();
+        expected.extend_from_slice(&logs[0].1.stream);
+        expected.extend_from_slice(b"=== disk ===\n");
+        expected.extend_from_slice(&logs[1].1.stream);
+        assert_eq!(std::fs::read(&output).unwrap(), expected);
+        let said = saved(2, &output);
+        assert!(said.starts_with("Saved 2 boot logs to "), "{said}");
+        assert!(said.ends_with("log.txt"), "{said}");
+        let error = write_logs(&logs, false, Some(&dir.path().join("no/such/dir")));
+        assert!(format!("{:#}", error.unwrap_err()).contains("cannot create"));
     }
 }
