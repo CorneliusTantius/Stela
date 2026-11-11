@@ -953,6 +953,9 @@ pub struct Machine<H: Host, D: Devices> {
     /// the running one's or a waiting one's, are then its latched pins
     /// (`Devices::pins`).
     device_lines: Option<(Lines, u64, usize)>,
+    /// The devices' [`Devices::generation`] right after the call that gave
+    /// `device_lines`' deadline.
+    device_generation: Option<u64>,
     /// The PAC context, the memo of results and the key tag words, which
     /// native code reads and completes misses through (`pointer`).
     pointer: alloc::boxed::Box<pointer::PointerService>,
@@ -1374,6 +1377,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             event_sample: None,
             debug: None,
             device_lines: None,
+            device_generation: None,
             pointer: alloc::boxed::Box::new(pointer::PointerService::new()),
             mirrors: alloc::boxed::Box::default(),
             admit_table,

@@ -640,9 +640,25 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 consider(timeout(parked.waiting));
             }
         }
-        consider(self.devices.deadline(now));
+        consider(self.devices_deadline(now));
         consider(self.devices.dma_deadline());
         earliest
+    }
+
+    /// The devices' next deadline at `now`. The one the running PE's cached
+    /// lines came with still holds while no other machine's call reached
+    /// the devices since ([`Devices::generation`]): their advance with time
+    /// gave it, and nothing changes them before it but such a call. That
+    /// saves the home PE a second advance of every device in each wait pass.
+    fn devices_deadline(&mut self, now: u64) -> Option<u64> {
+        if let (Some((_, until, pe)), Some(expected)) = (self.device_lines, self.device_generation)
+            && pe == self.current
+            && now < until
+            && self.devices.generation() == Some(expected)
+        {
+            return (until != u64::MAX).then_some(until);
+        }
+        self.devices.deadline(now)
     }
 
     /// Run PE `next` in place of the running one, which parks with its state.
