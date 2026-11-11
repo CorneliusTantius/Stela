@@ -236,15 +236,15 @@ fn accepts_zero(operation: BinaryOperation) -> bool {
     }
 }
 
-/// A scalar FDIV's zero dividend over a normal divisor: the quotient is
+/// An FDIV lane's zero dividend over a normal divisor: the quotient is
 /// an exact signed zero, with no status, whatever FPCR holds. Code divides
-/// zero often (a ratio or an animation's progress at its start), and each
-/// one would otherwise leave compiled code. A zero quotient from a normal
+/// zero often (a ratio, a normalized silent sample or transparent pixel, an
+/// animation's progress at its start), and each one would otherwise leave
+/// compiled code. A zero quotient from a normal
 /// dividend underflowed, which the host's status rejects; the divisor's
 /// range check still sends a zero or infinite divisor to the helper.
 fn zero_quotient(operand: &Operand) -> bool {
     operand.operation == BinaryOperation::Divide
-        && operand.shape == Shape::Scalar
         && matches!(operand.inputs, Inputs::Elementwise { .. })
 }
 
@@ -481,7 +481,7 @@ fn emit_vector(
     let right = prepare_inputs(code, operand);
     prepare_vector_input_range(code, operand.format);
     for source in [LEFT_VECTOR, right] {
-        if accepts_zero(operand.operation) {
+        if accepts_zero(operand.operation) || (source == LEFT_VECTOR && zero_quotient(operand)) {
             vector_normal_or_zero_range(
                 code,
                 operand.format,
@@ -517,7 +517,7 @@ fn emit_vector(
     restore_environment(code);
     helper.push(reject_other_status(code));
     prepare_vector_result_range(code);
-    if accepts_zero(operand.operation) {
+    if accepts_zero(operand.operation) || zero_quotient(operand) {
         vector_normal_or_zero_range(
             code,
             operand.format,
