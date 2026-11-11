@@ -173,7 +173,7 @@ impl Spi {
             configuration: u8::MAX,
         }
     }
-    #[cfg(test)]
+    /// The NOR image as programs and erases left it.
     pub fn image(&self) -> &Image {
         self.nor.image()
     }

@@ -378,43 +378,56 @@ fn report_peaks() {
     }
 }
 
-/// Whether this boot is single-user: macOS starts no Metal client, and a
-/// maintenance installation may put the plugin in place.
-static SINGLE_USER: AtomicBool = AtomicBool::new(false);
-
-pub(super) fn single_user(single_user: bool) {
-    SINGLE_USER.store(single_user, Ordering::Relaxed);
-}
-
 /// What the kext found of the Metal plugin, the bundle whose code this boot's
 /// trust cache lists. A multi-user boot's Metal clients cannot start without
-/// it, so the boot stops with the remedy rather than let WindowServer fail.
-/// The stop is an orderly power-off, not a fatal one: the GPUs' firmware is
-/// running by now, and only the boot CPU's service, outside Linux's
-/// callbacks, unloads it before the reset that would otherwise take down the
-/// card's link.
+/// it. A missing plugin, whose directories a kext cannot create, is repaired
+/// once by a single-user boot the engine drives (`bundle_repair`): this boot
+/// restarts into it. Otherwise the boot stops with the remedy rather than let
+/// WindowServer fail. The stop and the restart are orderly, not fatal: the
+/// GPUs' firmware is running by now, and only the boot CPU's service,
+/// outside Linux's callbacks, unloads it before the reset that would
+/// otherwise take down the card's link.
 fn bundle(report: BundleReport) {
-    let single_user = SINGLE_USER.load(Ordering::Relaxed);
-    match report {
-        BundleReport::Current => {
-            output::arguments(format_args!("GPU StelaGPU.bundle is this stela.efi's\n"));
-        }
-        BundleReport::Updated => {
+    use super::super::bundle_repair;
+    use stela_boot_core::bundle_repair::{Decision, Report};
+    let decided = bundle_repair::decide(match report {
+        BundleReport::Current => Report::Current,
+        BundleReport::Updated => Report::Updated,
+        BundleReport::Missing => Report::Missing,
+        BundleReport::Failed => Report::Failed,
+    });
+    match (decided, report) {
+        (Decision::Continue(_), BundleReport::Updated) => {
             output::arguments(format_args!(
                 "GPU StelaGPU.bundle updated to this stela.efi's\n"
             ));
         }
-        BundleReport::Missing | BundleReport::Failed if single_user => {
+        (Decision::Continue(_), _) => {
+            output::arguments(format_args!("GPU StelaGPU.bundle is this stela.efi's\n"));
+        }
+        (Decision::Log, _) => {
             output::arguments(format_args!(
                 "GPU StelaGPU.bundle is not installed ({report:?}); this single-user boot may install it\n"
             ));
         }
-        BundleReport::Missing => stop(
-            "StelaGPU.bundle is not installed in /Library/GPUBundles, and a kext cannot create \
-             its directories: boot macOS once with --single-user and run \
-             stela-gpu-maintenance install there",
+        (Decision::Repair, _) => {
+            output::arguments(format_args!(
+                "GPU StelaGPU.bundle is not installed and a kext cannot create its \
+                 directories; restarting once into a single-user boot that creates them\n"
+            ));
+            super::super::service::request_restart();
+        }
+        (Decision::StopMissing { attempted: true }, _) => stop(
+            "StelaGPU.bundle is still not installed in /Library/GPUBundles after the automatic \
+             single-user repair (its BUNDLE REPAIR lines say how it went): boot macOS once with \
+             --single-user and install it there by hand",
         ),
-        BundleReport::Failed => stop(
+        (Decision::StopMissing { attempted: false }, _) => stop(
+            "StelaGPU.bundle is not installed in /Library/GPUBundles, a kext cannot create \
+             its directories, and without the machine state's NVRAM no automatic repair can be \
+             recorded: boot macOS once with --single-user and install it there by hand",
+        ),
+        (Decision::StopFailed, _) => stop(
             "the StelaGPU kext could not install StelaGPU.bundle; its StelaGPU lines above say why",
         ),
     }

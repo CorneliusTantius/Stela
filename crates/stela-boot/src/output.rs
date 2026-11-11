@@ -942,7 +942,6 @@ pub fn fatal(message: impl core::fmt::Display) -> ! {
 /// Report `message` as the reason the mount stops through an orderly
 /// power-off the caller has requested (`engine::service`), which brings the
 /// GPUs to rest and unloads their firmware first, unlike [`fatal`].
-#[cfg(feature = "nvk")]
 pub fn stopping(message: &str) {
     arguments(format_args!("\nSTELA STOP {message}\n"));
     unqueue_serial();

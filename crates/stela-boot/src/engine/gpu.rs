@@ -1386,15 +1386,6 @@ pub(super) fn no_metal_device() -> Option<&'static str> {
     Some("this stela.efi was built without GPU drivers (the `nvk` feature)")
 }
 
-/// Records whether this boot is single-user, which decides what a missing
-/// Metal plugin stops.
-pub(super) fn single_user(single_user: bool) {
-    #[cfg(feature = "nvk")]
-    gate::single_user(single_user);
-    #[cfg(not(feature = "nvk"))]
-    let _ = single_user;
-}
-
 /// The kexts a boot that gives the GPUs to nouveau links into its system.
 pub(super) fn kexts() -> Vec<stela_loader::aux_kc::Kext<'static>> {
     #[cfg(feature = "nvk")]

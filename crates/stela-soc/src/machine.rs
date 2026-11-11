@@ -719,6 +719,14 @@ impl AppleDevices {
             .map_or_else(Vec::new, Spi::take_dirty)
     }
 
+    /// A copy of the NOR image as the guest left it, for the host to change
+    /// NVRAM once the guest has stopped.
+    pub fn nor_image(&mut self) -> Option<stela_soc_data::nor::Image> {
+        self.nor
+            .and_then(|id| self.bus.device_mut::<Spi>(id))
+            .map(|spi| spi.image().clone())
+    }
+
     /// Drain the `sks`/`pnon`/`scrd` traffic the SEP observed this run under
     /// `--sep-observe`, as log lines. Empty when observation is off.
     pub fn sep_observations(&mut self) -> Vec<String> {

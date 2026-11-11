@@ -19,6 +19,7 @@ mod aml;
 mod bluetooth;
 mod boot_image;
 pub(crate) mod bundle;
+mod bundle_repair;
 mod cursor;
 mod display;
 pub(crate) mod fdr;
@@ -497,14 +498,80 @@ pub(crate) fn feed_console_input() {
     }
 }
 
-/// The guest's console UART, shown line by line as `GUEST| ...`.
+/// The guest's console UART, shown line by line as `GUEST| ...`. In the
+/// automatic Metal plugin repair's boot it also types the repair's commands
+/// (`bundle_repair`), ahead of the host's own input.
 #[derive(Default)]
 struct GuestConsole {
     lines: console_lines::Lines,
+    repair: ConsoleRepair,
+}
+
+#[derive(Default)]
+enum ConsoleRepair {
+    /// Not looked at yet: the boot's kind is known once the guest runs.
+    #[default]
+    Unknown,
+    Driving(stela_boot_core::bundle_repair::Driver),
+    Off,
+}
+
+impl GuestConsole {
+    fn millis() -> u64 {
+        host::fresh_counter() / (host::COUNTER_HZ / 1000)
+    }
+
+    fn repair(&mut self) -> Option<&mut stela_boot_core::bundle_repair::Driver> {
+        if matches!(self.repair, ConsoleRepair::Unknown) {
+            self.repair = match bundle_repair::driver(Self::millis()) {
+                Some(driver) => ConsoleRepair::Driving(driver),
+                None => ConsoleRepair::Off,
+            };
+        }
+        match &mut self.repair {
+            ConsoleRepair::Driving(driver) => Some(driver),
+            _ => None,
+        }
+    }
+
+    /// Log what the driver did; a failure stops the machine with the manual
+    /// remedy, once, and the driver types nothing more.
+    fn report_repair(&mut self) {
+        let Some(driver) = self.repair() else {
+            return;
+        };
+        let events = driver.take_events();
+        let failed = events
+            .iter()
+            .any(|event| matches!(event, stela_boot_core::bundle_repair::Event::Failed(_)));
+        for event in &events {
+            output::arguments(format_args!(
+                "{}\n",
+                stela_boot_core::bundle_repair::describe(event)
+            ));
+        }
+        if failed {
+            self.repair = ConsoleRepair::Off;
+            output::stopping(
+                "the automatic single-user repair could not create StelaGPU.bundle's \
+                 directories (its BUNDLE REPAIR lines say where it stopped): boot macOS once \
+                 with --single-user and install it there by hand",
+            );
+            service::request_shutdown(true);
+        }
+    }
 }
 
 impl ConsoleSink for GuestConsole {
     fn poll(&mut self) -> Option<u8> {
+        if let Some(driver) = self.repair() {
+            driver.tick(Self::millis());
+            let byte = driver.next_byte();
+            self.report_repair();
+            if byte.is_some() {
+                return byte;
+            }
+        }
         let input = &CONSOLE_INPUT;
         let taken = input.taken.load(Ordering::Relaxed);
         if taken == input.put.load(Ordering::Acquire) {
@@ -527,6 +594,12 @@ impl ConsoleSink for GuestConsole {
                     "GUEST-FRAGMENT bytes={} continues=1\n",
                     fragment.bytes
                 ));
+            }
+            if let Some(driver) = self.repair() {
+                let now = Self::millis();
+                driver.tick(now);
+                driver.line(&line, now);
+                self.report_repair();
             }
             if !line.trim().is_empty()
                 && let Ok(mut lines) = GUEST_LINES.0.try_borrow_mut()

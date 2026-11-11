@@ -447,6 +447,13 @@ fn powered_serial_controllers() -> (AppleDevices, Console, u64, [u64; 3]) {
 }
 
 #[test]
+fn the_host_copies_the_nor_image_only_when_a_nor_exists() {
+    let (mut d, ..) = powered_serial_controllers();
+    assert_eq!(d.nor_image(), Some(stela_soc_data::nor::Image::fresh()));
+    assert_eq!(AppleDevices::new().nor_image(), None);
+}
+
+#[test]
 fn pmgr_serial_constructor_hooks_gate_mmio_and_preserve_kept_configuration() {
     let (mut d, console, supply, [uart, i2c, spi]) = powered_serial_controllers();
     for (address, value) in [(uart, 3), (i2c + 0x30, 0x1234), (spi + 0x30, 7)] {

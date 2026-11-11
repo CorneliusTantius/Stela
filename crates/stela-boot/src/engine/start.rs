@@ -71,17 +71,32 @@ fn from_disk(
         defaults.boot_args.push_str(" bt-transport-override=0");
     }
     defaults.boot_args.push_str(&lock_timeout_arguments(tsc_hz));
-    if options.maintenance_write {
+    // The automatic Metal plugin repair NVRAM asked for is the manual
+    // remedy's boot: single-user, filesystem protection off.
+    let maintenance_write = options.maintenance_write || options.bundle_repair;
+    let single_user = options.single_user || options.bundle_repair;
+    if maintenance_write {
         // CSR_ALLOW_UNRESTRICTED_FS; the kext grant and other policy bits stay separate.
         defaults.security.sip_bits |= 2;
         output::arguments(format_args!(
-            "MAINTENANCE filesystem protection disabled for this boot (--maintenance-write)\n"
+            "MAINTENANCE filesystem protection disabled for this boot ({})\n",
+            if options.maintenance_write {
+                "--maintenance-write"
+            } else {
+                "the automatic Metal plugin repair"
+            }
         ));
     }
-    if options.single_user {
+    if single_user {
         defaults.boot_args.push_str(" -s");
     }
-    gpu::single_user(options.single_user);
+    bundle_repair::boot(if options.bundle_repair {
+        stela_boot_core::bundle_repair::Boot::Repair
+    } else if options.single_user {
+        stela_boot_core::bundle_repair::Boot::SingleUser
+    } else {
+        stela_boot_core::bundle_repair::Boot::Normal
+    });
     let result = if options.upgrade {
         bundle::upgrade_from_disk(partition, options.boot_volume, &defaults)
     } else if let Some(kind) = options.recovery {
@@ -121,6 +136,7 @@ pub extern "sysv64" fn entry(handoff: u64) -> ! {
     // A single-user boot is a console, which draws through no GPU.
     if options.boots_macos()
         && !options.single_user
+        && !options.bundle_repair
         && let Some(reason) = gpu::no_metal_device()
     {
         output::fatal(format_args!("macOS cannot run without a GPU: {reason}"));
@@ -577,6 +593,7 @@ fn open_storage(handoff: &'static Handoff, options: &Options, host: &mut OpenedH
         ));
         let opened = nor::HostNor::open(device);
         crate::status::done("");
+        bundle_repair::nvram(&opened.2.proxy);
         opened
     });
     let (host_nor, nor_image, nvram, sep_state, board_flash) = match nor {

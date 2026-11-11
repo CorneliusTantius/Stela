@@ -35,6 +35,13 @@ pub(super) fn request_shutdown(force: bool) {
     });
 }
 
+/// Stop the guest and restart the PC: what NVRAM records at the stop
+/// chooses the next boot. Only the GPU gate's plugin repair asks.
+#[cfg(feature = "nvk")]
+pub(super) fn request_restart() {
+    SHUTDOWN.request(Shutdown::Restart);
+}
+
 pub(super) fn shutdown_pending() -> bool {
     SHUTDOWN.pending()
 }
@@ -154,9 +161,19 @@ impl Service {
     /// waiting: at the stop, before the PC restarts or turns off.
     pub(super) fn stop(&mut self) {
         if let Some(nor) = self.nor.as_mut() {
-            let (dirty, anchor) = self
-                .devices
-                .with(|devices| (nor::HostNor::dirty(devices), devices.rtc_anchor()));
+            let repair = super::bundle_repair::change_pending();
+            let (mut dirty, anchor, image) = self.devices.with(|devices| {
+                (
+                    nor::HostNor::dirty(devices),
+                    devices.rtc_anchor(),
+                    repair.then(|| devices.nor_image()).flatten(),
+                )
+            });
+            // The automatic plugin repair's record, on top of what the
+            // guest committed: the guest no longer writes its NOR.
+            if let Some(mut image) = image {
+                dirty.extend(super::bundle_repair::at_stop(&mut image));
+            }
             nor.store(dirty);
             if let Some(anchor) = anchor {
                 nor.keep_anchor(anchor);
@@ -179,6 +196,10 @@ impl Service {
                 Shutdown::Forced => {
                     self.stop();
                     self.power.power_off();
+                }
+                Shutdown::Restart => {
+                    self.stop();
+                    self.power.restart();
                 }
                 Shutdown::Orderly => self
                     .devices
