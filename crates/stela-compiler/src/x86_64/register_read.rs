@@ -717,6 +717,164 @@ pub fn interrupt_status_thunk(
     finish_unless(code, [closed, changed, due], pc)
 }
 
+/// What a [`timer_thunk`] completes, of one generic timer channel whose
+/// count is the system count with no offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimerAccess {
+    /// MSR TVAL: the compare becomes the count plus Xt's low 32 bits,
+    /// sign-extended.
+    WriteValue,
+    /// MSR CVAL: the compare becomes Xt.
+    WriteCompare,
+    /// MSR CTL: the control becomes Xt as the register takes it.
+    WriteControl(Written),
+    /// MRS CTL: ENABLE and IMASK as stored, ISTATUS while enabled with the
+    /// count at or past the compare.
+    ReadControl,
+}
+
+/// Where a [`timer_thunk`] finds its channel and the engine's words: two
+/// cells whose `value` is the address of the compare's storage and the
+/// control's, the count before which the engine looks at the lines again
+/// ([`crate::x86_64::transition::Places::lines_until`]) and the count reader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimerPlaces {
+    pub compare: Place,
+    pub control: Place,
+    pub lines_until: Place,
+    pub count: Place,
+}
+
+/// ENABLE and IMASK of a timer control.
+const TIMER_ARMING: i8 = 0b11;
+/// ENABLE alone: the timer's output follows the compare.
+const TIMER_ARMED: i8 = 0b01;
+/// ISTATUS's bit.
+const TIMER_STATUS_SHIFT: u8 = 2;
+
+/// The thunk completing `access` of a timer channel at `pc` with Xt, else
+/// exiting at `pc`. Both cells must be open. A write completes only when it
+/// leaves the channel's output low and its next rise no earlier than the
+/// engine's `lines_until`, which must name a count (not 0): the output was
+/// low (disabled, masked or before the compare), and once the write is done
+/// it is disabled, masked or armed for a compare after the count and at or
+/// past `lines_until`. The engine, which looks at the lines again at
+/// `lines_until`, then finds the new compare in storage; anything else,
+/// which could raise or lower the line or move its rise earlier, exits. A
+/// count that passes the new compare after the thunk read it is at or past
+/// `lines_until` too. It clobbers RAX, RCX and RDX.
+pub fn timer_thunk(pc: GuestAddress, rt: u8, access: TimerAccess, places: TimerPlaces) -> Thunk {
+    use Gpr::{Rax, Rcx, Rdx};
+    use Size::{Dword, Qword};
+    let (mut code, closed) = open(places.compare);
+    let mut asm = Asm::new(&mut code);
+    asm.place(Rax, places.control);
+    asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rax, 0), 0);
+    let control_closed = asm.jcc(Cond::E);
+    let storage = |asm: &mut Asm<'_>, destination: Gpr, cell: Place| {
+        asm.place(destination, cell);
+        asm.mov_load(Qword, destination, Mem::base_disp8(destination, VALUE));
+    };
+    if access == TimerAccess::ReadControl {
+        read_count(&mut asm, places.count);
+        storage(&mut asm, Rax, places.compare);
+        asm.alu_load(Alu::Cmp, Qword, Rdx, Mem::base(Rax, 0));
+        asm.setcc(Cond::Ae, Rcx);
+        asm.movzx(Dword, Rcx, Size::Byte, Rcx);
+        storage(&mut asm, Rax, places.control);
+        asm.mov_load(Qword, Rax, Mem::base(Rax, 0));
+        asm.alu(Alu::And, Dword, Rcx, Rax);
+        asm.shift_imm(ShiftOp::Shl, Dword, Rcx, TIMER_STATUS_SHIFT);
+        asm.alu_imm8(Alu::And, Qword, Rax, !(1 << TIMER_STATUS_SHIFT));
+        asm.alu(Alu::Or, Qword, Rax, Rcx);
+        if rt != 31 {
+            asm.mov_store(Qword, register(rt), Rax);
+        }
+        return finish_unless(code, [closed, control_closed], pc);
+    }
+    asm.place(Rcx, places.lines_until);
+    asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rcx, 0), 0);
+    let unknown = asm.jcc(Cond::E);
+    read_count(&mut asm, places.count);
+    // The output was low: not armed, or armed before its compare.
+    storage(&mut asm, Rax, places.control);
+    asm.mov_load(Dword, Rax, Mem::base(Rax, 0));
+    asm.alu_imm8(Alu::And, Dword, Rax, TIMER_ARMING);
+    asm.alu_imm8(Alu::Cmp, Dword, Rax, TIMER_ARMED);
+    let was_quiet = asm.jcc(Cond::Ne);
+    storage(&mut asm, Rax, places.compare);
+    asm.alu_load(Alu::Cmp, Qword, Rdx, Mem::base(Rax, 0));
+    let was_high = asm.jcc(Cond::Ae);
+    asm.bind(was_quiet);
+    // The new register value into RCX, and the compare it arms into RAX
+    // while the control arms one, else straight to the store.
+    let write = |asm: &mut Asm<'_>| {
+        if rt == 31 {
+            asm.alu(Alu::Xor, Dword, Rcx, Rcx);
+        } else {
+            asm.mov_load(Qword, Rcx, register(rt));
+        }
+    };
+    let quiet = match access {
+        TimerAccess::WriteValue | TimerAccess::WriteCompare => {
+            if access == TimerAccess::WriteValue {
+                if rt == 31 {
+                    asm.alu(Alu::Xor, Dword, Rcx, Rcx);
+                } else {
+                    asm.movsxd(Rcx, register(rt));
+                }
+                asm.alu(Alu::Add, Qword, Rcx, Rdx);
+            } else {
+                write(&mut asm);
+            }
+            storage(&mut asm, Rax, places.control);
+            asm.mov_load(Dword, Rax, Mem::base(Rax, 0));
+            asm.alu_imm8(Alu::And, Dword, Rax, TIMER_ARMING);
+            asm.alu_imm8(Alu::Cmp, Dword, Rax, TIMER_ARMED);
+            let quiet = asm.jcc(Cond::Ne);
+            asm.mov(Qword, Rax, Rcx);
+            quiet
+        }
+        TimerAccess::WriteControl(written) => {
+            write(&mut asm);
+            if written.keep != u64::MAX {
+                asm.mov_imm64(Rax, written.keep);
+                asm.alu(Alu::And, Qword, Rcx, Rax);
+            }
+            if written.set != 0 {
+                asm.mov_imm64(Rax, written.set);
+                asm.alu(Alu::Or, Qword, Rcx, Rax);
+            }
+            asm.mov(Dword, Rax, Rcx);
+            asm.alu_imm8(Alu::And, Dword, Rax, TIMER_ARMING);
+            asm.alu_imm8(Alu::Cmp, Dword, Rax, TIMER_ARMED);
+            let quiet = asm.jcc(Cond::Ne);
+            storage(&mut asm, Rax, places.compare);
+            asm.mov_load(Qword, Rax, Mem::base(Rax, 0));
+            quiet
+        }
+        TimerAccess::ReadControl => unreachable!("handled above"),
+    };
+    // Armed: after the count, and no earlier than the engine looks again.
+    asm.alu(Alu::Cmp, Qword, Rax, Rdx);
+    let at_once = asm.jcc(Cond::Be);
+    asm.place(Rdx, places.lines_until);
+    asm.alu_load(Alu::Cmp, Qword, Rax, Mem::base(Rdx, 0));
+    let earlier = asm.jcc(Cond::B);
+    asm.bind(quiet);
+    let target = match access {
+        TimerAccess::WriteControl(_) => places.control,
+        _ => places.compare,
+    };
+    storage(&mut asm, Rax, target);
+    asm.mov_store(Qword, Mem::base(Rax, 0), Rcx);
+    finish_unless(
+        code,
+        [closed, control_closed, unknown, was_high, at_once, earlier],
+        pc,
+    )
+}
+
 /// The count of the reader at `count` into RDX, as [`count_thunk`] reads
 /// it. Clobbers RAX and RCX.
 pub(super) fn read_count(asm: &mut Asm<'_>, count: Place) {
@@ -1424,6 +1582,225 @@ mod tests {
         expect(open(u64::MAX, 6), 0b01, NEXT, 0x40);
         // XZR reads nothing.
         let discard = interrupt_status_thunk(PC, 31, CELL, EPOCH, READER).code;
+        let before = state.x;
+        assert_eq!(run(&discard, &mut state), NEXT);
+        assert_eq!(state.x, before);
+    }
+
+    /// Timer thunks run on the host against a count the test moves: writes
+    /// that keep the output low and arm no compare before `lines_until`
+    /// complete into storage, every other write exits with storage as it
+    /// was, and CTL reads give ENABLE and IMASK as stored with ISTATUS from
+    /// the count.
+    #[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
+    #[test]
+    fn timer_thunks_complete_only_writes_that_raise_nothing_before_the_engine_looks() {
+        use crate::GuestState;
+        use core::mem::offset_of;
+        use core::sync::atomic::Ordering::Relaxed;
+        #[repr(C)]
+        #[derive(Default)]
+        struct Timer {
+            compare: Cell,
+            control: Cell,
+            cval: u64,
+            ctl: u64,
+            lines_until: u64,
+        }
+        const ENABLE: u64 = 1;
+        const IMASK: u64 = 2;
+        const ISTATUS: u64 = 4;
+        let place = |offset: usize| Place::new(Anchor::Mirrors, offset);
+        let places = TimerPlaces {
+            compare: place(offset_of!(Timer, compare)),
+            control: place(offset_of!(Timer, control)),
+            lines_until: place(offset_of!(Timer, lines_until)),
+            count: READER,
+        };
+        let mut timer = alloc::boxed::Box::new(Timer::default());
+        let base = &mut *timer as *mut Timer;
+        let published = alloc::boxed::Box::new(CountState::default());
+        published.ceiling.store(u64::MAX, Relaxed);
+        let mut count = alloc::boxed::Box::new(Count {
+            state: &*published as *const CountState as u64,
+            ..Count::default()
+        });
+        let mut state = GuestState::default();
+        state.anchors[Anchor::Mirrors] = base as u64;
+        state.anchors[Anchor::Count] = &mut *count as *mut Count as u64;
+        let (cval_at, ctl_at) = (
+            base as u64 + offset_of!(Timer, cval) as u64,
+            base as u64 + offset_of!(Timer, ctl) as u64,
+        );
+        // SAFETY: `base` points into the live box; every access happens
+        // between thunk runs.
+        let data = |f: &mut dyn FnMut(&mut Timer)| unsafe { f(&mut *base) };
+        let open = |d: &mut Timer| {
+            d.compare = Cell {
+                readable: 1,
+                value: cval_at,
+            };
+            d.control = Cell {
+                readable: 1,
+                value: ctl_at,
+            };
+        };
+        data(&mut |d| open(d));
+        let keep = Written {
+            keep: ENABLE | IMASK | ISTATUS,
+            set: 0,
+        };
+        let (value, compare) = (
+            timer_thunk(PC, 5, TimerAccess::WriteValue, places).code,
+            timer_thunk(PC, 5, TimerAccess::WriteCompare, places).code,
+        );
+        let control = timer_thunk(PC, 5, TimerAccess::WriteControl(keep), places).code;
+        // count, lines_until, (cval, ctl) before, the thunk, Xt, the exit
+        // and (cval, ctl) after.
+        let mut expect = |now: u64,
+                          until: u64,
+                          before: (u64, u64),
+                          code: &[u8],
+                          xt: u64,
+                          exit: Exit,
+                          after: (u64, u64)| {
+            published.offset.store(now, Relaxed);
+            data(&mut |d| {
+                (d.cval, d.ctl) = before;
+                d.lines_until = until;
+            });
+            state.x[5] = xt;
+            let ran = run(code, &mut state);
+            data(&mut |d| {
+                assert_eq!(
+                    (ran.pc, d.cval, d.ctl),
+                    (exit.pc, after.0, after.1),
+                    "now {now} until {until} before {before:?} xt {xt:#x}"
+                );
+            });
+            assert_eq!(state.x[5], xt, "a write leaves Xt");
+        };
+        let armed = (200, ENABLE);
+        // TVAL: count plus the sign-extended low word. 180 is past 150.
+        expect(100, 150, armed, &value, 80, NEXT, (180, ENABLE));
+        expect(
+            100,
+            150,
+            armed,
+            &value,
+            0xdead_0000_0000_0050,
+            NEXT,
+            (180, ENABLE),
+        );
+        // Earlier than the engine looks again: exit.
+        expect(100, 150, armed, &value, 30, MISS, armed);
+        // Due at once, or already past: exit.
+        expect(100, 150, armed, &value, 0, MISS, armed);
+        expect(100, 150, armed, &value, 0xffff_fff6, MISS, armed);
+        // CVAL: at lines_until itself completes.
+        expect(100, 150, armed, &compare, 150, NEXT, (150, ENABLE));
+        expect(100, 150, armed, &compare, 149, MISS, armed);
+        // The output is high (armed and past its compare): every write exits.
+        expect(100, 150, (90, ENABLE), &compare, 500, MISS, (90, ENABLE));
+        expect(100, 150, (90, ENABLE), &control, 0, MISS, (90, ENABLE));
+        // Masked or disabled, any compare completes and arms nothing.
+        expect(
+            100,
+            150,
+            (90, ENABLE | IMASK),
+            &compare,
+            120,
+            NEXT,
+            (120, ENABLE | IMASK),
+        );
+        expect(100, 150, (90, 0), &value, 5, NEXT, (105, 0));
+        // CTL: disabling or masking completes; ISTATUS and RES0 bits as the
+        // register takes them.
+        expect(
+            100,
+            150,
+            armed,
+            &control,
+            !ENABLE,
+            NEXT,
+            (200, IMASK | ISTATUS),
+        );
+        expect(100, 150, armed, &control, 0, NEXT, (200, 0));
+        // Unmasking an expired compare raises the line: exit.
+        expect(
+            100,
+            150,
+            (90, ENABLE | IMASK),
+            &control,
+            ENABLE,
+            MISS,
+            (90, ENABLE | IMASK),
+        );
+        // Enabling arms the stored compare: before lines_until exits.
+        expect(100, 150, (120, 0), &control, ENABLE, MISS, (120, 0));
+        expect(100, 150, (160, 0), &control, ENABLE, NEXT, (160, ENABLE));
+        // No count named (0): every write exits; none armed (MAX): only a
+        // write that arms a compare exits.
+        expect(100, 0, armed, &control, 0, MISS, armed);
+        expect(100, u64::MAX, armed, &control, 0, NEXT, (200, 0));
+        expect(100, u64::MAX, armed, &value, 1 << 20, MISS, armed);
+        expect(
+            100,
+            u64::MAX,
+            (200, 0),
+            &value,
+            1 << 20,
+            NEXT,
+            (100 + (1 << 20), 0),
+        );
+        // Closed cells: the engine's.
+        for closed in [offset_of!(Timer, compare), offset_of!(Timer, control)] {
+            data(&mut |d| {
+                open(d);
+                // SAFETY: `closed` is the offset of a Cell field of `d`.
+                unsafe { (*((d as *mut Timer as *mut u8).add(closed) as *mut Cell)).readable = 0 };
+            });
+            expect(100, 150, armed, &control, 0, MISS, armed);
+        }
+        data(&mut |d| open(d));
+        // The count passes the new compare right after the thunk read it:
+        // the native ISR read the engine left open until lines_until (150)
+        // exits there, before the compare (180) the line now rises at.
+        expect(100, 150, armed, &value, 80, NEXT, (180, ENABLE));
+        published.offset.store(180, Relaxed);
+        let mut status = Cell {
+            readable: 150,
+            value: 0,
+        };
+        let mut epoch = 0u64;
+        let mut isr_state = GuestState::default();
+        isr_state.anchors[Anchor::Mirrors] = &mut status as *mut Cell as u64;
+        isr_state.anchors[Anchor::Control] = &mut epoch as *mut u64 as u64;
+        isr_state.anchors[Anchor::Count] = state.anchors[Anchor::Count];
+        let isr = interrupt_status_thunk(PC, 5, CELL, Place::new(Anchor::Control, 0), READER);
+        assert_eq!(run(&isr.code, &mut isr_state), MISS);
+        // CTL reads: all eight ENABLE, IMASK and count cases, and a stored
+        // ISTATUS bit is never what the read gives.
+        let read = timer_thunk(PC, 7, TimerAccess::ReadControl, places).code;
+        let mut now = 180;
+        for ctl in 0..8u64 {
+            for past in [false, true] {
+                now += 10;
+                published.offset.store(now, Relaxed);
+                let cval = if past { now } else { now + 1 };
+                data(&mut |d| (d.cval, d.ctl) = (cval, ctl));
+                state.x[7] = 0xdead;
+                assert_eq!(run(&read, &mut state), NEXT);
+                let status = if ctl & ENABLE != 0 && past {
+                    ISTATUS
+                } else {
+                    0
+                };
+                assert_eq!(state.x[7], ctl & !ISTATUS | status, "ctl {ctl} past {past}");
+                data(&mut |d| assert_eq!((d.cval, d.ctl), (cval, ctl)));
+            }
+        }
+        let discard = timer_thunk(PC, 31, TimerAccess::ReadControl, places).code;
         let before = state.x;
         assert_eq!(run(&discard, &mut state), NEXT);
         assert_eq!(state.x, before);
