@@ -1638,17 +1638,41 @@ impl<'a> Store<'a> {
         }
     }
 
-    /// The pack a checkpoint writes over the pack file's records `file`
-    /// within `bound`: the records that gain entries from `proven` first,
-    /// then the file's others, as long as they fit. Records the file holds
-    /// unchanged stay where they are, so only the gains are written.
-    pub fn checkpoint_layout(
-        &self,
-        file: &[FileEntry<'a>],
-        proven: &BTreeMap<Digest, Record>,
-        bound: u64,
-    ) -> Layout<'a> {
-        let format = self.format();
+    /// What a checkpoint lays out over, taken under the store's lock to use
+    /// outside it ([`CheckpointBase::layout`]).
+    pub fn checkpoint_base(&self) -> CheckpointBase<'a> {
+        CheckpointBase {
+            translator: self.translator,
+            format: self.format(),
+            file: self.file(),
+            previous: self.pack.is_some() || self.file.is_some(),
+        }
+    }
+}
+
+/// The pack file's records and format a checkpoint lays out over.
+#[derive(Debug, Clone)]
+pub struct CheckpointBase<'a> {
+    translator: Digest,
+    format: PackFormat,
+    file: Arc<Vec<FileEntry<'a>>>,
+    /// The file holds a pack: the layout goes over it.
+    previous: bool,
+}
+
+impl<'a> CheckpointBase<'a> {
+    /// Whether the file holds a pack the layout must keep.
+    pub fn previous(&self) -> bool {
+        self.previous
+    }
+
+    /// The pack a checkpoint writes over the file within `bound`: the
+    /// records that gain entries from `proven` first, then the file's
+    /// others, as long as they fit. Records the file holds unchanged stay
+    /// where they are, so only the gains are written.
+    pub fn layout(&self, proven: &BTreeMap<Digest, Record>, bound: u64) -> Layout<'a> {
+        let file = &self.file[..];
+        let format = self.format;
         let mut scratch = DecodeScratch::default();
         let mut candidates: Vec<(Digest, Piece<'a>)> = Vec::new();
         for (key, record) in proven {
@@ -1693,10 +1717,12 @@ impl<'a> Store<'a> {
                 kept.push((key, piece));
             }
         }
-        let previous = (self.pack.is_some() || self.file.is_some()).then_some(file);
+        let previous = self.previous.then_some(file);
         layout_over(&self.translator, previous, kept, format, bound)
     }
+}
 
+impl<'a> Store<'a> {
     pub fn plan(&mut self, bound: u64, room: impl Fn() -> bool) -> Planned<'a> {
         let mut proven = core::mem::take(&mut self.proven);
         self.proven_bytes = 0;
@@ -2798,7 +2824,7 @@ mod tests {
         }
         // The first checkpoint: nothing on file yet, so laid out whole.
         let proven = store.take_proven();
-        let layout = store.checkpoint_layout(&store.file(), &proven, bound);
+        let layout = store.checkpoint_base().layout(&proven, bound);
         assert_eq!(layout.changed(), None);
         let image = layout.to_vec();
         store.adopt(Arc::new(written(layout)));
@@ -2812,7 +2838,7 @@ mod tests {
         // The second checkpoint appends the two changed records and the
         // index; the second page's record stays where it is.
         let proven = store.take_proven();
-        let layout = store.checkpoint_layout(&store.file(), &proven, bound);
+        let layout = store.checkpoint_base().layout(&proven, bound);
         let changed = layout.changed().unwrap().to_vec();
         assert_eq!(changed.len(), 3);
         let second_bytes = Pack::parse(&image, &translator)
