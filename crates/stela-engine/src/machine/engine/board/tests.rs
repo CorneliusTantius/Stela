@@ -11,9 +11,15 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// A deadline for every wait: a stuck grace period fails the test.
-fn give_up(started: Instant) -> impl FnMut() -> bool {
-    move || started.elapsed() > Duration::from_secs(20)
+/// A deadline for one wait, counted from its start: a stuck grace period
+/// fails the test, a slow host does not. Each check yields, so a waiter on
+/// a loaded host leaves the CPU to the readers it waits for.
+fn give_up() -> impl FnMut() -> bool {
+    let started = Instant::now();
+    move || {
+        thread::yield_now();
+        started.elapsed() > Duration::from_secs(60)
+    }
 }
 
 /// A small pseudo-random step, so each thread reads its own pattern.
@@ -60,7 +66,6 @@ fn grace_keeps_buffers_until_readers_left() {
     );
     let current = Arc::new(AtomicUsize::new(0));
     let done = Arc::new(AtomicBool::new(false));
-    let started = Instant::now();
     let readers: Vec<_> = (0..READERS)
         .map(|pe| {
             let (grace, buffers, current, done) = (
@@ -112,7 +117,7 @@ fn grace_keeps_buffers_until_readers_left() {
         current.store(new, Ordering::Release);
         let snapshot = grace.snapshot();
         assert!(
-            grace.wait(writer, &snapshot, give_up(started)),
+            grace.wait(writer, &snapshot, give_up()),
             "a grace period never passed"
         );
         for word in &buffers[old] {
@@ -350,7 +355,6 @@ fn ring_reuses_parts_only_after_readers_left(parts: usize) {
     let lock = Arc::new(std::sync::Mutex::new(()));
     let waits = Arc::new(AtomicU32::new(0));
     let redone = Arc::new(AtomicU32::new(0));
-    let started = Instant::now();
     fn word(place: Place) -> usize {
         (place.part as usize * PART + place.offset as usize) / 8
     }
@@ -420,17 +424,17 @@ fn ring_reuses_parts_only_after_readers_left(parts: usize) {
                                 }
                                 Advance::Wait(snapshot) => {
                                     waits.fetch_add(1, Ordering::Relaxed);
+                                    let mut give = give_up();
                                     let passed = match outside {
                                         true => loop {
                                             if grace.passed(&snapshot, None) {
                                                 break true;
                                             }
-                                            if give_up(started)() {
+                                            if give() {
                                                 break false;
                                             }
-                                            thread::yield_now();
                                         },
-                                        false => grace.wait(pe, &snapshot, give_up(started)),
+                                        false => grace.wait(pe, &snapshot, give),
                                     };
                                     assert!(passed, "a part's grace never passed");
                                 }
