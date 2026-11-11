@@ -293,7 +293,7 @@ fn dispatch_caches_complete_transfers_as_table_probes() {
                     }
                 }
                 11 => {
-                    // A context switch: the owner makes the cache stale.
+                    // A context switch: slots check their half's context.
                     contexts = match rng.below(3) {
                         0 => [
                             CONTEXTS[rng.below(3) as usize],
@@ -301,7 +301,6 @@ fn dispatch_caches_complete_transfers_as_table_probes() {
                         ],
                         _ => [CONTEXTS[0], CONTEXTS[1]],
                     };
-                    cache.invalidate();
                 }
                 12 => epoch += 1,
                 13..=20 if observed != epoch => {
@@ -335,7 +334,8 @@ fn dispatch_caches_complete_transfers_as_table_probes() {
             let held = cache.slot(btype, pc);
             let cached = held[0] == pc
                 && held[1] == cache.generation() + epoch
-                && held[4] == itlb.drop_epoch(pc);
+                && held[4] == itlb.drop_epoch(pc)
+                && held[5] == contexts[half(pc)];
             let (mut probed, mut dispatched) = (base, base);
             let mut states = [state.clone(), state.clone()];
             let lookup = run.run(false, btype, pc, word, &mut states[0], &mut probed);

@@ -709,8 +709,8 @@ pub unsafe fn stamp_counts(stamps: u64) -> [u64; STAMP_COUNTS] {
 pub const DISPATCH_SLOTS: usize = 1024;
 /// Bytes of one slot of a [`DispatchCache`]: the target, the dispatch
 /// generation it was filled in, the block word for `ChainControl::block`,
-/// the block's host entry and the ITLB drop epoch of the target's half
-/// ([`ITLB_DROPS`]) it was filled in.
+/// the block's host entry, and the ITLB drop epoch ([`ITLB_DROPS`]) and the
+/// context of the target's half it was filled in.
 pub const DISPATCH_SLOT_BYTES: usize = 64;
 /// Bytes of each BTYPE's part of a [`DispatchCache`].
 pub const DISPATCH_PART_BYTES: usize = DISPATCH_SLOTS * DISPATCH_SLOT_BYTES;
@@ -732,12 +732,13 @@ pub const fn dispatch_slot(pc: u64) -> usize {
 /// [`dispatch_slot`]. A slot is good while the PE's dispatch generation
 /// plus its control's interruption epoch is what it was when the slot was
 /// filled, and the drop epoch of the target's half in the PE's ITLB
-/// ([`ITLB_DROPS`]) is too: the generation grows at every other change that
+/// ([`ITLB_DROPS`]) and the context of that half are too: the generation grows at every other change that
 /// could make a table probe of the target find another block or none. It
 /// grows when the block table forgets an entry or puts another in its place
 /// for the same PC and key ([`LookupTable`] holds each PE's cache), when
-/// the ITLB is cleared, and when the PE's owner changes its contexts,
-/// tables or acknowledged interruption. A page of the ITLB dropping or
+/// the ITLB is cleared, and when the PE's owner changes its tables or
+/// acknowledged interruption. Another context gives the same key again
+/// while no page of its half dropped or changed. A page of the ITLB dropping or
 /// changing grows only its half's drop epoch, which only the PE's owner
 /// changes, never while its native code runs. A capacity eviction from either table is
 /// not a change: the entry's block stays valid until forgetting reaches
@@ -782,7 +783,7 @@ impl DispatchCache {
 
     /// The slot of `pc` in the part of `btype`: the target, the generation
     /// plus epoch it was filled in, the block word, the host entry and the
-    /// drop epoch of `pc`'s half it was filled in.
+    /// drop epoch and context of `pc`'s half it was filled in.
     pub fn slot(&self, btype: u8, pc: u64) -> [u64; DISPATCH_SLOT_BYTES / 8] {
         let at = DISPATCH_HEADER_WORDS
             + (usize::from(btype) * DISPATCH_PART_BYTES + dispatch_slot(pc) * DISPATCH_SLOT_BYTES)
@@ -2426,12 +2427,24 @@ fn dispatch_index(asm: &mut crate::x86_64::asm::Asm, slot: Gpr, target: crate::T
 /// R`into` = the drop epoch of the half of the target in RAX in the ITLB
 /// of the control at RCX ([`ITLB_DROPS`]).
 fn dispatch_drops(asm: &mut crate::x86_64::asm::Asm, into: Gpr) {
-    asm.mov(Qword, into, Rax);
-    asm.shift_imm(ShiftOp::Shr, Qword, into, 55);
-    asm.alu_imm8(Alu::And, Dword, into, 1);
+    dispatch_half(asm, into);
     asm.shift_imm(ShiftOp::Shl, Dword, into, 3);
     asm.alu_load(Alu::Add, Qword, into, Mem::base(Rcx, ITLB));
     asm.mov_load(Qword, into, Mem::base(into, ITLB_DROPS));
+}
+
+/// R`into` = the half of the target in RAX ([`half`]).
+fn dispatch_half(asm: &mut crate::x86_64::asm::Asm, into: Gpr) {
+    asm.mov(Qword, into, Rax);
+    asm.shift_imm(ShiftOp::Shr, Qword, into, 55);
+    asm.alu_imm8(Alu::And, Dword, into, 1);
+}
+
+/// R`into` = the context of the half of the target in RAX in the control
+/// at RCX.
+fn dispatch_context(asm: &mut crate::x86_64::asm::Asm, into: Gpr) {
+    dispatch_half(asm, into);
+    asm.mov_load(Qword, into, Mem::indexed(Rcx, into, 8, CONTEXTS));
 }
 
 /// The memory operand of word `word` of the slot R`slot` names
@@ -2478,6 +2491,9 @@ fn dispatcher_with(
         dispatch_drops(&mut asm, R11);
         asm.alu_load(Alu::Cmp, Qword, R11, dispatch_word(R9, btype, 4));
         let dropped = asm.jcc8(Cond::Ne);
+        dispatch_context(&mut asm, R11);
+        asm.alu_load(Alu::Cmp, Qword, R11, dispatch_word(R9, btype, 5));
+        let switched = asm.jcc8(Cond::Ne);
         spend_budget(&mut asm, policy);
         let spent = asm.jcc8(Cond::B);
         asm.shift_imm(ShiftOp::Shr, Dword, Rdx, ExitWord::RAN_SHIFT as u8);
@@ -2493,6 +2509,7 @@ fn dispatcher_with(
         asm.bind(other);
         asm.bind(stale);
         asm.bind(dropped);
+        asm.bind(switched);
         // Into the table probe, which follows.
         asm.mov_store(Qword, Mem::base(Rcx, DISPATCH_SEEN), R8);
     }
@@ -2563,6 +2580,9 @@ fn dispatcher_with(
         // now is the one the table probe's translation saw.
         dispatch_drops(&mut asm, Rdx);
         asm.mov_store(Qword, dispatch_word(R11, btype, 4), Rdx);
+        // Only the owner changes contexts, between native runs too.
+        dispatch_context(&mut asm, Rdx);
+        asm.mov_store(Qword, dispatch_word(R11, btype, 5), Rdx);
     }
     found(&mut asm);
     for miss in misses {

@@ -231,7 +231,7 @@ impl Owner {
             core::ptr::addr_of_mut!((*self.storage.control.get()).salts)
                 .write(salts(contexts, masks));
         }
-        self.storage.dispatch.invalidate();
+        // Dispatch cache slots check the context of their half themselves.
     }
     pub(super) fn begin(&mut self, block: usize, budget: u64) {
         let control = self.storage.control.get();
