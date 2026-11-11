@@ -1577,10 +1577,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
         words
     }
 
-    /// Device accesses by the physical address they reached: which
-    /// device registers to serve faster.
-    pub fn system_words(&self) -> &BTreeMap<u32, DeviceRegister> {
-        &self.system_words
+    /// System exits by instruction word and their handling ticks, under
+    /// step timing, ordered by word.
+    pub fn system_words(&self) -> BTreeMap<u32, DeviceRegister> {
+        self.system_words.to_map()
     }
 
     pub fn device_registers(&self) -> &BTreeMap<u64, DeviceRegister> {

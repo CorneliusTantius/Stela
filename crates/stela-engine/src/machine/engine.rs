@@ -54,6 +54,7 @@ mod pointer_authentication;
 mod regime_state;
 mod scheduler;
 mod system_access;
+mod system_words;
 mod timing;
 mod transitions;
 pub use board::{CodeReport, LockCounts, LockSite, SiteCounts};
@@ -746,7 +747,7 @@ pub struct Machine<H: Host, D: Devices> {
     timed_write: Option<[u64; 3]>,
     /// System exits by instruction word, with their handling time under step
     /// timing ([`Self::system_words`]).
-    system_words: BTreeMap<u32, DeviceRegister>,
+    system_words: system_words::SystemWords,
     /// The profile clock at the last phase charge or exit under step timing:
     /// where the run loop's next phase starts ([`Self::timing_resume`]).
     timing_mark: u64,
@@ -1292,7 +1293,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             device_registers: BTreeMap::new(),
             timed_device: None,
             timed_write: None,
-            system_words: BTreeMap::new(),
+            system_words: system_words::SystemWords::default(),
             timing_mark: 0,
             timed_word: None,
             timed_closed: false,
