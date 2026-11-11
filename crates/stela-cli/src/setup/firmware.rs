@@ -926,7 +926,12 @@ mod tests {
         let mut files = Vec::new();
         for entry in walk(directory) {
             files.push((
-                entry.strip_prefix(directory).unwrap().display().to_string(),
+                entry
+                    .strip_prefix(directory)
+                    .unwrap()
+                    .display()
+                    .to_string()
+                    .replace('\\', "/"),
                 fs::read(&entry).unwrap(),
             ));
         }
