@@ -35,6 +35,7 @@ pub mod guest_timeouts;
 pub mod handoff_records;
 pub mod heap;
 pub mod host_identity;
+pub mod host_locks;
 pub mod host_memory;
 pub mod host_resources;
 pub mod hpet;
