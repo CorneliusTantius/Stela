@@ -5,14 +5,53 @@ use crate::counter::FREQUENCY_HZ;
 use alloc::rc::Rc;
 use core::cell::Cell;
 use stela_contracts::refuse;
+use stela_soc_data::pmu::WallClock;
 
 const LIMIT: u64 = 1 << 47;
+
+/// Unix seconds of the upcount's zero when the host's wall time is known:
+/// 2001-01-01T00:00:00Z. The 47-bit upcount then lasts 2^32 seconds, to
+/// 2137, and the clock offset is about this base in ticks (3.2e13, inside
+/// both the signed 48-bit register and the signed 47-bit legacy field).
+pub const UPCOUNT_BASE_UNIX_SECONDS: u64 = 978_307_200;
 
 /// Declared emulated resource origin, not an observed Apple reset value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RtcEpoch {
     pub counter: u64,
     pub ticks: u64,
+}
+
+impl RtcEpoch {
+    /// The origin of a PMIC whose upcount has run since
+    /// [`UPCOUNT_BASE_UNIX_SECONDS`], as a Mac's RTC keeps counting across
+    /// power cycles: each boot's upcount continues the last one's and
+    /// follows the host's wall time. Without a wall time, or with one
+    /// outside the 47-bit upcount from the base, the upcount starts at zero
+    /// at `now`, a PMIC that lost power.
+    pub fn continuous(now: u64, wall: Option<WallClock>) -> Self {
+        let cold = Self {
+            counter: now,
+            ticks: 0,
+        };
+        let Some(wall) = wall else {
+            return cold;
+        };
+        let Some(seconds) = wall.unix_seconds.checked_sub(UPCOUNT_BASE_UNIX_SECONDS) else {
+            return cold;
+        };
+        // Carry the wall time's ticks from its counter to `now`.
+        let rate =
+            |counter: u64| i128::from(counter) * i128::from(RTC_HZ) / i128::from(FREQUENCY_HZ);
+        let ticks = i128::from(seconds) * i128::from(RTC_HZ) + rate(now) - rate(wall.counter);
+        match u64::try_from(ticks) {
+            Ok(ticks) if ticks < LIMIT => Self {
+                counter: now,
+                ticks,
+            },
+            _ => cold,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -137,6 +176,53 @@ mod tests {
         smc.publish(240 + FREQUENCY_HZ).unwrap();
         assert_eq!(clock.published_ticks(), Ok(1234 + RTC_HZ));
     }
+    #[test]
+    fn continuous_upcount_grows_across_boots_and_cold_without_wall_time() {
+        let wall = |unix_seconds, counter| {
+            Some(WallClock {
+                unix_seconds,
+                counter,
+            })
+        };
+        // No wall time, or one before the base: the old cold origin.
+        let cold = RtcEpoch {
+            counter: 77,
+            ticks: 0,
+        };
+        assert_eq!(RtcEpoch::continuous(77, None), cold);
+        assert_eq!(RtcEpoch::continuous(77, wall(0, 77)), cold);
+        assert_eq!(
+            RtcEpoch::continuous(77, wall(UPCOUNT_BASE_UNIX_SECONDS - 1, 77)),
+            cold
+        );
+        // Past the 47-bit upcount (2137): cold again, never a refusal.
+        let end = UPCOUNT_BASE_UNIX_SECONDS + (LIMIT >> 15);
+        assert_eq!(RtcEpoch::continuous(77, wall(end, 77)), cold);
+        let last = RtcEpoch::continuous(77, wall(end - 1, 77));
+        assert_eq!(last.ticks, LIMIT - RTC_HZ);
+        assert!(RtcClock::new(last).is_ok());
+        // A later boot, even with a smaller counter, has a larger upcount.
+        let first = RtcEpoch::continuous(9 * FREQUENCY_HZ, wall(1_792_000_000, 9 * FREQUENCY_HZ));
+        let second = RtcEpoch::continuous(3 * FREQUENCY_HZ, wall(1_792_000_100, 3 * FREQUENCY_HZ));
+        assert_eq!(
+            first.ticks,
+            (1_792_000_000 - UPCOUNT_BASE_UNIX_SECONDS) * RTC_HZ
+        );
+        assert_eq!(second.ticks - first.ticks, 100 * RTC_HZ);
+        let a = RtcClock::new(first).unwrap();
+        let b = RtcClock::new(second).unwrap();
+        // Late in the first boot, still below the start of the second.
+        assert!(a.check(90 * FREQUENCY_HZ).unwrap() < b.check(3 * FREQUENCY_HZ).unwrap());
+        // The upcount then follows real time.
+        assert_eq!(
+            b.check(13 * FREQUENCY_HZ).unwrap(),
+            second.ticks + 10 * RTC_HZ
+        );
+        // A wall time sampled at another counter is carried to `now`.
+        let carried = RtcEpoch::continuous(FREQUENCY_HZ, wall(1_792_000_000, 5 * FREQUENCY_HZ));
+        assert_eq!(carried.ticks, first.ticks - 4 * RTC_HZ);
+    }
+
     #[test]
     fn deadlines_round_up_and_tick_epoch_overflow_refuses_atomically() {
         let clock = RtcClock::new(RtcEpoch {

@@ -58,7 +58,10 @@
 //! extent rounded to the 256-byte page at whose end the RTC block begins
 //! (inferred). The upcount follows the system counter and refuses writes;
 //! the clock offset starts at the host's wall time when the engine knows it
-//! and otherwise at zero, a PMU whose RTC lost power. An enabled alarm
+//! and otherwise at zero, a PMU whose RTC lost power. With a wall time the
+//! board's upcount starts at the ticks since a fixed base
+//! ([`RtcEpoch::continuous`]), so it grows across power cycles as a Mac's
+//! never-reset PMIC upcount does and the offset is about the base. An enabled alarm
 //! latches its event when the upcount's seconds reach the alarm time, once
 //! per programming: writing the time or control arms it only for a time
 //! still ahead (inferred: a comparator that fires on reaching the time, so
@@ -115,7 +118,7 @@ mod clock;
 mod fault;
 mod firmware;
 mod startup;
-pub use clock::{RtcClock, RtcEpoch};
+pub use clock::{RtcClock, RtcEpoch, UPCOUNT_BASE_UNIX_SECONDS};
 
 use super::spmi::{SlaveError, SpmiSlave};
 #[cfg(test)]

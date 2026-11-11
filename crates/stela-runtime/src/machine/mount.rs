@@ -376,10 +376,8 @@ fn add_power_controllers(
         devices.add_spmi_with_resources(
             spmi,
             wall,
-            RtcEpoch {
-                counter: now,
-                ticks: 0,
-            },
+            // The upcount runs across power cycles, as a Mac's PMIC keeps it.
+            RtcEpoch::continuous(now, wall),
             &history,
         )?;
     }

@@ -224,14 +224,7 @@ impl AppleDevices {
                 "SMC RTC helper requires an explicit virtual RTC epoch authority"
             ));
         }
-        self.add_spmi_with_epoch(
-            placement,
-            wall,
-            pmu::RtcEpoch {
-                counter: 0,
-                ticks: 0,
-            },
-        )
+        self.add_spmi_with_epoch(placement, wall, pmu::RtcEpoch::continuous(0, wall))
     }
 
     /// The boot resource owner explicitly declares this virtual oscillator
