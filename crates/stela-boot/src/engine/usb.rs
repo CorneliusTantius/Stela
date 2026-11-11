@@ -202,7 +202,7 @@ impl HostUsb {
         );
         let firmware = self.firmware;
         for host in &mut self.hosts {
-            let mut changes = {
+            let changes = {
                 // The software attachment timer is owned by this HostUsb.
                 // Before it or the regular timer is due, a busy driver can
                 // leave topology work queued for another service turn.
@@ -235,10 +235,14 @@ impl HostUsb {
                 }
                 let changes = host.poll(&mut self.dma, firmware);
                 // A new device's driver may have found its firmware missing;
-                // the record is reached under the same lock.
-                firmware.report();
-                changes
+                // the record is reached under the same lock, and printed
+                // after it.
+                (changes, firmware.take_report())
             };
+            let (mut changes, missing) = changes;
+            if let Some(missing) = missing {
+                output::arguments(format_args!("{missing}"));
+            }
             for device in &changes.removed {
                 output::arguments(format_args!("USB removed {}\n", device.location));
                 for kept in &mut self.kept {
