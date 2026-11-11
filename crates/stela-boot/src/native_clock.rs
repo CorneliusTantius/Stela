@@ -266,21 +266,24 @@ impl CounterEpoch {
     }
     fn sample_ticks(&self) -> Result<u64, WorkError> {
         self.cpu.health.check()?;
-        self.cpu.check_cpu()?;
         self.cpu
             .source
             .continuous_period()
             .map_err(|error| self.cpu.health.fail(error))?;
         let flags = flags_disable();
-        let result = self.cpu.sample_ticks();
+        // One CPU and root check with IF clear covers the sample: from it to
+        // the restore nothing runs on this processor but the counter read,
+        // no task switch, callback or root change, and an NMI returns to the
+        // same root. Checking again in the restore and after it (two more
+        // page walks per Linux clock read) proved nothing more.
+        let result = self.cpu.check_cpu().and_then(|()| self.cpu.sample_ticks());
         // Restore depends only on the real time-free CPU identity. A failed
         // source must not prevent resources from being drained on that CPU.
-        // SAFETY: same CPU's enclosing IRQ save; no switch/callback.
+        // SAFETY: the same CPU's enclosing IRQ save above; no switch/callback.
         unsafe {
-            self.cpu.restore(flags);
+            restore(flags);
         }
         let ticks = result?;
-        self.cpu.check_cpu()?;
         self.cpu.health.check()?;
         Ok(ticks)
     }
