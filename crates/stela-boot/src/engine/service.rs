@@ -385,6 +385,9 @@ impl Service {
             {
                 output::arguments(format_args!("{line}\n"));
             }
+            if let Some(network) = network.as_ref() {
+                network.report();
+            }
             power.disks().report(*tsc_hz);
             *reported = now;
         }

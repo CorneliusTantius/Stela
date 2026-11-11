@@ -530,6 +530,8 @@ impl stela_runtime::restore::tss::Transport for Offline {
 pub struct GuestNetwork {
     link: RootLink,
     up: Option<bool>,
+    /// The guest adapter's counters at the last status, for [`Self::report`].
+    counters: stela_soc::machine::UsbNetworkCounters,
     /// The first link refusal, reported once.
     refused: bool,
     /// Frames read from the host adapter that the guest's receive queue
@@ -562,6 +564,7 @@ impl GuestNetwork {
         Ok(Self {
             link: RootLink::new(device, links.root),
             up: None,
+            counters: Default::default(),
             refused: false,
             received: alloc::collections::VecDeque::new(),
         })
@@ -574,6 +577,9 @@ impl GuestNetwork {
     /// Report the guest's link state as `status` gives it.
     pub fn status(&mut self, status: Option<(bool, stela_soc::machine::UsbNetworkCounters)>) {
         let up = status.is_some_and(|(up, _)| up);
+        if let Some((_, counters)) = status {
+            self.counters = counters;
+        }
         if self.up != Some(up) {
             self.up = Some(up);
             let counters = status.map(|(_, counters)| counters).unwrap_or_default();
@@ -582,6 +588,28 @@ impl GuestNetwork {
                 if up { "up" } else { "down" }
             ));
         }
+    }
+
+    /// The beat report's line: the frames the guest adapter moved each way
+    /// and dropped (oversized, filtered and overflowed), so a run shows
+    /// whether traffic moves.
+    pub fn report(&self) {
+        let counters = self.counters;
+        output::arguments(format_args!(
+            "GUEST NETWORK frames link={} to_host={} to_guest={} drops={} oversized={} \
+             filtered={} overflowed={}\n",
+            match self.up {
+                Some(true) => "up",
+                Some(false) => "down",
+                None => "unknown",
+            },
+            counters.to_host,
+            counters.to_guest,
+            counters.oversized + counters.filtered + counters.overflowed,
+            counters.oversized,
+            counters.filtered,
+            counters.overflowed
+        ));
     }
 
     /// Read frames from the host adapter while the guest's receive queue
