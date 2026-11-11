@@ -375,6 +375,8 @@ pub struct Counts {
     /// gave a stamped tail, how many exits had one when it last looked, then
     /// the PAC branch exits it gave a predicted tail.
     pub stamped: [u64; chain::STAMP_COUNTS + 3],
+    /// PAC results its service computed since boot, each a memo miss.
+    pub pac_fills: u64,
     /// TSC ticks in each engine phase ([`step_timing::Phase`]), while
     /// step timing is enabled.
     pub phases: [u64; step_timing::Phase::COUNT],
@@ -1835,6 +1837,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 stamped[chain::STAMP_COUNTS + 2] = statistics.predicted_tails;
                 stamped
             },
+            pac_fills: self.pointer.fills,
             phases: self
                 .step_timing
                 .as_ref()

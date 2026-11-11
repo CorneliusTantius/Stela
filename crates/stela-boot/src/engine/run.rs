@@ -1211,6 +1211,7 @@ impl Heartbeat {
             );
             let mut stamped_in_use = 0;
             let mut predicted = 0;
+            let mut pac_fills = 0;
             let deltas = |line: &mut String, pe: usize, now: &[u64], before: &[u64]| {
                 line.push_str(&format!(" {pe}:"));
                 for (slot, (now, before)) in now.iter().zip(before).enumerate() {
@@ -1337,6 +1338,7 @@ impl Heartbeat {
                 );
                 stamped_in_use = stamped_in_use.max(now.stamped[promoted]);
                 predicted += now.stamped[promoted + 1].saturating_sub(before.stamped[promoted + 1]);
+                pac_fills += now.pac_fills.saturating_sub(before.pac_fills);
                 deltas(
                     &mut store,
                     pe,
@@ -1474,7 +1476,7 @@ impl Heartbeat {
             ));
             output::arguments(format_args!("{store}\n"));
             stamped.push_str(&format!(" in_use={stamped_in_use}"));
-            stamped_line = Some((stamped, predicted));
+            stamped_line = Some((stamped, predicted, pac_fills));
             if machine.step_timing().is_some() {
                 output::arguments(format_args!("{phases}\n"));
                 output::arguments(format_args!("{levels}\n"));
@@ -1511,12 +1513,14 @@ impl Heartbeat {
                 self.beats.is_multiple_of(HOT_TOTAL_BEATS),
             );
         }
-        if let Some((mut line, predicted)) = stamped_line {
+        if let Some((mut line, predicted, pac_fills)) = stamped_line {
             if machine.step_timing().is_some() {
                 line.push_str(&dynamic_sites(&self.dynamic));
             }
             // Exits of PAC branch thunks given a predicted tail this beat.
             line.push_str(&format!(" predicted={predicted}"));
+            // PAC results computed this beat, all PEs: memo misses.
+            line.push_str(&format!(" pac_fills={pac_fills}"));
             output::arguments(format_args!("{line}\n"));
         }
         // Self-loops since boot, every PE together: compiled, then with
