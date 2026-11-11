@@ -5,7 +5,7 @@ use core::{
     marker::PhantomData,
     sync::atomic::{AtomicU64, Ordering},
 };
-use stela_compiler::x86_64::chain::{self, ChainControl, itlb_salt};
+use stela_compiler::x86_64::chain::{self, ChainControl, DispatchCache, itlb_salt};
 
 /// The salts of `contexts` in an ITLB of the set mask in `masks`.
 fn salts(contexts: [u64; 2], masks: [u32; 2]) -> [u32; 2] {
@@ -17,6 +17,9 @@ fn salts(contexts: [u64; 2], masks: [u32; 2]) -> [u32; 2] {
 #[repr(C, align(64))]
 pub(super) struct Storage {
     control: UnsafeCell<ChainControl>,
+    /// The PE's dispatch cache, which `control` names: its owner, the
+    /// board's block table and the owner's ITLB make it stale.
+    dispatch: Arc<DispatchCache>,
 }
 // SAFETY: shared storage exposes only an aligned atomic epoch. Other fields
 // are accessed only through the unique Owner admitted by the inbox.
@@ -25,8 +28,13 @@ unsafe impl Send for Storage {}
 unsafe impl Sync for Storage {}
 impl Storage {
     pub(super) fn new() -> Arc<Self> {
+        let dispatch = Arc::new(DispatchCache::new());
         Arc::new(Self {
-            control: UnsafeCell::new(ChainControl::default()),
+            control: UnsafeCell::new(ChainControl {
+                dispatch: dispatch.address(),
+                ..ChainControl::default()
+            }),
+            dispatch,
         })
     }
     fn budget(&self) -> &AtomicU64 {
@@ -121,6 +129,13 @@ impl Owner {
             core::ptr::addr_of_mut!((*control).observed_interrupt_epoch).write(0);
         }
         self.budget().store(0, Ordering::Relaxed);
+        self.storage.dispatch.invalidate();
+    }
+
+    /// This PE's dispatch cache, which the board's block table and the
+    /// PE's ITLB are to make stale at their changes.
+    pub(super) fn dispatch(&self) -> &Arc<DispatchCache> {
+        &self.storage.dispatch
     }
     /// Acknowledge only the Acquire snapshot taken before a successful drain.
     /// MAX is never acknowledged, so exhausted notification state stays sticky.
@@ -131,6 +146,9 @@ impl Owner {
             core::ptr::addr_of_mut!((*self.storage.control.get()).observed_interrupt_epoch)
                 .write(epoch.min(u64::MAX - 1));
         }
+        // A dispatch cache slot is good only while the epoch is what it was
+        // when a table probe, which needs it acknowledged, filled it.
+        self.storage.dispatch.invalidate();
     }
     /// The epoch the owner last acknowledged: every notification up to it
     /// has been drained ([`Self::acknowledge_interrupt`]).
@@ -156,6 +174,7 @@ impl Owner {
             let contexts = core::ptr::addr_of!((*control).contexts).read();
             core::ptr::addr_of_mut!((*control).salts).write(salts(contexts, masks));
         }
+        self.storage.dispatch.invalidate();
     }
     /// This PE's stamps and the board's stamped cells, which stamped tails
     /// and the cell probe use ([`stela_compiler::x86_64::chain::stamped_tail`]).
@@ -212,6 +231,7 @@ impl Owner {
             core::ptr::addr_of_mut!((*self.storage.control.get()).salts)
                 .write(salts(contexts, masks));
         }
+        self.storage.dispatch.invalidate();
     }
     pub(super) fn begin(&mut self, block: usize, budget: u64) {
         let control = self.storage.control.get();
@@ -283,6 +303,10 @@ impl Owner {
             heat: unsafe { core::ptr::addr_of!((*control).heat).read() },
             loop_entries: self.loops().0,
             loop_iterated: self.loops().1,
+            // SAFETY: as for `table`.
+            dispatch: unsafe { core::ptr::addr_of!((*control).dispatch).read() },
+            // SAFETY: as for `table`; native code writes it only within a call.
+            dispatch_seen: unsafe { core::ptr::addr_of!((*control).dispatch_seen).read() },
         }
     }
 

@@ -3152,7 +3152,7 @@ fn returns_and_exits_out_of_the_page_go_through_lookup_dispatchers() {
             (second.code.0 + code(second).len() - chain::DYNAMIC_EXIT_BYTES) as u64,
         ) as usize,
     ];
-    let dispatcher = chain::lookup_dispatcher(0).unwrap();
+    let dispatcher = chain::dispatching_dispatcher(0, machine.target).unwrap();
     let probes = machine
         .host
         .installed
@@ -4119,7 +4119,7 @@ fn indirect_branches_go_through_lookups_that_check_the_target() {
         (2, ExitKind::Indirect, 0b01),
         (3, ExitKind::Indirect, 0b11),
     ] {
-        let dispatcher = chain::lookup_dispatcher(btype).unwrap();
+        let dispatcher = chain::dispatching_dispatcher(btype, machine.target).unwrap();
         assert!(machine.host.installed.contains(&dispatcher), "{kind:?}");
         assert!(!machine.code.blocks.record(index).dynamic_open(), "{index}");
     }
@@ -6601,7 +6601,7 @@ fn pac_returns_go_through_a_lookup_dispatcher() {
     let site = chain::dynamic_patch((at + thunk.dynamic.unwrap()) as u64);
     // The probes, then the RET's own tail, which calls the table probe.
     let installed = machine.host.installed.len();
-    let dispatcher = chain::lookup_dispatcher(0).unwrap();
+    let dispatcher = chain::dispatching_dispatcher(0, machine.target).unwrap();
     assert_eq!(machine.host.installed[installed - 2], dispatcher);
     let probes = ((installed - 1) * NATIVE_CODE_STRIDE) as u64;
     let tail = (installed * NATIVE_CODE_STRIDE) as u64;
@@ -6668,7 +6668,7 @@ fn pac_branches_take_a_predicted_tail_linked_through_a_cell() {
     let installed = machine.host.installed.len();
     assert_eq!(
         machine.host.installed[installed - 3],
-        chain::lookup_dispatcher(0b01).unwrap()
+        chain::dispatching_dispatcher(0b01, machine.target).unwrap()
     );
     let probes = ((installed - 2) * NATIVE_CODE_STRIDE) as u64;
     let tail = ((installed - 1) * NATIVE_CODE_STRIDE) as u64;
@@ -9089,4 +9089,52 @@ fn host_work_holds_the_shared_count_only_for_a_pe_stopped_in_the_kernel() {
     };
     assert!(during(1) < u64::MAX / 2, "a kernel lock may be held");
     assert_eq!(during(0), u64::MAX / 2);
+}
+
+/// A PE's dispatch cache goes stale at every change its probes do not
+/// check: the board's block table and the PE's ITLB hold it, and the
+/// owner's context, table and acknowledgement changes grow its generation.
+#[test]
+fn dispatch_caches_follow_their_tables_and_owner() {
+    const RET: u32 = 0xd65f_03c0;
+    let mut machine = machine(&[RET]);
+    let cache = alloc::sync::Arc::clone(machine.chain.dispatch());
+    assert!(machine.code.cache().targets.holds_dispatch(&cache));
+    assert!(machine.itlb.holds_dispatch(&cache));
+    assert_eq!(machine.chain.snapshot().dispatch, cache.address());
+    let mut generation = cache.generation();
+    let mut grew = |what: &str| {
+        let now = cache.generation();
+        assert!(now > generation, "{what}");
+        generation = now;
+    };
+    let contexts = machine.chain.contexts();
+    machine.chain.set_contexts([contexts[1], contexts[0]]);
+    grew("contexts");
+    machine.chain.acknowledge_interrupt(0);
+    grew("acknowledgement");
+    machine.chain.set_table(
+        machine.code.table.address(),
+        machine.itlb.address(),
+        [machine.code.table.mask(), machine.itlb.mask()],
+    );
+    grew("tables");
+    machine.itlb.clear();
+    grew("ITLB");
+    machine
+        .code
+        .cache()
+        .targets
+        .forget_frames(0..=u64::MAX >> 12, |_| true);
+    grew("block table");
+    // The dispatchers it installs are the dispatching ones.
+    machine.chain.set_contexts(contexts);
+    let base = machine.cpu.pc;
+    machine.host.exits = vec![NativeExit::Exit {
+        next_pc: base + 0x2000,
+        kind: ExitKind::Return as u64,
+    }];
+    machine.step().unwrap();
+    let dispatcher = chain::dispatching_dispatcher(0, machine.target).unwrap();
+    assert!(machine.host.installed.contains(&dispatcher));
 }

@@ -294,13 +294,19 @@ pub struct ChainControl {
     /// skipped): the engine's counts, which only those exits write.
     pub loop_entries: u64,
     pub loop_iterated: u64,
+    /// The host address of this PE's [`DispatchCache`], which the probes of
+    /// a [`dispatching_dispatcher`] read and fill, or 0.
+    pub dispatch: u64,
+    /// The dispatch generation a dispatch cache miss saw, read before the
+    /// table probe that fills the slot ([`dispatching_dispatcher`]).
+    pub dispatch_seen: u64,
 }
 
 // Epoch and observed state are naturally aligned atomic-width words. Capture
 // and storage owners keep the mapped control alive for every embedded address.
 const _: () = assert!(core::mem::offset_of!(ChainControl, interrupt_epoch) == 64);
 const _: () = assert!(core::mem::offset_of!(ChainControl, observed_interrupt_epoch) == 72);
-const _: () = assert!(core::mem::size_of::<ChainControl>() == 144);
+const _: () = assert!(core::mem::size_of::<ChainControl>() == 160);
 
 /// In the block table, one block a fetch at `pc` runs while its page
 /// translates to the frame and fetch state `key` names ([`block_key`]). In
@@ -699,6 +705,88 @@ pub unsafe fn stamp_counts(stamps: u64) -> [u64; STAMP_COUNTS] {
         unsafe { AtomicU64::from_ptr(word) }.load(Ordering::Relaxed)
     })
 }
+/// Slots of each BTYPE's part of a [`DispatchCache`].
+pub const DISPATCH_SLOTS: usize = 2048;
+/// Bytes of one slot of a [`DispatchCache`]: the target, the dispatch
+/// generation it was filled in, the block word for `ChainControl::block`
+/// and the block's host entry.
+pub const DISPATCH_SLOT_BYTES: usize = 32;
+/// Bytes of each BTYPE's part of a [`DispatchCache`].
+pub const DISPATCH_PART_BYTES: usize = DISPATCH_SLOTS * DISPATCH_SLOT_BYTES;
+/// Byte offset from a [`DispatchCache`]'s address of its generation.
+pub const DISPATCH_GENERATION: i32 = -8;
+/// Words before a [`DispatchCache`]'s first slot: one cache line.
+const DISPATCH_HEADER_WORDS: usize = 8;
+
+/// The slot of target `pc` in each BTYPE's part of a [`DispatchCache`]: the
+/// instruction index's low bits with those of the 4 KiB page number folded
+/// in, as the probes compute it with SHR or RORX.
+pub const fn dispatch_slot(pc: u64) -> usize {
+    let pc = pc as u32;
+    ((pc ^ pc >> 12) >> 2) as usize & (DISPATCH_SLOTS - 1)
+}
+
+/// One PE's direct-mapped cache of the targets its dispatchers' table probes
+/// found ([`dispatching_dispatcher`]), a part for each BTYPE, by
+/// [`dispatch_slot`]. A slot is good while the PE's dispatch generation
+/// plus its control's interruption epoch is what it was when the slot was
+/// filled: the generation grows at every change that could make a table
+/// probe of the target find another block or none, so the probe checks
+/// nothing else. It grows when the block table forgets an entry or puts
+/// another in its place for the same PC and key ([`LookupTable`] holds each
+/// PE's cache), when the PE's ITLB drops a page or changes its translation
+/// (its drop epochs), and when the PE's owner changes its contexts, tables
+/// or acknowledged interruption. A capacity eviction from either table is
+/// not a change: the entry's block stays valid until forgetting reaches
+/// it, as a cell keeps it ([`LookupTable::link_cell`]).
+#[derive(Debug)]
+pub struct DispatchCache {
+    words: Box<[AtomicU64]>,
+}
+
+impl Default for DispatchCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl DispatchCache {
+    /// An empty cache, its generation 1: no slot, all zero, is good.
+    pub fn new() -> Self {
+        let words: Box<[AtomicU64]> = (0..DISPATCH_HEADER_WORDS + 4 * DISPATCH_PART_BYTES / 8)
+            .map(|_| AtomicU64::new(0))
+            .collect();
+        words[DISPATCH_HEADER_WORDS - 1].store(1, Ordering::Relaxed);
+        Self { words }
+    }
+
+    /// Its host address, for `ChainControl::dispatch`.
+    pub fn address(&self) -> u64 {
+        self.words[DISPATCH_HEADER_WORDS..].as_ptr() as u64
+    }
+
+    /// Its dispatch generation.
+    pub fn generation(&self) -> u64 {
+        self.words[DISPATCH_HEADER_WORDS - 1].load(Ordering::Acquire)
+    }
+
+    /// Make every slot stale: after the change that makes it so is
+    /// visible, as a slot filled from a table probe that read the generation
+    /// before that probe's reads is stale only if the generation moved.
+    pub fn invalidate(&self) {
+        self.words[DISPATCH_HEADER_WORDS - 1].fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// The slot of `pc` in the part of `btype`: the target, the generation
+    /// plus epoch it was filled in, the block word and the host entry.
+    pub fn slot(&self, btype: u8, pc: u64) -> [u64; 4] {
+        let at = DISPATCH_HEADER_WORDS
+            + (usize::from(btype) * DISPATCH_PART_BYTES + dispatch_slot(pc) * DISPATCH_SLOT_BYTES)
+                / 8;
+        core::array::from_fn(|word| self.words[at + word].load(Ordering::Relaxed))
+    }
+}
+
 /// Byte offset from an ITLB's address ([`LookupTable::address`]) of its
 /// drop epochs, one 64-bit word per half: each grows when an entry of the
 /// half leaves or changes, never at a capacity eviction; they start at 1.
@@ -786,6 +874,9 @@ pub struct LookupTable {
     stamp_tables: Vec<u64>,
     /// The stamps those addresses name, which never move.
     stamp_store: Vec<Box<[AtomicU64]>>,
+    /// The dispatch caches of the PEs that run on it, made stale at each of
+    /// its changes a table probe could see ([`DispatchCache`]).
+    dispatch: Vec<Arc<DispatchCache>>,
     /// The link of each stamped cell an exit holds, for its promotion
     /// ([`Self::hot_links`]).
     cell_links: Vec<Option<CellLink>>,
@@ -855,6 +946,7 @@ impl LookupTable {
             cell_sites: BTreeMap::new(),
             stamp_tables: Vec::new(),
             stamp_store: Vec::new(),
+            dispatch: Vec::new(),
             stamped: BTreeSet::new(),
             cell_links: Vec::new(),
             victims: 0x9e37_79b9_7f4a_7c15,
@@ -966,6 +1058,7 @@ impl LookupTable {
         self.cell_frames.clear();
         self.dropped(0);
         self.dropped(1 << 55);
+        self.invalidate_dispatch();
     }
 
     /// Whether every entry is empty, and no cell holds one.
@@ -1129,6 +1222,26 @@ impl LookupTable {
         address
     }
 
+    /// Make `cache` stale at each of its changes from now on, unless it
+    /// does already.
+    pub fn add_dispatch(&mut self, cache: &Arc<DispatchCache>) {
+        if !self.dispatch.iter().any(|held| Arc::ptr_eq(held, cache)) {
+            self.dispatch.push(Arc::clone(cache));
+        }
+    }
+
+    /// Whether it makes `cache` stale ([`Self::add_dispatch`]).
+    pub fn holds_dispatch(&self, cache: &Arc<DispatchCache>) -> bool {
+        self.dispatch.iter().any(|held| Arc::ptr_eq(held, cache))
+    }
+
+    /// Make the dispatch caches stale, after a change.
+    fn invalidate_dispatch(&self) {
+        for cache in &self.dispatch {
+            cache.invalidate();
+        }
+    }
+
     /// Whether `stamps` is an address [`Self::new_stamps`] of this table
     /// returned.
     pub fn holds_stamps(&self, stamps: u64) -> bool {
@@ -1229,6 +1342,7 @@ impl LookupTable {
     fn dropped(&self, pc: u64) {
         if self.grouping == Grouping::Pc {
             self.sets.header()[half(pc)].fetch_add(1, Ordering::Relaxed);
+            self.invalidate_dispatch();
         }
     }
 
@@ -1291,7 +1405,30 @@ impl LookupTable {
             }
             self.note_rekey(slot, &entry);
         }
+        // An entry the set does not hold yet, or none in place of one: a
+        // table probe of its PC may find another block than before, or
+        // none, as an older entry of the PC and key may have been put out
+        // of the set and still be in a dispatch cache. Another PC put out
+        // of the slot is a capacity eviction, which its block outlives,
+        // unless the neighbour holds another entry of that PC and key,
+        // which a table probe of it finds from now on.
+        let replaced = self.grouping == Grouping::Frame && {
+            let resident = self.sets.get(slot).load();
+            let beside = self.sets.get(neighbour(slot)).load();
+            if entry.key == 0 {
+                resident.key != 0
+            } else {
+                (resident != entry && beside != entry)
+                    || (resident.key != 0
+                        && resident != entry
+                        && (beside.pc, beside.key) == (resident.pc, resident.key)
+                        && beside != resident)
+            }
+        };
         self.sets.get(slot).store(entry);
+        if replaced {
+            self.invalidate_dispatch();
+        }
         if entry.key == 0 {
             return;
         }
@@ -1499,6 +1636,7 @@ impl LookupTable {
             );
             found = true;
         }
+        self.invalidate_dispatch();
         found
     }
 
@@ -1518,6 +1656,7 @@ impl LookupTable {
                 held.store(LookupEntry::default());
             }
         }
+        self.invalidate_dispatch();
         if self.cell_counts.is_empty() || self.cell_counts[cell_bucket(pc)] == 0 {
             return 0;
         }
@@ -1705,6 +1844,8 @@ const HITS: i32 = core::mem::offset_of!(ChainControl, hits) as i32;
 const STAMPS: i32 = core::mem::offset_of!(ChainControl, stamps) as i32;
 const CELLS: i32 = core::mem::offset_of!(ChainControl, cells) as i32;
 const HEAT: i32 = core::mem::offset_of!(ChainControl, heat) as i32;
+const DISPATCH: i32 = core::mem::offset_of!(ChainControl, dispatch) as i32;
+const DISPATCH_SEEN: i32 = core::mem::offset_of!(ChainControl, dispatch_seen) as i32;
 #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
 const LINKED: i32 = core::mem::offset_of!(ChainControl, linked) as i32;
 const INTERRUPT_EPOCH: i32 = core::mem::offset_of!(ChainControl, interrupt_epoch) as i32;
@@ -2230,7 +2371,53 @@ pub const CELL_TAIL_BYTES: usize = 10 + TAIL_BYTES;
 pub fn lookup_dispatcher(btype: u8) -> Option<Vec<u8>> {
     dispatcher_with_policy(btype, Interruption::Epoch)
 }
+
+/// A [`lookup_dispatcher`] whose entry at [`PROBE_ENTRY`] first looks the
+/// target up in the PE's [`DispatchCache`] (`ChainControl::dispatch`, which
+/// must be set), in the part of `btype`: a slot of the target filled in the
+/// current dispatch generation plus interruption epoch enters its block,
+/// the transfer spent, its instructions and the hit counted and `block`
+/// named, as the table probe would. Any other target goes on to the table
+/// probe, which fills the slot when it enters a block. Shifts by RORX on a
+/// `target` with BMI2, else by MOV and SHR, to the same slot.
+pub fn dispatching_dispatcher(btype: u8, target: crate::TargetCpu) -> Option<Vec<u8>> {
+    dispatcher_with(btype, Interruption::Epoch, Some(target))
+}
+
 fn dispatcher_with_policy(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
+    dispatcher_with(btype, policy, None)
+}
+
+/// R`slot` = the byte offset over 8 of `pc`'s slot ([`dispatch_slot`]) in a
+/// part of a [`DispatchCache`], from the target in RAX.
+fn dispatch_index(asm: &mut crate::x86_64::asm::Asm, slot: Gpr, target: crate::TargetCpu) {
+    if target.supports(crate::TargetCpu::Bmi2) {
+        // The rotated-in high bits land above the mask.
+        asm.rorx(Dword, slot, Rax, 12);
+    } else {
+        asm.mov(Dword, slot, Rax);
+        asm.shift_imm(ShiftOp::Shr, Dword, slot, 12);
+    }
+    asm.alu(Alu::Xor, Dword, slot, Rax);
+    asm.alu_imm32(Alu::And, Dword, slot, ((DISPATCH_SLOTS - 1) << 2) as i32);
+}
+
+/// The memory operand of word `word` of the slot R`slot` names
+/// ([`dispatch_index`]) in the part of `btype` of the cache at R10.
+fn dispatch_word(slot: Gpr, btype: u8, word: i32) -> Mem {
+    Mem::indexed(
+        R10,
+        slot,
+        8,
+        usize::from(btype) as i32 * DISPATCH_PART_BYTES as i32 + 8 * word,
+    )
+}
+
+fn dispatcher_with(
+    btype: u8,
+    policy: Interruption,
+    cache: Option<crate::TargetCpu>,
+) -> Option<Vec<u8>> {
     if btype > 3 {
         return None;
     }
@@ -2243,6 +2430,37 @@ fn dispatcher_with_policy(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
         code.asm().int3();
     }
     debug_assert_eq!(code.len(), PROBE_ENTRY);
+    if let Some(target) = cache {
+        // The dispatch cache probe: R10 the cache, R9 the slot, R8 the
+        // generation plus epoch a good slot was filled in.
+        let mut asm = code.asm();
+        asm.place(Rcx, CONTROL);
+        asm.mov_load(Qword, R10, Mem::base(Rcx, DISPATCH));
+        dispatch_index(&mut asm, R9, target);
+        asm.mov_load(Qword, R8, Mem::base(R10, DISPATCH_GENERATION));
+        asm.alu_load(Alu::Add, Qword, R8, Mem::base(Rcx, INTERRUPT_EPOCH));
+        asm.alu_load(Alu::Cmp, Qword, Rax, dispatch_word(R9, btype, 0));
+        let other = asm.jcc8(Cond::Ne);
+        asm.alu_load(Alu::Cmp, Qword, R8, dispatch_word(R9, btype, 1));
+        let stale = asm.jcc8(Cond::Ne);
+        spend_budget(&mut asm, policy);
+        let spent = asm.jcc8(Cond::B);
+        asm.shift_imm(ShiftOp::Shr, Dword, Rdx, ExitWord::RAN_SHIFT as u8);
+        asm.alu(Alu::Add, Qword, Mem::base(Rcx, RETIRED), Rdx);
+        asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, HITS), 1);
+        asm.mov_load(Qword, R8, dispatch_word(R9, btype, 2));
+        asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
+        asm.jmp_rm(dispatch_word(R9, btype, 3));
+        asm.bind(spent);
+        missed(&mut asm);
+        // A miss: the table probe after this fills the slot in what this
+        // read, before any of the table probe's reads.
+        asm.bind(other);
+        asm.bind(stale);
+        // Into the table probe, which follows.
+        asm.mov_store(Qword, Mem::base(Rcx, DISPATCH_SEEN), R8);
+    }
+    let table_entry = code.len();
     // The table probe.
     let mut asm = code.asm();
     asm.place(Rcx, CONTROL);
@@ -2295,13 +2513,24 @@ fn dispatcher_with_policy(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, HITS), 1);
     entered_btype(&mut asm, R8, btype);
     asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
+    if let Some(target) = cache {
+        // Fill the target's slot of the dispatch cache, in the generation
+        // plus epoch its miss saw: a change since makes it stale.
+        asm.mov_load(Qword, R10, Mem::base(Rcx, DISPATCH));
+        dispatch_index(&mut asm, R11, target);
+        asm.mov_load(Qword, Rdx, Mem::base(Rcx, DISPATCH_SEEN));
+        asm.mov_store(Qword, dispatch_word(R11, btype, 0), Rax);
+        asm.mov_store(Qword, dispatch_word(R11, btype, 1), Rdx);
+        asm.mov_store(Qword, dispatch_word(R11, btype, 2), R8);
+        asm.mov_store(Qword, dispatch_word(R11, btype, 3), R9);
+    }
     found(&mut asm);
     for miss in misses {
         asm.bind(miss);
     }
     missed(&mut asm);
     crate::x86_64::asm::resolve(&mut code, to_table, table);
-    crate::x86_64::asm::resolve(&mut code, to_probe, PROBE_ENTRY);
+    crate::x86_64::asm::resolve(&mut code, to_probe, table_entry);
     // The stamping cell probe, which a stamped tail's miss takes.
     let padding = STAMPING_PROBE_ENTRY
         .checked_sub(code.len())
@@ -2311,7 +2540,7 @@ fn dispatcher_with_policy(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     }
     let (to_table, to_probe) = cell_probe(&mut code, policy, true, btype);
     crate::x86_64::asm::resolve(&mut code, to_table, table);
-    crate::x86_64::asm::resolve(&mut code, to_probe, PROBE_ENTRY);
+    crate::x86_64::asm::resolve(&mut code, to_probe, table_entry);
     Some(code.into_bytes())
 }
 
@@ -3934,6 +4163,8 @@ mod tests {
     mod budget;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     mod differential;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    mod dispatch;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     mod patching;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

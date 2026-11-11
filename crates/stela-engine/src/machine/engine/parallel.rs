@@ -1354,6 +1354,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
     pub(super) fn attach_stamps(&mut self) {
         let code = Arc::clone(&self.code);
         let mut cache = code.cache_at(super::board::LockSite::Other);
+        // The block table and the ITLB this PE's probes read make its
+        // dispatch cache stale at their changes.
+        cache.targets.add_dispatch(self.chain.dispatch());
+        self.itlb.add_dispatch(self.chain.dispatch());
         let cells = cache.targets.stamped_cells();
         let (stamps, held) = self.chain.stamps();
         if held == cells && cache.targets.holds_stamps(stamps) {

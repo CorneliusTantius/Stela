@@ -990,7 +990,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         self.install_stream = stream;
         let probe = self
-            .install_native(&chain::lookup_dispatcher(btype)?, false)
+            .install_native(&chain::dispatching_dispatcher(btype, self.target)?, false)
             .ok()?;
         // The part filled between the two: the tail waits for the next.
         if part_of(probe.0) != part {
@@ -1000,7 +1000,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         Some((probe.0 as u64, tail))
     }
 
-    /// The probes of `btype` ([`chain::lookup_dispatcher`]), in the part of
+    /// The probes of `btype` ([`chain::dispatching_dispatcher`]), in the part of
     /// the arena new code fills: like a thunk, they stay until after every
     /// tail that calls them, as parts go oldest first, every tail is in the
     /// part of its probes, and the exits that jump to a tail are in that part
@@ -1009,7 +1009,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if let Some(code) = self.lookup_dispatchers[usize::from(btype)] {
             return Some(code.0 as u64);
         }
-        let code = chain::lookup_dispatcher(btype)?;
+        let code = chain::dispatching_dispatcher(btype, self.target)?;
         let installed = self.host.install(&code).ok()?;
         self.lookup_dispatchers[usize::from(btype)] = Some(installed);
         Some(installed.0 as u64)
