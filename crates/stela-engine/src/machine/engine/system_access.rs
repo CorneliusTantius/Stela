@@ -574,19 +574,33 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// now returns: the write changes neither the controls the read's
     /// plainness follows from (SPRR_CONFIG_EL1, HACR_EL2, HCR_EL2 and the
     /// EL) nor which SPRR_PERM register it reads, so dyld's read-back after
-    /// each toggle completes natively.
+    /// each toggle completes natively. That holds in every state whose read
+    /// names the register this write reached ([`user_permission_register`]):
+    /// a kernel writes it at EL2 at each thread switch and reads it back in
+    /// other states of the host, whose cells then stay open too.
     pub(super) fn permission_write(&mut self, word: u32, access: RegisterAccess) -> Step {
-        let open = self.mirrors[SPRR_PERM_MIRROR].readable != 0;
+        let cells = self.mirrors.banks.map(|cells| cells[SPRR_PERM_MIRROR]);
+        let tge = self.cpu.in_host();
+        let current = self.mirror_state();
+        let reached = user_permission_register(current, tge);
+        let reopen: Vec<usize> = (0..MIRROR_STATES)
+            .filter(|&state| {
+                cells[state].readable != 0 && user_permission_register(state, tge) == reached
+            })
+            .collect();
         let before = self.completion_point();
         let step = self.register_access(word, access);
-        if step.is_err() || !open || self.position() != before {
+        if step.is_err() || reopen.is_empty() || self.position() != before {
             return step;
         }
         let read = decode_register(word | MRS_READ).expect("MSR has an MRS form");
         let physical = self.now();
         if let RegisterOutcome::Read(value) = self.cpu.apple_access(read, physical) {
             let value = self.degraded_read(read, value);
-            self.mirrors[SPRR_PERM_MIRROR] = register_read::Cell { readable: 1, value };
+            for state in reopen {
+                self.mirrors.banks[state][SPRR_PERM_MIRROR] =
+                    register_read::Cell { readable: 1, value };
+            }
         }
         step
     }
@@ -1065,6 +1079,19 @@ fn data_barrier() {
     #[cfg(test)]
     tests::DATA_BARRIERS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether an SPRR_PERM_EL0 read in mirror state `state` names the EL2&0
+/// regime's EL0 permissions (`cpu::PERM_EL0_20`), as at EL2 and at EL0 under
+/// HCR_EL2.TGE, rather than the EL1&0 regime's (`Cpu::regime`,
+/// `Cpu::apple_el0`). HCR_EL2 writes close every cell, so the TGE a write
+/// finds is that of every open cell.
+fn user_permission_register(state: usize, tge: bool) -> bool {
+    match state & 3 {
+        2 => true,
+        0 => tge,
+        _ => false,
+    }
 }
 
 #[cfg(test)]

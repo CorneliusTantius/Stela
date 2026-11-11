@@ -7343,6 +7343,58 @@ fn keys_native_code_wrote_reopen_together_at_the_next_pac_exit() {
     assert_eq!(machine.pointer.tags[usize::from(ib)], open(ib));
 }
 
+/// An SPRR_PERM_EL0 write at EL2 of the host keeps open the read cell of
+/// every state whose read names the same register: EL0 under TGE reads what
+/// an engine-path read there returns; without TGE EL0's read names the EL1&0
+/// register and its cell closes.
+#[test]
+fn sprr_perm_el0_writes_keep_the_cells_of_states_reading_the_same_register() {
+    const MRS: u32 = 0xd53e_f1a8; // mrs x8, sprr_perm_el0
+    const MSR: u32 = 0xd51e_f1a9; // msr sprr_perm_el0, x9
+    const MSR_SPRR_CONFIG: u32 = 0xd51e_f109; // msr sprr_config_el1, x9
+    const HCR_E2H: u64 = 1 << 34;
+    for tge in [true, false] {
+        let mut machine = machine(&[MRS]);
+        let hcr = HCR_E2H | u64::from(tge) << HCR_TGE;
+        machine.cpu.registers.set(SystemRegister::HCR_EL2, 0, hcr);
+        machine.cpu.set_pstate(Pstate::reset(2));
+        machine.derived_changed();
+        machine.cpu.state.x[9] = 1;
+        machine.system_instruction(MSR_SPRR_CONFIG).unwrap();
+        machine.cpu.state.x[9] = 0x10;
+        machine.system_instruction(MSR).unwrap();
+        // A read opens EL2's cell; EL0's is open on the old value.
+        machine.system_instruction(MRS).unwrap();
+        let el0 = mirror_state(0, false);
+        machine.mirrors.banks[el0][SPRR_PERM_MIRROR] = register_read::Cell {
+            readable: 1,
+            value: 0x10,
+        };
+        machine.cpu.pc = BASE;
+        machine.cpu.state.x[9] = 0x30;
+        machine.system_instruction(MSR).unwrap();
+        let cell = machine.mirrors.banks[el0][SPRR_PERM_MIRROR];
+        if tge {
+            assert_eq!(
+                cell,
+                register_read::Cell {
+                    readable: 1,
+                    value: 0x30
+                }
+            );
+            // What the engine reads at EL0 is what the kept cell holds.
+            machine.cpu.set_pstate(Pstate::reset(0));
+            let read = decode_register(MRS).unwrap();
+            assert_eq!(
+                machine.cpu.apple_access(read, 0),
+                RegisterOutcome::Read(0x30)
+            );
+        } else {
+            assert_eq!(cell.readable, 0, "EL0 reads the EL1&0 register");
+        }
+    }
+}
+
 #[test]
 fn sprr_perm_el0_writes_reopen_its_open_cell() {
     const MRS: u32 = 0xd53e_f1a8; // mrs x8, sprr_perm_el0
@@ -7389,7 +7441,9 @@ fn sprr_perm_el0_writes_reopen_its_open_cell() {
             value: 0x30
         }
     );
-    assert_eq!(machine.mirrors.banks[0][SPRR_PERM_MIRROR].readable, 0);
+    // EL0 of the host reads the same register, so its cell stays open on
+    // the new value (`user_permission_register`).
+    assert_eq!(machine.mirrors.banks[0][SPRR_PERM_MIRROR].value, 0x30);
     machine.system_instruction(MRS).unwrap();
     assert_eq!(machine.cpu.state.x[8], 0x30);
     assert_eq!(machine.mirrors[thread].readable, 1);
