@@ -394,6 +394,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if let Some(index) = written(access) {
             return self.stored_write(word, access, index);
         }
+        if access.encoding() == TABLE_BASE && access.direction() == Direction::Write {
+            return self.table_base_write(word, access);
+        }
         if let Some(index) = guarded_written(access) {
             return self.guarded_access(word, access, index);
         }
@@ -537,6 +540,31 @@ impl<H: Host, D: Devices> Machine<H, D> {
             });
         if let (Ok(()), true, Some(value)) = (&step, self.position() == before, value) {
             self.mirrors[written_cell(index)] = register_read::Cell { readable: 1, value };
+        }
+        step
+    }
+
+    /// MSR TTBR0_EL1: one that only reaches the register's storage opens
+    /// [`TABLE_BASE_KEPT`] there, for a register that takes what the
+    /// thunk's fixed bits say, so a later write of the same value completes
+    /// natively. A write of another value changes translation and stays the
+    /// engine's.
+    fn table_base_write(&mut self, word: u32, access: RegisterAccess) -> Step {
+        let before = self.completion_point();
+        self.plain_read = None;
+        let step = self.register_access(word, access);
+        let value = self
+            .plain_read
+            .filter(|&(register, _)| {
+                matches!(
+                    register,
+                    SystemRegister::TTBR0_EL1 | SystemRegister::TTBR0_EL2
+                ) && self.register_fixed_bits(register)
+                    == self.register_fixed_bits(SystemRegister::TTBR0_EL1)
+            })
+            .and_then(|(register, index)| self.cpu.registers.address(register, index));
+        if let (Ok(()), true, Some(value)) = (&step, self.position() == before, value) {
+            self.mirrors[TABLE_BASE_KEPT] = register_read::Cell { readable: 1, value };
         }
         step
     }

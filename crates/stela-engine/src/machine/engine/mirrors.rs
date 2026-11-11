@@ -153,8 +153,18 @@ pub(super) const DATA_BARRIER: usize = PAN_WRITES + 1;
 pub(super) const SEND_EVENT: usize = DATA_BARRIER + 1;
 pub(super) const EVENT_WAIT: usize = SEND_EVENT + 1;
 
+/// The cell of MSR TTBR0_EL1 (`x86_64::register_read::unchanged_write_thunk`),
+/// open on the storage a plain write reached: a write of the value the
+/// register holds completes natively and changes nothing, any other exits.
+/// A kernel rewrites the same table base at most switches into a thread of
+/// the address space it already runs.
+pub(super) const TABLE_BASE_KEPT: usize = EVENT_WAIT + 1;
+
+/// TTBR0_EL1 (TTBR0_EL2 at EL2 with E2H).
+pub(super) const TABLE_BASE: Encoding = Encoding::new(3, 0, 2, 0, 0);
+
 /// The cell of the first of the [`STORED_WRITES`].
-const STORED_WRITE_CELLS: usize = EVENT_WAIT + 1;
+const STORED_WRITE_CELLS: usize = TABLE_BASE_KEPT + 1;
 
 /// The IMPLEMENTATION DEFINED registers that a store completes writes of
 /// that get a cell of their own the first time code naming them is installed
@@ -600,6 +610,19 @@ pub(super) fn written_register(pc: u64, word: u32) -> Option<(usize, u8)> {
     let instruction = block::decode_system_mode_instruction(GuestAddress(pc), word).ok()??;
     match instruction.operation {
         SystemOperation::Register(access) => Some((written(access)?, access.rt())),
+        _ => None,
+    }
+}
+
+/// Xt of the MSR TTBR0_EL1 `word` at `pc`, if it is one.
+pub(super) fn table_base_write(pc: u64, word: u32) -> Option<u8> {
+    let instruction = block::decode_system_mode_instruction(GuestAddress(pc), word).ok()??;
+    match instruction.operation {
+        SystemOperation::Register(access)
+            if access.encoding() == TABLE_BASE && access.direction() == Direction::Write =>
+        {
+            Some(access.rt())
+        }
         _ => None,
     }
 }

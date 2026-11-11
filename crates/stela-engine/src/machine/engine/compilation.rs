@@ -1363,6 +1363,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
             register_read::stack_select_thunk(GuestAddress(pc), select, cell, current, sp0)
         } else if let Some((index, rt)) = written_register(pc, word) {
             self.stored_write_thunk(GuestAddress(pc), index, rt)
+        } else if let Some(rt) = table_base_write(pc, word) {
+            let cell = cell_place(TABLE_BASE_KEPT);
+            let written = self.register_fixed_bits(SystemRegister::TTBR0_EL1);
+            register_read::unchanged_write_thunk(GuestAddress(pc), rt, cell, written)
         } else if let Some((index, rt)) = guarded_written_register(pc, word) {
             let cell = cell_place(index);
             let all = register_read::Written {
