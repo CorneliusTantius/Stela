@@ -216,8 +216,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// HACR traps none; SVC and ERET between EL0 and EL2 of the host
     /// (HCR_EL2.E2H and TGE: one translation regime, PAC keys and controls,
     /// and no fine-grained trap of either) or within EL2, unguarded, with
-    /// the watchpoints the same on both sides, no single-step in progress
-    /// and the local monitor kept in the frame alone (no canonical memory).
+    /// the watchpoints the same on both sides and no single-step in
+    /// progress. ERET also needs the local monitor kept in the frame alone:
+    /// a PE with canonical memory (the home PE of a parallel board) clears
+    /// its reservation through the shared registry (`Cpu::exception_return`),
+    /// which native code cannot reach. An SVC leaves the monitor alone
+    /// (`Cpu::take`), so it makes records there too.
     pub(super) fn note_transition(&mut self, kind: usize, start: Start, spsr: u64, aspsr: u64) {
         self.statistics.engine_transitions[kind] += 1;
         let (from, to) = (start.pstate, self.cpu.pstate);
@@ -233,7 +237,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     && self.cpu.in_host()
                     && start.watch == self.watch
                     && !self.cpu.step_advance
-                    && !self.cpu.has_canonical_memory()
+                    && (kind == SUPERVISOR_CALL || !self.cpu.has_canonical_memory())
                     && if kind == SUPERVISOR_CALL {
                         to.el == 2
                     } else {
