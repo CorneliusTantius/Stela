@@ -797,6 +797,72 @@ fn guest_panic() -> Option<String> {
         .and_then(|panic| panic.message().map(String::from))
 }
 
+/// The panic region's guest-physical base and size, from the booted
+/// DeviceTree's `/pram reg` (the loader publishes it; zero when absent).
+static PANIC_REGION: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Keep the panic region the booted DeviceTree names, for
+/// [`panic_region_report`].
+pub(crate) fn remember_panic_region(tree: &DeviceTree) {
+    let Some(reg) = tree.property(stela_loader::carveouts::PRAM, "reg") else {
+        return;
+    };
+    let Some((base, bytes)) = reg.value.get(..16).map(|pair| {
+        let (base, bytes) = pair.split_at(8);
+        (
+            u64::from_le_bytes(base.try_into().expect("8 bytes")),
+            u64::from_le_bytes(bytes.try_into().expect("8 bytes")),
+        )
+    }) else {
+        return;
+    };
+    PANIC_REGION[0].store(base, Ordering::Relaxed);
+    PANIC_REGION[1].store(bytes, Ordering::Relaxed);
+}
+
+/// When the guest went down without a panic on its console, what its panic
+/// region holds: XNU logs a panic there before it stops the other CPUs'
+/// work, and a CPU that never answers (parked in SPTM, say) keeps the
+/// console from ever printing it, until a watchdog resets the machine.
+fn panic_region_report<H: Host>(machine: &mut Machine<H, parallel::Board>) {
+    use stela_boot_core::panic_region::{Contents, HEADER_BYTES, TEXT_LIMIT, read};
+    let base = PANIC_REGION[0].load(Ordering::Relaxed);
+    let bytes = PANIC_REGION[1].load(Ordering::Relaxed);
+    if base == 0 || bytes < HEADER_BYTES as u64 {
+        output::arguments(format_args!("GUEST PANIC region=none\n"));
+        return;
+    }
+    // The header, the log offset XNU's header gives (0x331 bytes in) and the
+    // text limit, read a page at a time so a short region stays in bounds.
+    let wanted = bytes.min(0x1000 + TEXT_LIMIT as u64) as usize;
+    let mut region = alloc::vec![0u8; wanted];
+    for (index, chunk) in region.chunks_mut(0x1000).enumerate() {
+        if !machine.read_physical(base + index as u64 * 0x1000, chunk) {
+            output::arguments(format_args!(
+                "GUEST PANIC region={base:#x} unreadable at {:#x}\n",
+                base + index as u64 * 0x1000
+            ));
+            return;
+        }
+    }
+    match read(&region) {
+        Contents::NoHeader => output::arguments(format_args!(
+            "GUEST PANIC region={base:#x} no panic header: the kernel did not begin a panic log\n"
+        )),
+        Contents::BadOffset(offset) => output::arguments(format_args!(
+            "GUEST PANIC region={base:#x} header log offset {offset:#x} lies outside it\n"
+        )),
+        Contents::Empty => output::arguments(format_args!(
+            "GUEST PANIC region={base:#x} header present, no log text yet\n"
+        )),
+        Contents::Text { text, truncated } => {
+            output::arguments(format_args!(
+                "GUEST PANIC region={base:#x} truncated={truncated} text={text:?}\n"
+            ));
+        }
+    }
+}
+
 /// How the guest went down: the first panic, else `otherwise`.
 fn guest_down(otherwise: String) -> String {
     match guest_panic() {
@@ -1034,6 +1100,11 @@ fn finish<H: Host>(
                 output::arguments(format_args!("STOP macOS crashed: {message}\n"));
                 output::arguments(format_args!("RESET after panic: {reset}\n"));
             } else {
+                // Before the report: a watchdog's reset leaves RAM as the
+                // panicking PE left it.
+                if !orderly(&reset) {
+                    panic_region_report(machine);
+                }
                 output::arguments(format_args!("STOP reset: {reset}\n"));
             }
             // The run is over: its blocks' memory goes to proving the new

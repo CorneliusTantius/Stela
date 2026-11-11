@@ -774,4 +774,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
             _ => false,
         }
     }
+
+    /// Read `bytes.len()` bytes of guest RAM at physical `address`, for
+    /// diagnostics after a stop (the panic region): `false` when it reaches
+    /// no RAM; nothing is faulted or changed.
+    pub fn read_physical(&mut self, address: u64, bytes: &mut [u8]) -> bool {
+        self.host.read_ram(address, bytes)
+    }
 }

@@ -54,6 +54,7 @@ pub mod native_resources;
 pub mod nofault_read;
 pub mod options;
 pub mod page_window;
+pub mod panic_region;
 pub mod paging_controls;
 pub mod passthrough;
 pub mod pe;
