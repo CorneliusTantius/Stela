@@ -2384,6 +2384,9 @@ fn an_evicted_blocks_successor_box_and_index_list_serve_the_next_block() {
     let causes = machine.install_causes();
     assert_eq!((causes.installs, causes.thrash, causes.first), (5, 1, 4));
     assert!(causes.installed_bytes > 0 && causes.evicted_bytes > 0);
+    // One branch per block, all in the lower half.
+    assert_eq!(causes.guest_instructions, 5);
+    assert_eq!((causes.upper_bytes, causes.upper_instructions), (0, 0));
 }
 
 #[test]

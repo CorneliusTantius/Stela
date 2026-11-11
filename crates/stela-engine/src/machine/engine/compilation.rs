@@ -999,7 +999,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
             .recovery()
             .insert(slot, compiled.clone().installed());
         let mut cache = shared.cache_at(board::LockSite::Install);
-        self.census_installed(&mut cache, pc, physical, variant, installed_bytes);
+        self.census_installed(
+            &mut cache,
+            pc,
+            physical,
+            variant,
+            installed_bytes,
+            instructions,
+        );
         // Another PE installed the block meanwhile: the first install wins,
         // and this one's code stays unreachable until its part goes.
         if let Some(held) = cache.index.get(&shared.blocks, pc, physical, id) {
@@ -1113,10 +1120,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
     }
 
-    /// Count an install of `bytes` of code of the block at `pc`, `physical`
-    /// and `variant`, and with step timing on, why it was needed
-    /// ([`install_census`]). A shared board keeps one census, under its
-    /// lock (`cache`), and its blocks are never elsewhere.
+    /// Count an install of `bytes` of code for `instructions` guest
+    /// instructions of the block at `pc`, `physical` and `variant`, and
+    /// with step timing on, why it was needed ([`install_census`]). A
+    /// shared board keeps one census, under its lock (`cache`), and its
+    /// blocks are never elsewhere.
     pub(super) fn census_installed(
         &mut self,
         cache: &mut board::Cache,
@@ -1124,10 +1132,16 @@ impl<H: Host, D: Devices> Machine<H, D> {
         physical: u64,
         variant: Variant,
         bytes: usize,
+        instructions: usize,
     ) {
         let causes = &mut self.install_causes;
         causes.installs += 1;
         causes.installed_bytes += bytes as u64;
+        causes.guest_instructions += instructions as u64;
+        if pc >> 63 != 0 {
+            causes.upper_bytes += bytes as u64;
+            causes.upper_instructions += instructions as u64;
+        }
         if self.step_timing.is_none() {
             self.census = None;
             return;

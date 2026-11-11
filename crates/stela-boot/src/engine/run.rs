@@ -1235,8 +1235,9 @@ impl Heartbeat {
             // interval's share evicting. On a shared board one census
             // counts for the board: evicted by any PE, never on the board
             // before, and never elsewhere.
-            let mut installs =
-                String::from("PES INSTALLS installs/thrash/elsewhere/first/in_kb/out_kb/evict%");
+            let mut installs = String::from(
+                "PES INSTALLS installs/thrash/elsewhere/first/in_kb/out_kb/evict%/insns/upper_kb/upper_insns",
+            );
             let tsc_percent = |ticks: u64| u128::from(ticks) * 100 / u128::from(elapsed.max(1));
             // With `--profile`: the exits of every PE together, by kind, as
             // `PROFILE exits` gives the home machine's.
@@ -1341,7 +1342,7 @@ impl Heartbeat {
                 );
                 let (cause, was) = (&now.installs, &before.installs);
                 installs.push_str(&format!(
-                    " {pe}:{}/{}/{}/{}/{}/{}/{}",
+                    " {pe}:{}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
                     cause.installs.saturating_sub(was.installs),
                     cause.thrash.saturating_sub(was.thrash),
                     cause.elsewhere.saturating_sub(was.elsewhere),
@@ -1349,6 +1350,13 @@ impl Heartbeat {
                     cause.installed_bytes.saturating_sub(was.installed_bytes) / 1024,
                     cause.evicted_bytes.saturating_sub(was.evicted_bytes) / 1024,
                     percent(cause.evict_ticks.saturating_sub(was.evict_ticks)),
+                    cause
+                        .guest_instructions
+                        .saturating_sub(was.guest_instructions),
+                    cause.upper_bytes.saturating_sub(was.upper_bytes) / 1024,
+                    cause
+                        .upper_instructions
+                        .saturating_sub(was.upper_instructions),
                 ));
                 phases.push_str(&format!(" {pe}:"));
                 for (slot, (now, before)) in now.phases.iter().zip(before.phases).enumerate() {
