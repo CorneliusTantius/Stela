@@ -1023,12 +1023,22 @@ impl Cpu {
                 pmu.set_guarded_filter(value, physical, retired, context);
             }
         }
+        // A storage or scratch register a store takes in full
+        // (`impdef::Entry::stored_write`), such as XNU's thread keys at each
+        // thread switch, holds a value that only reads of it return: no
+        // access, translation, exception entry or transition record depends
+        // on it, as native code's store of it already assumes.
+        let stored = matches!(entry.class, impdef::Class::Storage | impdef::Class::Scratch)
+            && entry
+                .stored_write()
+                .is_some_and(|refused| value & refused == 0);
         match self.apple.impdef.write(entry, value) {
             Ok(()) => Outcome::Written(Changes {
                 unmodeled: entry.unmodeled_effect(value),
                 irq_steering: (entry.encoding == impdef::SIQ_CFG_EL1)
                     .then_some(value & SIQ_CFG_MODE == SIQ_CFG_NO_IRQ),
-                reads_kept: true,
+                stored,
+                reads_kept: !stored,
                 ..Changes::default()
             }),
             Err(reason) => Outcome::Refused(Refusal::UnsupportedSetting(reason)),
@@ -1297,9 +1307,13 @@ impl Apple {
                 apple.sprr_perm[index] = value;
                 changes.permissions = true;
             }
+            // The fields only gate later SPRR_PERM writes, which the engine
+            // completes and checks then (`mmu::sprr_unlocked`): no access,
+            // derived state or transition record reads them. SPTM writes
+            // them at every address-space switch.
             Self::SprrFields(which) => {
                 apple.sprr_fields[which] = value;
-                changes.reads_kept = true;
+                changes.stored = true;
             }
             Self::GxfConfig(level) => {
                 if value & !(GXF_CONFIG_EN | GXF_CONFIG_LOCKS | GXF_CONFIG_EL1_LOCK) != 0 {
