@@ -232,18 +232,23 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// and keeps its neighbour. Counts the pages the ITLB lacked in the
     /// context apart from the new keys of pages it held.
     pub(super) fn translate_page(&mut self, pc: u64, key: u64) {
-        self.take_page(pc, key, true);
+        let global = self.fetched_global(pc);
+        self.take_page(pc, key, true, global);
     }
 
     /// [`Self::translate_page`], counting a page the ITLB lacked as a miss
     /// when `missed` (a fetch's) and as a refill when not
-    /// ([`Self::refill_pages`]).
-    fn take_page(&mut self, pc: u64, key: u64, missed: bool) {
+    /// ([`Self::refill_pages`]). `global` marks a page whose walk ended in
+    /// a global leaf ([`chain::LookupEntry::global_page`]).
+    fn take_page(&mut self, pc: u64, key: u64, missed: bool, global: bool) {
         let half = chain::half(pc);
         let context = self.chain.contexts()[half];
         let page = pc & !(FETCH_PAGE - 1);
         let slot = self.itlb.page_slot(pc, context);
-        let entry = chain::LookupEntry::page(page, context, key);
+        let entry = match global {
+            true => chain::LookupEntry::global_page(page, context, key),
+            false => chain::LookupEntry::page(page, context, key),
+        };
         let held = self.itlb.find(slot, page, context);
         if held == entry {
             return;
@@ -453,7 +458,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     pub(super) fn refill_pages(&mut self, el: u8, context: Variant) {
         let generation = self.translation_generation;
         for pc in core::mem::take(&mut self.refills) {
-            let Some((physical, guarded)) = self.quiet_fetch_physical(pc) else {
+            let Some((physical, guarded, global)) = self.quiet_fetch_physical(pc) else {
                 continue;
             };
             if self.translation_generation != generation {
@@ -468,7 +473,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             let variant = self.page_variant(current, physical);
             if let Some(id) = self.known_variant(variant) {
                 let key = self.block_key(physical, id);
-                self.take_page(pc, key, false);
+                self.take_page(pc, key, false, global);
             }
         }
     }

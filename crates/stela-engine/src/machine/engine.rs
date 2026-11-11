@@ -593,6 +593,8 @@ struct FetchEntry {
     physical: u64,
     /// FEAT_BTI's guarded page (Arm `InGuardedPage`).
     guarded: bool,
+    /// The walk ended in a global leaf (nG=0).
+    global: bool,
     el: u8,
     epoch: FetchEpoch,
 }
@@ -642,9 +644,6 @@ impl<T> core::ops::Deref for Padded<T> {
 const RECENT: usize = 4;
 /// `Machine::lower_globals` with no such fetch.
 const NO_GLOBALS: (u64, u64) = (u64::MAX, 0);
-/// The bits of [`Machine::global_leaves`]: 32 KiB, which the few thousand
-/// global leaves (a shared library cache's) fill to about 2%.
-const GLOBAL_LEAVES: usize = 1 << 18;
 
 /// The translation inputs besides TTBR0 and the SPRR permissions that a
 /// PE's contexts name at once ([`Machine::context_frames`]).
@@ -869,13 +868,6 @@ pub struct Machine<H: Host, D: Devices> {
     /// The first and last addresses of the lower half fetched through a
     /// global page since its contexts were last forgotten, or [`NO_GLOBALS`].
     lower_globals: (u64, u64),
-    /// A filter of the lower half's leaves fetched through global
-    /// translations since its contexts were last forgotten, a bit per hash
-    /// ([`GLOBAL_LEAVES`]), and their sizes, a bit per power of two: a TLBI
-    /// by VA and ASID of any other leaf reaches that ASID's contexts alone,
-    /// however wide `lower_globals` is. Allocated at the first such fetch.
-    global_leaves: Vec<u64>,
-    global_sizes: u64,
     /// A filter of the leaves each half fetched through since its contexts
     /// were last forgotten: a TLBI of any other leaf reaches no lookup entry
     /// and no cached fetch, as most by far do not. Each half allocates
@@ -1356,8 +1348,6 @@ impl<H: Host, D: Devices> Machine<H, D> {
             fill_log: Vec::new(),
             fill_next: 0,
             pending_refills: BTreeMap::new(),
-            global_leaves: Vec::new(),
-            global_sizes: 0,
             refills: Vec::new(),
             applying_mail: false,
             profile_missing: Vec::new(),

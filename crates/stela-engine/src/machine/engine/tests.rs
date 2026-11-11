@@ -3523,9 +3523,10 @@ fn block_entries_survive_a_tlbi_all() {
     // had its salt.
     let slot = machine.itlb.page_slot(BASE, after);
     assert_eq!(slot, machine.itlb.page_slot(BASE, before));
+    let entry = machine.itlb.entry(slot);
     assert_eq!(
-        machine.itlb.entry(slot),
-        chain::LookupEntry::page(BASE & !(FETCH_PAGE - 1), after, key)
+        (entry.pc, entry.key, entry.entry),
+        (BASE & !(FETCH_PAGE - 1), after, key)
     );
 }
 
@@ -3944,7 +3945,8 @@ fn steady_state_transfers_between_pages_stay_in_the_dispatchers() {
 }
 
 /// A TLBI by VA of one process leaves the other processes' ITLB entries of
-/// the same VAs, however wide its span, unless a global page shares them.
+/// the same VAs, however wide its span, but those made through a global
+/// leaf.
 #[test]
 fn a_tlbi_by_va_and_asid_leaves_the_entries_of_other_asids() {
     use mmu::tlbi::{Everywhere, Reach};
@@ -3985,9 +3987,16 @@ fn a_tlbi_by_va_and_asid_leaves_the_entries_of_other_asids() {
     tlbi(&mut machine);
     assert_eq!(held(&machine), [false, true]);
     assert_eq!(machine.statistics.lookup_forgets[2], 2);
-    // A global page in the span is every process's.
+    // A global page in the span leaves the other process's non-global
+    // entry of it, and its global entry is every process's.
     machine.fetched_through(0, PC, 0x4000, true);
     fill(&mut machine);
+    tlbi(&mut machine);
+    assert_eq!(held(&machine), [false, true]);
+    machine.itlb.set(
+        machine.itlb.page_slot(PC, six),
+        chain::LookupEntry::global_page(PC, six, 1),
+    );
     tlbi(&mut machine);
     assert_eq!(held(&machine), [false, false]);
 }
@@ -4005,6 +4014,7 @@ fn a_tlbi_drops_the_cached_fetches_of_the_pages_it_reaches_alone() {
             page,
             physical: page,
             guarded: false,
+            global: true,
             el: 0,
             epoch,
         });
