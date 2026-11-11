@@ -2023,7 +2023,13 @@ pub(super) fn pump() {
                 serving,
             );
             steps += 1;
-            if super::service::shutdown_pending() || host::rdtsc().wrapping_sub(started) >= budget {
+            // A core spinning for the host drivers' lock this pump holds
+            // (a disk or input call) takes it after this step; the rest
+            // stays pending for the next pump.
+            if super::service::shutdown_pending()
+                || host::rdtsc().wrapping_sub(started) >= budget
+                || super::storage::host_drivers_wanted()
+            {
                 if !gpu.events.pending.swap(true, Ordering::AcqRel) {
                     PENDING_SINCE.store(host::rdtsc(), Ordering::Release);
                 }

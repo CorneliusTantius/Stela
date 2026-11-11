@@ -23,7 +23,7 @@ use core::{
     cell::Cell,
     panic::Location,
     ptr,
-    sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering},
 };
 use stela_boot_core::staged_disk::{self, DiskWorker};
 use stela_contracts::refuse;
@@ -200,12 +200,23 @@ fn try_lock_host_drivers() -> bool {
         .is_ok()
 }
 
+/// Cores spinning for [`HOST_DRIVERS`] now ([`host_drivers_wanted`]).
+static HOST_DRIVERS_WAITERS: AtomicU32 = AtomicU32::new(0);
+
+/// Whether a core waits for the host drivers' lock now: a holder that runs
+/// work in steps (the GPU pump) ends its turn at the next step boundary
+/// instead of at its budget, leaving the rest pending.
+pub(super) fn host_drivers_wanted() -> bool {
+    HOST_DRIVERS_WAITERS.load(Ordering::Relaxed) != 0
+}
+
 /// Take the host drivers' lock, counting the wait.
 fn lock_host_drivers() -> u64 {
     if try_lock_host_drivers() {
         return 0;
     }
     let started = super::host::rdtsc();
+    HOST_DRIVERS_WAITERS.fetch_add(1, Ordering::Relaxed);
     while HOST_DRIVERS
         .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()
@@ -215,6 +226,7 @@ fn lock_host_drivers() -> u64 {
         crate::native_mmio::shootdown::service();
         core::hint::spin_loop();
     }
+    HOST_DRIVERS_WAITERS.fetch_sub(1, Ordering::Relaxed);
     let waited = super::host::rdtsc().wrapping_sub(started);
     HOST_DRIVERS_WAITED[0].fetch_add(waited, Ordering::Relaxed);
     HOST_DRIVERS_WAITED[1].fetch_max(waited, Ordering::Relaxed);
