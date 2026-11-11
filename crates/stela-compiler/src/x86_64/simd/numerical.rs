@@ -974,6 +974,87 @@ pub(super) fn vector_normal_or_zero_range(
     source: u8,
     scratch: u8,
 ) {
+    vector_normal_or_zero_fields(code, format, source, scratch);
+    vector_validity_mask(code, format, shape);
+}
+
+/// Accept normal values, infinities and, for S/D, signed zeros: every
+/// ordered value except subnormals (and Half zeros). NaN lanes fail. Same
+/// register contract as [`vector_normal_or_zero_range`].
+pub(super) fn vector_ordered_range(
+    code: &mut Code,
+    format: Format,
+    shape: Shape,
+    source: u8,
+    scratch: u8,
+) {
+    if format == Format::Half {
+        vector_exponent_validity(code, format, source, false);
+    } else {
+        vector_normal_or_zero_fields(code, format, source, scratch);
+    }
+    infinity_lanes(code, format, source, scratch);
+    vector_validity_mask(code, format, shape);
+}
+
+/// OR an all-ones mask for every infinite lane of `source` into
+/// EXPONENT_VECTOR. Shifting out the sign leaves an infinity equal to all
+/// ones shifted above the fraction; a NaN has fraction bits and differs.
+/// Clobbers VALIDITY_VECTOR and `scratch`.
+fn infinity_lanes(code: &mut Code, format: Format, source: u8, scratch: u8) {
+    let (left, equal) = match format {
+        Format::Double => (ShiftOpcode::LeftQword, Host::EqualDword),
+        Format::Single => (ShiftOpcode::LeftDword, Host::EqualDword),
+        Format::Half => (ShiftOpcode::LeftWord, Host::EqualWord),
+    };
+    packed(code, Host::MoveAligned, VALIDITY_VECTOR, source);
+    left.emit(code, VALIDITY_VECTOR, SIGN_BITS);
+    packed(code, Host::EqualDword, scratch, scratch);
+    left.emit(code, scratch, format.fraction_bits() as u8 + SIGN_BITS);
+    packed(code, equal, VALIDITY_VECTOR, scratch);
+    if format == Format::Double {
+        packed_imm(
+            code,
+            Host::ShuffleDword,
+            scratch,
+            VALIDITY_VECTOR,
+            SWAP_DWORD_PAIRS,
+        );
+        packed(code, Host::And, VALIDITY_VECTOR, scratch);
+    }
+    packed(code, Host::Or, EXPONENT_VECTOR, VALIDITY_VECTOR);
+}
+
+/// Leave ZF set when the low `format` lane of `source` is an infinity of
+/// either sign. Clobbers RAX.
+pub(super) fn infinity_scalar(code: &mut Code, format: Format, source: u8) {
+    let mut asm = code.asm();
+    if format == Format::Double {
+        asm.movq_from_xmm(Rax, source);
+        // Drop the sign, then rotate the exponent below the fraction.
+        asm.shift_imm(ShiftOp::Shl, Size::Qword, Rax, SIGN_BITS);
+        asm.shift_imm(
+            ShiftOp::Rol,
+            Size::Qword,
+            Rax,
+            (Format::Double.bits() - Format::Double.fraction_bits() - u32::from(SIGN_BITS)) as u8,
+        );
+        let exponent = (format.exponent_mask() >> format.fraction_bits()) as i32;
+        asm.alu_imm32(Alu::Cmp, Size::Qword, Rax, exponent);
+    } else {
+        asm.movd_from_xmm(Rax, source);
+        // Shift out the higher lanes and the sign.
+        let shift = u32::BITS - format.bits() + u32::from(SIGN_BITS);
+        asm.shift_imm(ShiftOp::Shl, Size::Dword, Rax, shift as u8);
+        asm.alu_accumulator_imm32(
+            Alu::Cmp,
+            Size::Dword,
+            (format.exponent_mask() << shift) as u32 as i32,
+        );
+    }
+}
+
+fn vector_normal_or_zero_fields(code: &mut Code, format: Format, source: u8, scratch: u8) {
     assert!(
         ![
             source,
@@ -1007,7 +1088,6 @@ pub(super) fn vector_normal_or_zero_range(
         packed(code, Host::And, VALIDITY_VECTOR, scratch);
     }
     packed(code, Host::Or, EXPONENT_VECTOR, VALIDITY_VECTOR);
-    vector_validity_mask(code, format, shape);
 }
 
 fn vector_validity_mask(code: &mut Code, format: Format, shape: Shape) {
