@@ -346,6 +346,8 @@ pub struct Counts {
     pub spin_ticks: u64,
     /// Of `sleep_ticks`, those in the host halt ([`super::Statistics::halt_ticks`]).
     pub halt_ticks: u64,
+    /// Of `waits`, WFEs completed in their exit ([`super::Statistics::short_waits`]).
+    pub short_waits: u64,
     pub sync_ticks: u64,
     pub waits: u64,
     pub broadcasts: u64,
@@ -1633,6 +1635,120 @@ impl<H: Host, D: Devices> Machine<H, D> {
         };
     }
 
+    /// Complete a short WFE inside the scheduler's entry, without its wait
+    /// passes: `Some` with the completion when the running PE, not the home
+    /// PE and the only one of its machine, waits in WFE (no monitor armed,
+    /// not powered down) and becomes ready ([`Self::ready`], the passes'
+    /// own test) by its next own wake (event stream edge, timer, PMI, WFET
+    /// timeout, device-line cache expiry) within [`Self::idle_poll`] host
+    /// counts. That is the most the passes' own halt-poll would spin before
+    /// they halt, at most 200 us (`IDLE_POLL_HZ`): far under the 0.5 s one
+    /// exit may take, and no longer than today's spin to the same wake.
+    ///
+    /// The spin is a safe point (`Host::relax`) and serves host interrupts
+    /// as the halt-poll does. Mail (another PE's SEV or maintenance) is read
+    /// at once, before any block runs, and the WFE completes if that made
+    /// it ready. A host call, the host's service, a host interrupt or a
+    /// wake still ahead leave the wait to the passes (`None`), which then
+    /// find it as they do now; so do the home PE and a run with a deadline.
+    pub(super) fn short_event_wait(
+        &mut self,
+        run_deadline: Option<super::budget::Deadline>,
+    ) -> Option<Step> {
+        let hub = self.parallel.as_ref()?;
+        let pe = self.current;
+        let event_wait = self
+            .waiting
+            .is_some_and(|wait| wait.kind == super::WaitKind::Event && !wait.down);
+        if run_deadline.is_some()
+            || self.idle_poll == 0
+            || !event_wait
+            || self.cpu.monitor.is_some()
+            || hub.home.load(Ordering::Relaxed) == pe
+            || hub.woken(pe, self.lines_epoch)
+            || self.processor_paused(pe)
+            || self
+                .peers
+                .iter()
+                .any(|peer| matches!(peer, Peer::Parked(_)))
+            || self.devices.dma_deadline().is_some()
+            || self.devices.waits_on_host()
+        {
+            return None;
+        }
+        let start = self.host.counter();
+        let now = self.now();
+        if !self.ready(pe, now) {
+            let wake = self.own_wake(now)?;
+            let until = self.clock.wake_at(wake, start);
+            if until > start.saturating_add(self.idle_poll) {
+                return None;
+            }
+            loop {
+                let hub = self.parallel.as_ref()?;
+                if hub.woken(pe, self.lines_epoch) {
+                    if let Err(stop) = self.read_mail() {
+                        return Some(Err(stop));
+                    }
+                    let now = self.now();
+                    let hub = self.parallel.as_ref()?;
+                    if hub.woken(pe, self.lines_epoch) || !self.ready(pe, now) {
+                        self.statistics.sleep_ticks += self.host.counter().wrapping_sub(start);
+                        return None;
+                    }
+                    break;
+                }
+                if self.host.poll_interrupt() {
+                    self.statistics.sleep_ticks += self.host.counter().wrapping_sub(start);
+                    return None;
+                }
+                if self.host.counter() >= until {
+                    let now = self.now();
+                    if !self.ready(pe, now) {
+                        self.statistics.sleep_ticks += self.host.counter().wrapping_sub(start);
+                        return None;
+                    }
+                    break;
+                }
+                self.host.relax();
+            }
+        }
+        self.statistics.waits += 1;
+        self.statistics.short_waits += 1;
+        self.statistics.sleep_ticks += self.host.counter().wrapping_sub(start);
+        // As the passes start a PE they found ready.
+        self.slice_end = self.statistics.blocks + super::processors::QUANTUM;
+        self.slice_deadline =
+            self.host.counter() + self.profile.counter_frequency / super::processors::QUANTUM_HZ;
+        let share = self.runnable();
+        let work = self.work();
+        self.clock.start_slice(|| self.host.counter(), work, share);
+        let (retired, phases) = (self.cpu.retired, self.clock_phases());
+        self.clock.busy(|| self.host.counter(), retired, phases);
+        Some(self.wake())
+    }
+
+    /// The earliest count at which the running PE's own wait can end with
+    /// nobody else acting: its event stream edge, timer, PMI and WFET
+    /// timeout, and the expiry of its cached device lines.
+    fn own_wake(&mut self, now: u64) -> Option<u64> {
+        let wait = self.waiting?;
+        let lines = self
+            .device_lines
+            .filter(|&(_, _, pe)| pe == self.current)
+            .map(|(_, until, _)| until);
+        [
+            super::timer::next_event(&self.cpu, now),
+            self.timer_deadline(),
+            self.cpu.pmu.as_ref().and_then(|monitor| monitor.deadline()),
+            wait.timeout.map(|timeout| timeout.deadline(now)),
+            lines,
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
     /// Maintenance another PE broadcast, reached from this PE's context.
     fn maintain(&mut self, maintenance: Maintenance) -> Step {
         match maintenance {
@@ -1870,6 +1986,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             sleep_ticks: statistics.sleep_ticks,
             spin_ticks: statistics.spin_ticks,
             halt_ticks: statistics.halt_ticks,
+            short_waits: statistics.short_waits,
             sync_ticks: statistics.sync_ticks,
             waits: statistics.waits,
             broadcasts: statistics.broadcasts,

@@ -1144,7 +1144,8 @@ impl Heartbeat {
             // Per PE: idle, monitor-polling and synchronizing shares of
             // the interval, its waits, and the blocks it compiled and
             // installed from another PE.
-            let mut shares = String::from("PES TIME idle%/spin%/sync%/waits/compiled/shared/halt%");
+            let mut shares =
+                String::from("PES TIME idle%/spin%/sync%/waits/compiled/shared/halt%/short");
             // Per PE: the interval's share compiling, reading and hashing
             // fetch pages, finding shared blocks and installing blocks.
             let mut fetches = String::from("PES FETCH compile%/page%/shared%/install%");
@@ -1274,7 +1275,7 @@ impl Heartbeat {
                     / 1_000_000;
                 rates.push_str(&format!(" {pe}:{rate}"));
                 shares.push_str(&format!(
-                    " {pe}:{}/{}/{}/{}/{}/{}/{}",
+                    " {pe}:{}/{}/{}/{}/{}/{}/{}/{}",
                     percent(now.sleep_ticks.saturating_sub(before.sleep_ticks)),
                     percent(now.spin_ticks.saturating_sub(before.spin_ticks)),
                     percent(now.sync_ticks.saturating_sub(before.sync_ticks)),
@@ -1282,6 +1283,7 @@ impl Heartbeat {
                     now.compiled.saturating_sub(before.compiled),
                     now.shared.saturating_sub(before.shared),
                     percent(now.halt_ticks.saturating_sub(before.halt_ticks)),
+                    now.short_waits.saturating_sub(before.short_waits),
                 ));
                 fetches.push_str(&format!(
                     " {pe}:{}/{}/{}/{}",

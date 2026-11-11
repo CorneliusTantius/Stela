@@ -637,6 +637,9 @@ pub struct Statistics {
     /// host halt itself, past the halt-poll (`poll_for_wake`): the rest of
     /// `sleep_ticks` the host core spun.
     pub halt_ticks: u64,
+    /// Of `waits`, WFEs completed inside their exit by a short bounded spin
+    /// (`processors::Machine::short_event_wait`), without a scheduler pass.
+    pub short_waits: u64,
     /// With every PE on a core of its own: maintenance this PE broadcast,
     /// device accesses it forwarded to the home machine, and the counter
     /// ticks it spent waiting on other PEs for those or parked while the
@@ -713,6 +716,7 @@ impl core::ops::AddAssign for Statistics {
             sleep_ticks,
             spin_ticks,
             halt_ticks,
+            short_waits,
             broadcasts,
             forwards,
             sync_ticks,
@@ -841,6 +845,7 @@ impl core::ops::AddAssign for Statistics {
             (&mut self.sleep_ticks, sleep_ticks),
             (&mut self.spin_ticks, spin_ticks),
             (&mut self.halt_ticks, halt_ticks),
+            (&mut self.short_waits, short_waits),
             (&mut self.broadcasts, broadcasts),
             (&mut self.forwards, forwards),
             (&mut self.sync_ticks, sync_ticks),

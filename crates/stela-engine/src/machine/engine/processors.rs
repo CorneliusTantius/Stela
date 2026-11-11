@@ -332,6 +332,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             // a lock and stays busy.
             self.clock.wait(|| self.host.counter());
         }
+        if let Some(step) = self.short_event_wait(run_deadline) {
+            return step;
+        }
         let mut armed = false;
         loop {
             let pass = self.host.counter();
@@ -481,7 +484,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// The PEs that share the round with the running one, itself included:
     /// those out of reset and not waiting for an interrupt. A PE in WFE
     /// spins, so it shares the round.
-    fn runnable(&self) -> u64 {
+    pub(super) fn runnable(&self) -> u64 {
         let parked = self.peers.iter().enumerate().filter(|(pe, peer)| {
             if self.processor_paused(*pe) {
                 return false;

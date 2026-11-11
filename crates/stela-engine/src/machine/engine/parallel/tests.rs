@@ -2378,3 +2378,74 @@ fn a_pe_that_joins_the_board_takes_stamps_of_its_table() {
     assert_eq!(control.cells, cache.targets.stamped_cells());
     assert!(cache.targets.holds_stamps(control.stamps));
 }
+
+/// A WFE of a PE that is not home ends inside the scheduler's entry when
+/// its next own wake is within the halt-poll: at its event stream edge, or
+/// earlier on another PE's SEV, with mail that came during the spin read
+/// before the guest runs again. A wake past the poll, and the home PE,
+/// take the wait passes.
+#[test]
+fn a_short_wfe_completes_in_its_exit_without_the_wait_passes() {
+    use super::super::tests::{BASE, FakeHost, machine};
+    use crate::machine::NoDevices;
+    use crate::machine::system::Register as SystemRegister;
+    use crate::machine::system::TlbiKind::VAA;
+    const WFE: u32 = 0xd503_205f;
+    let start = |events: u64| {
+        let (hub, _) = hub(2);
+        let mut machine = machine(&[]);
+        machine.enter_parallel(Arc::clone(&hub)).unwrap();
+        hub.home.store(1, Ordering::Relaxed);
+        machine.host.counter_step = 1;
+        machine.idle_poll = 300;
+        // CNTHCTL_EL2.EVNTEN with EVNTI `events`: edges 2^(events+1) apart.
+        machine
+            .cpu
+            .registers
+            .set(SystemRegister::CNTHCTL_EL2, 0, 1 << 2 | events << 4);
+        (hub, machine)
+    };
+    let wfe = |machine: &mut Machine<FakeHost, NoDevices>| {
+        machine.cpu.pc = BASE;
+        machine.system_instruction(WFE).unwrap();
+        machine.schedule()
+    };
+    // Edges 128 counts apart: the spin reaches the next one.
+    let (_hub, mut machine) = start(6);
+    let edge = crate::machine::timer::next_event(&machine.cpu, machine.host.now).unwrap();
+    wfe(&mut machine).unwrap();
+    assert!(machine.waiting.is_none() && !machine.cpu.event);
+    assert_eq!(machine.cpu.pc, BASE + 4);
+    let statistics = &machine.statistics;
+    assert_eq!((statistics.waits, statistics.short_waits), (1, 1));
+    assert_eq!(statistics.halt_ticks, 0);
+    assert!(machine.host.timers.is_empty(), "no halt was armed");
+    assert!(machine.host.now >= edge && machine.host.now < edge + 100);
+    // Another PE's TLBI and SEV during the spin: both are read in it and
+    // the SEV ends the WFE before the edge.
+    let (hub, mut machine) = start(7);
+    let edge = crate::machine::timer::next_event(&machine.cpu, machine.host.now).unwrap();
+    let sender = Arc::clone(&hub);
+    machine.host.on_relax = Some(Box::new(move |turn| {
+        if turn == 3 {
+            sender.broadcast(1, &[tlbi(VAA, 0x1234)]);
+            sender.event(1);
+        }
+    }));
+    wfe(&mut machine).unwrap();
+    assert!(machine.waiting.is_none());
+    assert!(!hub.pending(0), "the mail was read");
+    assert_eq!(machine.statistics.short_waits, 1);
+    assert!(machine.host.now < edge, "the SEV ended it");
+    // Edges 65536 counts apart, past the poll: the wait passes take it.
+    let (_hub, mut machine) = start(15);
+    wfe(&mut machine).unwrap();
+    assert!(machine.waiting.is_none());
+    assert_eq!(machine.statistics.short_waits, 0);
+    assert!(machine.statistics.waits > 0);
+    // The home PE always takes the passes.
+    let (hub, mut machine) = start(6);
+    hub.home.store(0, Ordering::Relaxed);
+    wfe(&mut machine).unwrap();
+    assert_eq!(machine.statistics.short_waits, 0);
+}
