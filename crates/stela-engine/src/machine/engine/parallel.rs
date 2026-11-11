@@ -860,7 +860,6 @@ impl Hub {
 
     /// PE `pe`'s mail, if any, which its machine applies and then
     /// acknowledges with [`Self::acknowledge`].
-    #[cfg(test)]
     pub(super) fn take(&self, pe: usize) -> Option<Mail> {
         self.take_into(pe, &mut Vec::new())
     }
