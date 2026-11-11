@@ -42,12 +42,13 @@ pub(super) fn transition_word(word: u32) -> Option<(usize, u16)> {
     }
 }
 
-/// Why GENTER or GEXIT took the engine path, as its thunk would have
-/// decided there ([`Machine::note_transition_miss`]): no record was ever made
+/// Why GENTER, GEXIT, SVC or ERET took the engine path, as its thunk would
+/// have decided there ([`Machine::note_transition_miss`]): no record was ever made
 /// from the state; one was, but the table's generation moved since; it was
 /// made for another frame or stack selection; a deadline was due or none
-/// was known (GEXIT); an interrupt notification came (GEXIT); the operands
-/// the record fixes differ; an interrupt waiting would be unmasked (GEXIT);
+/// was known (GEXIT, ERET); an interrupt notification came (GEXIT, ERET);
+/// the operands the record fixes differ, or the engine holds a monitor
+/// (ERET); an interrupt waiting would be unmasked (GEXIT, ERET);
 /// or the record held, so no thunk ran (none installed, the block ran in
 /// the engine, or the host's root moved).
 pub mod miss {
@@ -93,15 +94,18 @@ pub(super) struct Start {
 }
 
 impl<H: Host, D: Devices> Machine<H, D> {
-    /// GENTER (`kind` [`GUARDED_ENTER`]) or GEXIT is about to take the
-    /// engine path: count why ([`miss`]), in
-    /// [`Statistics::transition_misses`], GENTER's first. Only EL2's make
-    /// records, so only theirs count.
+    /// GENTER, GEXIT, SVC or ERET (`kind`) is about to take the engine
+    /// path: count why ([`miss`]) in [`Statistics::transition_misses`], by
+    /// kind. Only states that make records count: EL2 for all, and EL0 of
+    /// the host for SVC.
     pub(super) fn note_transition_miss(&mut self, kind: usize) {
-        if self.cpu.pstate.el != 2 {
+        let pstate = self.cpu.pstate;
+        let counted = pstate.el == 2
+            || kind == SUPERVISOR_CALL && pstate.el == 0 && !pstate.guarded && self.cpu.in_host();
+        if !counted {
             return;
         }
-        let exit = kind == GUARDED_EXIT;
+        let returning = matches!(kind, GUARDED_EXIT | EXCEPTION_RETURN);
         let table = &self.mirrors.transitions;
         let record = table.records[self.mirror_state()][kind];
         let frame = &self.cpu.state as *const GuestState as u64;
@@ -109,50 +113,60 @@ impl<H: Host, D: Devices> Machine<H, D> {
             miss::NEVER
         } else if record.generation != table.generation {
             miss::FORGOTTEN
-        } else if record.frame != frame || record.selected != u64::from(self.cpu.pstate.sp) {
+        } else if record.frame != frame || record.selected != u64::from(pstate.sp) {
             miss::FRAME
-        } else if exit
+        } else if returning
             && self.mirrors.lines_until != u64::MAX
             && (self.mirrors.lines_until == 0 || self.now() >= self.mirrors.lines_until)
         {
             miss::DEADLINE
-        } else if exit && self.chain.interrupt_moved() {
+        } else if returning && self.chain.interrupt_moved() {
             miss::EPOCH
-        } else if self.transition_operands_differ(&record, exit) {
+        } else if self.transition_operands_differ(&record, kind) {
             miss::CHECK
-        } else if exit && self.transition_unmasks() {
+        } else if returning && self.transition_unmasks(kind) {
             miss::INTERRUPT
         } else {
             miss::OTHER
         };
-        self.statistics.transition_misses[usize::from(exit)][reason] += 1;
+        self.statistics.transition_misses[kind][reason] += 1;
+    }
+
+    /// The SPSR a GEXIT or ERET of `kind` restores, with GEXIT's ASPSR.
+    fn returned_state(&self, kind: usize) -> Option<(u64, u64)> {
+        if kind == EXCEPTION_RETURN {
+            return Some((self.cpu.read(SystemRegister::SPSR_EL2), 0));
+        }
+        let bank = usize::from(self.cpu.pstate.el)
+            .checked_sub(1)
+            .and_then(|level| self.cpu.apple.guarded.get(level))?;
+        Some((bank.spsr, bank.aspsr))
     }
 
     /// Whether the operands `record` fixes differ from the PE's, as the
-    /// thunk checks them: GEXIT's ASPSR guarded bit and SPSR's fixed bits,
-    /// GENTER's PAN.
-    fn transition_operands_differ(&self, record: &Record, exit: bool) -> bool {
-        if !exit {
+    /// thunk checks them: GENTER's and SVC's PAN; GEXIT's ASPSR guarded bit
+    /// and SPSR's fixed bits; ERET's SPSR fixed bits, or a monitor the
+    /// engine holds (`Places::monitor`).
+    fn transition_operands_differ(&self, record: &Record, kind: usize) -> bool {
+        if matches!(kind, GUARDED_ENTER | SUPERVISOR_CALL) {
             return u64::from(self.cpu.pstate.pan) != record.check;
         }
-        let Some(bank) = usize::from(self.cpu.pstate.el)
-            .checked_sub(1)
-            .and_then(|level| self.cpu.apple.guarded.get(level))
-        else {
+        let Some((spsr, aspsr)) = self.returned_state(kind) else {
             return true;
         };
-        bank.aspsr & 1 != record.aspsr_value || bank.spsr & record.check_mask != record.check
+        let monitor = kind == EXCEPTION_RETURN
+            && (self.cpu.monitor.is_some() || self.cpu.has_canonical_memory());
+        let guarded = kind == GUARDED_EXIT && aspsr & 1 != record.aspsr_value;
+        monitor || guarded || spsr & record.check_mask != record.check
     }
 
-    /// Whether GEXIT would unmask an interrupt waiting at native entry.
-    fn transition_unmasks(&self) -> bool {
-        let Some(bank) = usize::from(self.cpu.pstate.el)
-            .checked_sub(1)
-            .and_then(|level| self.cpu.apple.guarded.get(level))
-        else {
+    /// Whether a GEXIT or ERET of `kind` would unmask an interrupt waiting
+    /// at native entry.
+    fn transition_unmasks(&self, kind: usize) -> bool {
+        let Some((spsr, _)) = self.returned_state(kind) else {
             return false;
         };
-        let masks = bank.spsr >> 6 & 3;
+        let masks = spsr >> 6 & 3;
         u64::from(self.cpu.state.pending) & 3 & !masks != 0
     }
 
@@ -646,13 +660,13 @@ pub(super) mod tests {
             machine.finish_transition(1);
             machine.system_instruction(GEXIT).unwrap();
             machine.finish_transition(1);
-            machine.statistics.transition_misses[1]
+            machine.statistics.transition_misses[GUARDED_EXIT]
         };
         let mut expected = [0; miss::REASONS];
         expected[miss::NEVER] += 1;
         assert_eq!(gexit(&mut machine), expected);
         assert_eq!(
-            machine.statistics.transition_misses[0][miss::NEVER],
+            machine.statistics.transition_misses[GUARDED_ENTER][miss::NEVER],
             1,
             "GENTER too"
         );

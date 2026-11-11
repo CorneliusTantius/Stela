@@ -1191,8 +1191,8 @@ impl Heartbeat {
             // GEXIT's, SVC's and ERET's.
             let mut transitions =
                 String::from("PES TRANSITIONS genter/engine/gexit/engine/svc/engine/eret/engine");
-            // All PEs: why GENTER and GEXIT at EL2 took the engine path.
-            let mut transition_misses = [0u64; 16];
+            // All PEs: why SVC, ERET, GENTER and GEXIT took the engine path.
+            let mut transition_misses = [0u64; 32];
             let mut itlb_sources = String::from(concat!(
                 "PES ITLBSRC fills_lower/fills_upper/cold_seen/drop_asid/drop_every",
                 "/all_local/all_received/all_forgot/all_kept/made/mail_merged/refilled",
@@ -1464,16 +1464,15 @@ impl Heartbeat {
             output::arguments(format_args!("{itlb}\n"));
             output::arguments(format_args!("{itlb_sources}\n"));
             output::arguments(format_args!("{transitions}\n"));
-            let [genter, gexit] =
-                [&transition_misses[..8], &transition_misses[8..]].map(|misses| {
-                    misses
-                        .iter()
-                        .map(|count| format!("{count}"))
-                        .collect::<Vec<_>>()
-                        .join("/")
-                });
+            let [svc, eret, genter, gexit] = [0, 1, 2, 3].map(|kind| {
+                transition_misses[kind * 8..kind * 8 + 8]
+                    .iter()
+                    .map(|count| format!("{count}"))
+                    .collect::<Vec<_>>()
+                    .join("/")
+            });
             output::arguments(format_args!(
-                "PES TRANSITION MISSES never/forgotten/frame/deadline/epoch/check/interrupt/other genter={genter} gexit={gexit}\n"
+                "PES TRANSITION MISSES never/forgotten/frame/deadline/epoch/check/interrupt/other svc={svc} eret={eret} genter={genter} gexit={gexit}\n"
             ));
             output::arguments(format_args!("{store}\n"));
             stamped.push_str(&format!(" in_use={stamped_in_use}"));

@@ -198,6 +198,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             // To EL1, or to EL2 from EL2 and from EL0 in the host.
             ExceptionOperation::SupervisorCall { immediate } => {
                 self.advance_step();
+                self.note_transition_miss(transition::SUPERVISOR_CALL);
                 let start = self.transition_start();
                 self.take(Exception::synchronous(
                     Class::SupervisorCall,
@@ -327,6 +328,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         self.guest_entry(self.cpu.exception_state(), self.cpu.pstate.guarded);
         let trace = self.monitor_before(MonitorKind::ExceptionReturn);
+        if key.is_none() {
+            self.note_transition_miss(transition::EXCEPTION_RETURN);
+        }
         let start = self.transition_start();
         let spsr = self.cpu.exception_state();
         self.cpu.exception_return(target).map_err(|_| {

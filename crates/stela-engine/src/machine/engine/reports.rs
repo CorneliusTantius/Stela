@@ -555,9 +555,9 @@ pub struct Statistics {
     pub native_transitions: [u64; transition::KINDS],
     /// Those the engine completed, by the same kinds.
     pub engine_transitions: [u64; transition::KINDS],
-    /// Why GENTER, then GEXIT, at EL2 took the engine path, by
-    /// `transitions::miss` reason.
-    pub transition_misses: [[u64; super::transitions::miss::REASONS]; 2],
+    /// Why GENTER, GEXIT, SVC and ERET took the engine path, by kind
+    /// (`x86_64::transition`) and `transitions::miss` reason.
+    pub transition_misses: [[u64; super::transitions::miss::REASONS]; transition::KINDS],
     /// AMX moves completed inside blocks (`x86_64::amx_transfer`) and by
     /// the engine's service.
     pub amx_moves: [u64; 2],
