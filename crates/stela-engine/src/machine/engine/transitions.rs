@@ -835,6 +835,119 @@ pub(super) mod tests {
         assert_eq!(machine.mirrors.transitions.generation, generation);
     }
 
+    /// MSR APCTL_EL1, x0 (`S3_4_C15_C0_4`), which SPTM makes on entry and
+    /// exit and XNU at thread switches.
+    const MSR_APCTL: u32 = 0xd51c_f080;
+    /// APCTL's kernel-keys bit (`pointer_authentication::APCTL_KERNEL_KEYS`).
+    const KERNEL_KEYS: u64 = 1 << 4;
+
+    /// A write of PAC's inputs (APCTL, a key) keeps the GENTER and GEXIT
+    /// records, whose two sides share every PAC input, and drops the SVC and
+    /// ERET records, whose two levels' PAC use it may set apart.
+    #[test]
+    fn pointer_writes_keep_only_the_guarded_records() {
+        let mut machine = gxf2();
+        machine.cpu.pc = BASE + 0x100;
+        for _ in 0..2 {
+            machine.system_instruction(GENTER_WORD).unwrap();
+            machine.finish_transition(1);
+            machine.system_instruction(GEXIT).unwrap();
+            machine.finish_transition(1);
+            machine.cpu.pc = BASE + 0x100;
+        }
+        let table = &mut machine.mirrors.transitions;
+        let generation = table.generation;
+        assert_eq!(table.records[2][GUARDED_ENTER].generation, generation);
+        assert_eq!(table.records[6][GUARDED_EXIT].generation, generation);
+        // As an SVC from the host's EL0 and an ERET from EL2 would leave.
+        table.records[0][SUPERVISOR_CALL].generation = generation;
+        table.records[2][EXCEPTION_RETURN].generation = generation;
+        let holds = |machine: &Machine<FakeHost, NoDevices>, state: usize, kind: usize| {
+            let table = &machine.mirrors.transitions;
+            table.records[state][kind].generation == table.generation
+        };
+        machine.cpu.state.x[0] = KERNEL_KEYS;
+        machine.system_instruction(MSR_APCTL).unwrap();
+        assert_eq!(machine.cpu.apple.apctl[1], KERNEL_KEYS);
+        assert_ne!(machine.mirrors.transitions.generation, generation);
+        assert!(holds(&machine, 2, GUARDED_ENTER) && holds(&machine, 6, GUARDED_EXIT));
+        assert!(!holds(&machine, 0, SUPERVISOR_CALL) && !holds(&machine, 2, EXCEPTION_RETURN));
+        // An architectural key's write alike.
+        machine
+            .cpu
+            .registers
+            .set(SystemRegister::APIAKeyLo_EL1, 0, 0x5555);
+        machine.register_written(SystemRegister::APIAKeyLo_EL1);
+        assert!(holds(&machine, 2, GUARDED_ENTER) && holds(&machine, 6, GUARDED_EXIT));
+        // Any other derived change still drops them.
+        machine.derived_changed();
+        assert!(!holds(&machine, 2, GUARDED_ENTER) && !holds(&machine, 6, GUARDED_EXIT));
+    }
+
+    /// A native GENTER, an APCTL write at GL2 that turns the kernel keys
+    /// off, and a native GEXIT leave the PE, the PAC service included, as
+    /// the engine path does.
+    #[test]
+    fn native_guarded_transitions_around_an_apctl_write_match_the_engine_path() {
+        let pc = BASE + 0x100;
+        let (mut engine, mut native) = (gxf2(), gxf2());
+        for machine in [&mut engine, &mut native] {
+            machine.cpu.apple.apctl[1] = KERNEL_KEYS;
+            // EL2's own keys (S3_6_C15_C13_0 onward), every half known.
+            for index in 0..10u8 {
+                let encoding = Encoding::new(3, 6, 15, 13 + index / 8, index % 8);
+                let register = crate::machine::pointer_keys::Register::decode(encoding).unwrap();
+                machine
+                    .cpu
+                    .apple
+                    .pointer_keys
+                    .write(register, 0x1111 * u64::from(index + 1));
+            }
+            machine.derived_changed();
+            prepare(machine, pc);
+            for _ in 0..2 {
+                machine.system_instruction(GENTER_WORD).unwrap();
+                machine.finish_transition(1);
+                machine.system_instruction(GEXIT).unwrap();
+                machine.finish_transition(1);
+                machine.cpu.pc = pc;
+            }
+            prepare(machine, pc);
+            machine.revalidate_pointers();
+        }
+        native.mirrors.lines_until = u64::MAX;
+        let pointer = |machine: &Machine<FakeHost, NoDevices>| {
+            (machine.pointer.tags, machine.pointer.generation)
+        };
+        assert_eq!(pointer(&engine), pointer(&native));
+        assert!(native.pointer.tags.iter().any(|&tag| tag != 0), "keys open");
+        engine.system_instruction(GENTER_WORD).unwrap();
+        let syndrome = Cpu::guarded_enter_syndrome(3) as u32;
+        let enter = transition::guarded_enter_thunk(GuestAddress(pc), syndrome, &TRANSITIONS);
+        assert_eq!(
+            run_native(&mut native, &enter.code),
+            (ENTER, ExitKind::Return as u64)
+        );
+        for machine in [&mut engine, &mut native] {
+            machine.cpu.pc = ENTER;
+            machine.cpu.state.x[0] = 0;
+            machine.system_instruction(MSR_APCTL).unwrap();
+            assert_eq!(machine.cpu.apple.apctl[1], 0);
+            machine.cpu.pc = ENTER + 0x40;
+        }
+        assert_eq!(observed(&engine), observed(&native));
+        assert_eq!(pointer(&engine), pointer(&native));
+        engine.system_instruction(GEXIT).unwrap();
+        let leave = transition::guarded_exit_thunk(GuestAddress(ENTER + 0x40), &TRANSITIONS);
+        assert_eq!(
+            run_native(&mut native, &leave.code),
+            (pc + 4, ExitKind::Return as u64)
+        );
+        assert_eq!(observed(&engine), observed(&native));
+        assert_eq!(pointer(&engine), pointer(&native));
+        assert_eq!(native.statistics.native_transitions, [0, 0, 1, 1]);
+    }
+
     /// Any change of what records depend on drops them; lookup contexts
     /// going only keeps them from continuing in their new state until the
     /// next native entry there gives them its contexts.

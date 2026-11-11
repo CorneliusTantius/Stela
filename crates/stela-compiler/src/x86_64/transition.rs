@@ -191,6 +191,20 @@ impl Table {
         self.generation = self.generation.wrapping_add(1).max(1);
     }
 
+    /// Every record stops holding but those of the `kept` kinds that held,
+    /// which hold in the new generation.
+    pub fn forget_but(&mut self, kept: &[usize]) {
+        let (old, new) = (self.generation, self.generation.wrapping_add(1).max(1));
+        for records in &mut self.records {
+            for &kind in kept {
+                if records[kind].generation == old {
+                    records[kind].generation = new;
+                }
+            }
+        }
+        self.generation = new;
+    }
+
     /// Lookup contexts went: no record continues in its new state until
     /// the engine gives it that state's contexts again.
     pub fn contexts_moved(&mut self) {
@@ -1177,5 +1191,27 @@ mod tests {
                 assert_eq!((rig.words.state, rig.state.sp), (6, 0x7000));
             }
         }
+    }
+
+    /// A forget that keeps some kinds keeps only those of them that held;
+    /// the rest, and a record that had stopped holding, do not hold.
+    #[test]
+    fn forgetting_but_some_kinds_keeps_only_their_holding_records() {
+        let mut table = Table::default();
+        let generation = table.generation;
+        for kind in 0..KINDS {
+            table.records[3][kind].generation = generation;
+        }
+        table.records[5][GUARDED_EXIT].generation = generation + 7;
+        table.forget_but(&[GUARDED_ENTER, GUARDED_EXIT]);
+        assert_ne!(table.generation, generation);
+        let holds = |table: &Table, state: usize, kind: usize| {
+            table.records[state][kind].generation == table.generation
+        };
+        assert!(holds(&table, 3, GUARDED_ENTER) && holds(&table, 3, GUARDED_EXIT));
+        assert!(!holds(&table, 3, SUPERVISOR_CALL) && !holds(&table, 3, EXCEPTION_RETURN));
+        assert!(!holds(&table, 5, GUARDED_EXIT));
+        table.forget();
+        assert!(!holds(&table, 3, GUARDED_ENTER));
     }
 }

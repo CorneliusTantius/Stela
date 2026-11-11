@@ -201,6 +201,10 @@ pub struct Changes {
     /// No MRS reads or traps differently after the write, so reads complete
     /// natively as they did: only what else derives from it goes.
     pub reads_kept: bool,
+    /// With `reads_kept`: the write changed only PAC's inputs at EL2 (APCTL,
+    /// the keys), which EL2 and its guarded level share whole, so records
+    /// of GENTER and GEXIT, between those two, stay.
+    pub pointer: bool,
     /// The write took a value whose effect this machine does not model
     /// (`impdef::Entry::unmodeled_effect`): what is missing, which the
     /// engine reports once.
@@ -1351,14 +1355,17 @@ impl Apple {
             Self::ApControl(level) => {
                 apple.apctl[level] = value;
                 changes.reads_kept = true;
+                changes.pointer = true;
             }
             Self::KernelKey(index) => {
                 apple.kernel_key[index] = value;
                 changes.reads_kept = true;
+                changes.pointer = true;
             }
             Self::PointerKey(register) => {
                 apple.pointer_keys.write(register, value);
                 changes.reads_kept = true;
+                changes.pointer = true;
             }
             Self::VmsaLock => {
                 if value & !VMSA_LOCK_KNOWN != 0 {

@@ -860,7 +860,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     self.device_lines = None;
                 }
                 // PSTATE.D and Apple registers can change what is derived.
-                if changes.reads_kept {
+                if changes.reads_kept && changes.pointer {
+                    self.forget_pointer_derived();
+                } else if changes.reads_kept {
                     self.forget_derived();
                 } else if !changes.stored && !changes.permissions {
                     self.derived_changed();
