@@ -128,7 +128,7 @@ impl Cursors {
         };
         archive
             .read_member_resuming(reader, entry, &mut progress, offset, output)
-            .map_err(payload)?;
+            .map_err(|error| source_error(reader, error))?;
         if let Some(progress) = progress
             && progress.produced() < entry.bytes
         {
@@ -157,6 +157,15 @@ pub struct Store<R> {
 }
 fn payload(error: impl core::fmt::Debug) -> Error {
     Error::Payload(refuse!("payload: {error}", ?error))
+}
+/// A failed read of `reader`: [`Error::Pending`] when the source only ran
+/// out of the time it may wait (`ReadAt::blocked`), so the caller asks
+/// again later, else the payload's refusal.
+fn source_error<R: ReadAt>(reader: &mut R, error: impl core::fmt::Debug) -> Error {
+    match reader.blocked() {
+        true => Error::Pending,
+        false => payload(error),
+    }
 }
 impl<R: ReadAt> Store<R> {
     /// `selected` is supplied by the inventory (20 for the acceptance input),
@@ -497,19 +506,26 @@ impl<R: ReadAt> Store<R> {
         if blocks > MAX_BLOCKS - self.block_count {
             return Err(Error::Limit("payload hash index"));
         }
-        let mut stream = self
-            .archive
-            .open_member(&mut self.reader, &entry)
-            .map_err(payload)?;
         let mut hash = Sha256::new();
         let mut hash384 = Sha384::new();
         let mut hashes = Vec::new();
         let mut buffer = vec![0; BLOCK_BYTES];
         let mut total = 0u64;
+        let read = self.archive.open_member(&mut self.reader, &entry);
+        let mut stream = match read {
+            Ok(stream) => stream,
+            Err(error) => return Err(source_error(&mut self.reader, error)),
+        };
         loop {
             let mut done = 0;
             while done < buffer.len() {
-                let n = stream.read(&mut buffer[done..]).map_err(payload)?;
+                let n = match stream.read(&mut buffer[done..]) {
+                    Ok(n) => n,
+                    Err(error) => {
+                        drop(stream);
+                        return Err(source_error(&mut self.reader, error));
+                    }
+                };
                 if n == 0 {
                     break;
                 }

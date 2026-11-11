@@ -313,12 +313,18 @@ impl<R: ReadAt, H: Copy + Eq> Driver<R, H> {
             {
                 continue;
             }
-            if let Err(e) = transfer.job.prefetch(&mut self.answers.store, chunks) {
-                self.failure = Some(super::refuse(
-                    refuse!("transfer failed: {e}", ?e),
-                    &transfer.job.request,
-                ));
-                return;
+            match transfer.job.prefetch(&mut self.answers.store, chunks) {
+                Ok(()) => {}
+                // The source ran out of the time it may wait: the next
+                // prefetch reads on from what arrived meanwhile.
+                Err(Error::Pending) => return,
+                Err(e) => {
+                    self.failure = Some(super::refuse(
+                        refuse!("transfer failed: {e}", ?e),
+                        &transfer.job.request,
+                    ));
+                    return;
+                }
             }
         }
     }

@@ -434,3 +434,71 @@ fn interleaved_deflated_members_resume_without_replaying_prefixes() {
         "resumed {resumed}, replayed {replayed}"
     );
 }
+
+#[test]
+fn a_read_whose_source_ran_out_of_time_is_pending_and_goes_on_later() {
+    /// A network source bounded for its caller: its next `stalls` reads
+    /// run out of time; `broken` fails every read for another reason.
+    struct Stalling {
+        source: Memory,
+        stalls: usize,
+        broken: bool,
+        blocked: bool,
+    }
+    impl ReadAt for Stalling {
+        type Error = &'static str;
+
+        fn len(&self) -> u64 {
+            self.source.len()
+        }
+
+        fn read_at(
+            &mut self,
+            offset: u64,
+            buffer: &mut [u8],
+        ) -> core::result::Result<(), Self::Error> {
+            if self.stalls > 0 {
+                self.stalls -= 1;
+                self.blocked = true;
+                return Err("the read's time ran out");
+            }
+            if self.broken {
+                return Err("connection refused");
+            }
+            self.source.read_at(offset, buffer)
+        }
+
+        fn blocked(&mut self) -> bool {
+            core::mem::take(&mut self.blocked)
+        }
+    }
+
+    let data: Vec<u8> = (0..3 * BLOCK_BYTES).map(|n| (n % 251) as u8).collect();
+    for deflate in [false, true] {
+        let (source, manifest) = parts(&data, deflate, &[], &[], ERASE);
+        let reader = Stalling {
+            source,
+            stalls: 0,
+            broken: false,
+            blocked: false,
+        };
+        let mut store = Store::open(reader, manifest, 0).unwrap();
+        store.prepare().unwrap();
+        store.reader.stalls = 2;
+        for _ in 0..2 {
+            assert!(matches!(
+                store.read_at("os.dmg", 5, BLOCK_BYTES),
+                Err(Error::Pending)
+            ));
+        }
+        assert_eq!(
+            store.read_at("os.dmg", 5, BLOCK_BYTES).unwrap(),
+            data[5..5 + BLOCK_BYTES]
+        );
+        // Any other failure stays the payload's refusal.
+        store.cursors.0.clear();
+        store.reader.broken = true;
+        let error = store.read_at("os.dmg", 2 * BLOCK_BYTES as u64, 16);
+        assert!(matches!(error, Err(Error::Payload(_))), "{error:?}");
+    }
+}

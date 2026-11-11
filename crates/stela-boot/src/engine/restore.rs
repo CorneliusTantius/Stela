@@ -160,6 +160,21 @@ impl ReadAt for Source {
     fn read_at(&mut self, offset: u64, buffer: &mut [u8]) -> Result<()> {
         self.reader.read_at(offset, buffer)
     }
+    fn blocked(&mut self) -> bool {
+        self.remote
+            .as_ref()
+            .is_some_and(|remote| remote.borrow_mut().blocked())
+    }
+}
+
+impl Source {
+    /// Bound every later read of a remote image ([`Remote::bound`]): the
+    /// service reads it on a PE whose guest CPU waits meanwhile.
+    fn bound(&mut self) {
+        if let Some(remote) = &self.remote {
+            remote.borrow_mut().bound();
+        }
+    }
 }
 
 /// The restore inventory the loader read.
@@ -760,6 +775,7 @@ impl Experiment {
     /// guest's devices: [`Self::poll`] then only copies it to the guest.
     pub fn prefetch(&mut self) {
         if !self.terminal {
+            self.driver.answers.store.reader_mut().bound();
             self.driver.prefetch(PREFETCH_CHUNKS);
         }
     }
@@ -769,6 +785,7 @@ impl Experiment {
     /// which every PE's device access would otherwise wait out.
     pub fn work(&mut self) {
         if !self.terminal {
+            self.driver.answers.store.reader_mut().bound();
             self.driver.work();
         }
     }
