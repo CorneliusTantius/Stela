@@ -2752,8 +2752,9 @@ fn start_devices(
                     count(disks, "disk", "disks")
                 ),
             });
-            // Before the GPU starts, so the USB keeps its step and how it
-            // ended, or where it stopped.
+            // The log first, as soon as its disk is open: it then holds every
+            // line since the engine started (`output::add_log`), and a stall
+            // or stop in the GPU's start below is kept on the USB.
             if let Some(log) = log {
                 crate::log_file::resume(log);
             }
