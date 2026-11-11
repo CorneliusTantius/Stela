@@ -388,6 +388,7 @@ impl Drop for RestoreRoot {
                 asm!("sti", options(nomem, nostack));
             }
         }
+        after_release();
     }
 }
 
@@ -601,6 +602,39 @@ const LOOK_WINDOW_MICROS: u64 = 20;
 /// no step has answered ([`staged_disk::step_due`]).
 static SEEN_DOORBELLS: AtomicU64 = AtomicU64::new(0);
 
+/// A staged disk step was given up because another core was inside the
+/// host drivers: the core that leaves them takes it ([`after_release`]),
+/// so disk work waits at most one hold, not for the next devices' release
+/// or the [`FALLBACK_MILLIS`] slice.
+static GAVE_UP: AtomicBool = AtomicBool::new(false);
+/// One core at a time takes the given-up steps: a step's own driver calls
+/// leave the drivers again inside it.
+static RETRYING: AtomicBool = AtomicBool::new(false);
+/// Given-up steps the leaving holder took since the last report.
+static RETRIED: AtomicU64 = AtomicU64::new(0);
+
+/// After this core left the host drivers, with its interrupt flag back:
+/// one bounded step of each staged disk whose step another core gave up
+/// while this one held them. Never in an interrupt, as [`released`]; a step
+/// only try-locks its disk's host side, so a holder of that side (a model's
+/// direct call) leaves it to the next step.
+fn after_release() {
+    if !GAVE_UP.load(Ordering::Relaxed)
+        || super::host::in_interrupt()
+        || RETRYING.swap(true, Ordering::Acquire)
+    {
+        return;
+    }
+    if GAVE_UP.swap(false, Ordering::AcqRel) {
+        for worker in staged_workers() {
+            if worker.work() && step(worker).is_some() {
+                RETRIED.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+    RETRYING.store(false, Ordering::Release);
+}
+
 /// Called under the devices' lock; it only marks the step due.
 fn wake_staged() {
     STEP_DUE.store(true, Ordering::Release);
@@ -654,6 +688,8 @@ pub(super) fn released() -> bool {
 fn step(worker: &DiskWorker) -> Option<staged_disk::Step> {
     if host_drivers_taken() {
         STEPS[1].fetch_add(1, Ordering::Relaxed);
+        // The holder takes it as it leaves the drivers ([`RestoreRoot`]'s drop).
+        GAVE_UP.store(true, Ordering::Release);
         return None;
     }
     STEPS[0].fetch_add(1, Ordering::Relaxed);
@@ -809,9 +845,10 @@ impl HostDisks {
         // and root change for any caller, a disk's calls inside them, and a
         // staged disk's step.
         let mut line = format!(
-            "HOST DISK STAGED steps={} gave_up={} longest_us",
+            "HOST DISK STAGED steps={} gave_up={} retried={} longest_us",
             STEPS[0].swap(0, Ordering::Relaxed),
-            STEPS[1].swap(0, Ordering::Relaxed)
+            STEPS[1].swap(0, Ordering::Relaxed),
+            RETRIED.swap(0, Ordering::Relaxed)
         );
         for (name, longest) in DISK_PARTS.iter().zip(&DISK_TIMES) {
             line.push_str(&format!(
