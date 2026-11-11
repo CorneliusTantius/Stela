@@ -768,8 +768,22 @@ impl Hub {
     /// interrupted nor waited for: nothing it can use is stale, and the
     /// mail left first is read before it uses that context, which it
     /// publishes first ([`Machine::publish_translating`]).
+    #[cfg(test)]
     pub(super) fn broadcast(&self, from: usize, maintenance: &[Maintenance]) -> Vec<(usize, u64)> {
         let mut posted = Vec::new();
+        self.broadcast_each(from, maintenance, |pe, serial| posted.push((pe, serial)));
+        posted
+    }
+
+    /// [`Self::broadcast`], giving each PE to wait for and its serial to
+    /// `reached` instead of collecting them; how many there were.
+    pub(super) fn broadcast_each(
+        &self,
+        from: usize,
+        maintenance: &[Maintenance],
+        mut reached: impl FnMut(usize, u64),
+    ) -> usize {
+        let mut posted = 0;
         for pe in self.others(from) {
             let inbox = &self.inboxes[pe];
             let mut serial = 0;
@@ -789,7 +803,8 @@ impl Hub {
             });
             if reaches {
                 self.interrupt(pe);
-                posted.push((pe, serial));
+                reached(pe, serial);
+                posted += 1;
             }
         }
         posted
@@ -845,16 +860,27 @@ impl Hub {
 
     /// PE `pe`'s mail, if any, which its machine applies and then
     /// acknowledges with [`Self::acknowledge`].
+    #[cfg(test)]
     pub(super) fn take(&self, pe: usize) -> Option<Mail> {
+        self.take_into(pe, &mut Vec::new())
+    }
+
+    /// [`Self::take`], leaving the emptied buffer `spare` in the inbox for
+    /// the next mail, so a read and the next post allocate nothing.
+    pub(super) fn take_into(&self, pe: usize, spare: &mut Vec<Maintenance>) -> Option<Mail> {
         let inbox = &self.inboxes[pe];
         if !inbox.pending.swap(false, Ordering::AcqRel) {
             return None;
         }
+        spare.clear();
         let mut mail = inbox.mail.lock().unwrap_or_else(|e| e.into_inner());
-        let serial = mail.serial;
-        let taken = core::mem::take(&mut *mail);
-        mail.serial = serial;
-        Some(taken)
+        Some(Mail {
+            start: mail.start.take(),
+            event: core::mem::take(&mut mail.event),
+            maintenance: core::mem::replace(&mut mail.maintenance, core::mem::take(spare)),
+            serial: mail.serial,
+            merged: core::mem::take(&mut mail.merged),
+        })
     }
 
     pub(super) fn acknowledge(&self, pe: usize, serial: u64) {
@@ -1454,7 +1480,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             if !hub.pending(self.current) {
                 return Ok(());
             }
-            let Some(mail) = hub.take(self.current) else {
+            let mut spare = core::mem::take(&mut self.mail_spare);
+            let Some(mail) = hub.take_into(self.current, &mut spare) else {
+                self.mail_spare = spare;
                 return Ok(());
             };
             if mail.event && !self.waiting.is_some_and(|wait| wait.down) {
@@ -1465,6 +1493,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 self.maintain(*maintenance)?;
             }
             hub.acknowledge(self.current, mail.serial);
+            self.mail_spare = mail.maintenance;
             if let Some(address) = mail.start {
                 self.start(Start {
                     cpu: self.current,
@@ -1712,7 +1741,13 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
         let profile = self.observation_inbox(&hub).map(|inbox| &inbox.broadcasts);
         let started = profile.map(|_| self.host.counter());
-        let posted = hub.broadcast(self.current, &self.outgoing);
+        let held = &mut self.posted;
+        let posted = hub.broadcast_each(self.current, &self.outgoing, |pe, serial| {
+            match held.iter_mut().find(|(held, _)| *held == pe) {
+                Some((_, held)) => *held = serial,
+                None => held.push((pe, serial)),
+            }
+        });
         if let (Some(slot), Some(started)) = (profile, started) {
             for maintenance in &self.outgoing {
                 let kind = match maintenance {
@@ -1720,18 +1755,12 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     Maintenance::Code(_) => BroadcastKind::Code,
                     Maintenance::Power(_) => BroadcastKind::Power,
                 };
-                if let Some(active) = slot.begin(kind, started, posted.len()) {
+                if let Some(active) = slot.begin(kind, started, posted) {
                     slot.finish(active, 0, 0);
                 }
             }
         }
         self.outgoing.clear();
-        for (pe, serial) in posted {
-            match self.posted.iter_mut().find(|(held, _)| *held == pe) {
-                Some((_, held)) => *held = serial,
-                None => self.posted.push((pe, serial)),
-            }
-        }
     }
 
     /// Wait until every other running PE has applied the maintenance this
@@ -1765,6 +1794,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.host.relax();
         }
         hub.set_parked(self.current, false);
+        // `posted` is empty now: keep its buffer for the next DSB.
+        if self.posted.is_empty() {
+            self.posted = posted;
+        }
         self.statistics.broadcasts += 1;
         let elapsed = self.host.counter().wrapping_sub(started);
         self.statistics.sync_ticks += elapsed;
@@ -1855,7 +1888,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// which may wait on it: an event, maintenance, and a start, which is
     /// posted again for the PE's next mail read.
     fn wait_for_others(&mut self, hub: &Arc<Hub>) -> Step {
-        let Some(mail) = hub.take(self.current) else {
+        let mut spare = core::mem::take(&mut self.mail_spare);
+        let Some(mail) = hub.take_into(self.current, &mut spare) else {
+            self.mail_spare = spare;
             return Ok(());
         };
         if mail.event {
@@ -1872,6 +1907,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             }
         }
         hub.acknowledge(self.current, mail.serial);
+        self.mail_spare = mail.maintenance;
         if let Some(address) = mail.start {
             hub.start(self.current, address);
         }
