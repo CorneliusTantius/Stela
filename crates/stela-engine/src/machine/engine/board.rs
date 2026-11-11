@@ -1006,6 +1006,11 @@ pub(super) struct Blocks {
     records: Records<Record>,
     /// Slots holding an installed block.
     live: AtomicUsize,
+    /// Advanced by every retirement ([`Self::retire`]): a paired frame
+    /// holds it from its push, and a return takes its continuation only
+    /// while it is unchanged (`chain::ChainControl::retire_epoch`), as the
+    /// continuation may lie in a block retired since.
+    epoch: AtomicU64,
 }
 
 impl Blocks {
@@ -1014,7 +1019,14 @@ impl Blocks {
             slots: Slots::new(capacity),
             records: Records::new(capacity),
             live: AtomicUsize::new(0),
+            epoch: AtomicU64::new(0),
         }
+    }
+
+    /// The host address of the retire epoch, which native code reads while
+    /// the board lives.
+    pub(super) fn epoch_address(&self) -> u64 {
+        self.epoch.as_ptr() as u64
     }
 
     /// One more than the highest slot given so far.
@@ -1116,6 +1128,9 @@ impl Blocks {
             self.live.fetch_sub(1, Ordering::Relaxed);
         }
         record.incarnation.fetch_add(1, Ordering::Release);
+        // Before the slot's release: a PE whose frame names the block sees
+        // the epoch moved at its return, or returned before the release.
+        self.epoch.fetch_add(1, Ordering::Release);
     }
 
     /// `slots`, retired, were unpublished before `snapshot`.

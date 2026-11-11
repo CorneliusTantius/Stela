@@ -66,7 +66,7 @@
 //! block's first instruction would.
 use crate::x86_64::asm::{
     Alu, BitTest, Code, Cond,
-    Gpr::{self, R8, R9, R10, R11, Rax, Rcx, Rdx},
+    Gpr::{self, R8, R9, R10, R11, Rax, Rcx, Rdx, Rsp},
     Mem, ShiftOp,
     Size::{self, Dword, Qword},
 };
@@ -316,13 +316,59 @@ pub struct ChainControl {
     /// skipped): the engine's counts, which only those exits write.
     pub loop_entries: u64,
     pub loop_iterated: u64,
+    /// Paired frames on the host stack now ([`paired_call`]): the entry
+    /// sets 0, a call that pushes one adds 1 and a return that takes one
+    /// takes 1.
+    pub frames: u32,
+    /// The most paired frames one native run keeps: 0 pushes none, and a
+    /// call past it takes the plain exit.
+    pub frame_bound: u32,
+    /// The host address of the board's retire epoch, which every block
+    /// retirement advances, or 0 with `frame_bound` 0. A frame holds the
+    /// epoch of its push; a return takes it only while the epoch is
+    /// unchanged, as its continuation may lie in a block another PE
+    /// retired since.
+    pub retire_epoch: u64,
+    /// What paired frames did ([`PairCount`]): native code's counts, which
+    /// only grow.
+    pub pairs: [u64; PAIR_COUNTS],
 }
+
+/// The counts of [`ChainControl::pairs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairCount {
+    /// Calls that pushed a frame.
+    Pushed,
+    /// Returns that took their frame's continuation.
+    Matched,
+    /// Returns with frames on the stack that took the exit's lookup.
+    Missed,
+    /// Calls past the frame bound, which took the plain exit.
+    Refused,
+}
+
+/// Entries of [`ChainControl::pairs`].
+pub const PAIR_COUNTS: usize = 4;
+
+impl PairCount {
+    const fn offset(self) -> i32 {
+        PAIRS + 8 * self as i32
+    }
+}
+
+/// The frame bound the engine sets by default ([`ChainControl::frame_bound`]).
+pub const DEFAULT_FRAME_BOUND: u32 = 64;
+/// Bytes of one paired frame on the host stack: the retire epoch, the
+/// calling block's word, the guest return address and the host return
+/// address, in that order from the top of the stack down. A multiple of
+/// 16, so code between blocks keeps its stack alignment.
+pub const FRAME_BYTES: usize = 32;
 
 // Epoch and observed state are naturally aligned atomic-width words. Capture
 // and storage owners keep the mapped control alive for every embedded address.
 const _: () = assert!(core::mem::offset_of!(ChainControl, interrupt_epoch) == 64);
 const _: () = assert!(core::mem::offset_of!(ChainControl, observed_interrupt_epoch) == 72);
-const _: () = assert!(core::mem::size_of::<ChainControl>() == 144);
+const _: () = assert!(core::mem::size_of::<ChainControl>() == 192);
 
 /// In the block table, one block a fetch at `pc` runs while its page
 /// translates to the frame and fetch state `key` names ([`block_key`]). In
@@ -1751,6 +1797,10 @@ const LINKED: i32 = core::mem::offset_of!(ChainControl, linked) as i32;
 const INTERRUPT_EPOCH: i32 = core::mem::offset_of!(ChainControl, interrupt_epoch) as i32;
 const OBSERVED_INTERRUPT_EPOCH: i32 =
     core::mem::offset_of!(ChainControl, observed_interrupt_epoch) as i32;
+const FRAMES: i32 = core::mem::offset_of!(ChainControl, frames) as i32;
+const FRAME_BOUND: i32 = core::mem::offset_of!(ChainControl, frame_bound) as i32;
+const RETIRE_EPOCH: i32 = core::mem::offset_of!(ChainControl, retire_epoch) as i32;
+const PAIRS: i32 = core::mem::offset_of!(ChainControl, pairs) as i32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Interruption {
@@ -2244,6 +2294,121 @@ fn link_body(
     }
     code.patch(transfer.offset(), distance.to_le_bytes());
     Some(code.into_bytes())
+}
+
+/// The start of a call whose guest return address is `return_address`,
+/// in code that RAX, RCX, RDX, R8 and flags are free in, before its exit:
+/// unless the control's frames reached their bound, a paired frame
+/// ([`FRAME_BYTES`]) and a host `call` of the exit that follows, whose
+/// return comes back to a jump to the call's continuation. The frame holds
+/// the board's retire epoch, the calling block's word (`block`) and
+/// `return_address`, under the call's own return address, so a guest
+/// return to `return_address` in this native run can `ret` into the
+/// continuation ([`paired_return`]). The continuation is the caller's own
+/// exit to `return_address`, which runs none of the block's instructions:
+/// the call's exit counted them. A call past the bound counts its refusal
+/// and takes the exit as a plain one.
+///
+/// A run that leaves native code at any exit leaves every frame with it
+/// ([`EXIT_RETURN`]): an exit that the called code takes before its
+/// return, or the call's own exit while unlinked, discards the frames
+/// whole, half-made ones included. The jump to the continuation is the
+/// patch this returns, which the caller binds after the call's exit.
+pub(crate) fn paired_call(
+    asm: &mut crate::x86_64::asm::Asm,
+    return_address: GuestAddress,
+) -> crate::x86_64::asm::Patch {
+    asm.place(Rcx, CONTROL);
+    // Code run without a control, as a test runs one block, keeps none.
+    asm.test(Qword, Rcx, Rcx);
+    let uncontrolled = asm.jcc(Cond::E);
+    asm.mov_load(Dword, R8, Mem::base(Rcx, FRAMES));
+    asm.alu_load(Alu::Cmp, Dword, R8, Mem::base(Rcx, FRAME_BOUND));
+    let refused = asm.jcc(Cond::Ae);
+    asm.alu_imm8(Alu::Add, Dword, Mem::base(Rcx, FRAMES), 1);
+    asm.alu_imm8(
+        Alu::Add,
+        Qword,
+        Mem::base(Rcx, PairCount::Pushed.offset()),
+        1,
+    );
+    asm.mov_load(Qword, R8, Mem::base(Rcx, RETIRE_EPOCH));
+    asm.push_rm(Mem::base(R8, 0));
+    asm.push_rm(Mem::base(Rcx, BLOCK));
+    asm.mov_imm64(R8, return_address.0);
+    asm.push(R8);
+    let call = asm.call();
+    let continuation = asm.jmp();
+    asm.bind(refused);
+    asm.alu_imm8(
+        Alu::Add,
+        Qword,
+        Mem::base(Rcx, PairCount::Refused.offset()),
+        1,
+    );
+    asm.bind(call);
+    asm.bind(uncontrolled);
+    continuation
+}
+
+/// The start of a return to the target in RAX, from a block that ran `ran`
+/// instructions, in code that RCX, R8 and flags are free in, before its
+/// exit: when the frame on top of the host stack ([`paired_call`]) holds
+/// the target and the board's retire epoch has not moved since its push,
+/// and no interruption is pending and budget is left, the return counts
+/// `ran`, names the calling block again and `ret`s into the frame's
+/// continuation, taking the frame. Anything else goes on to the exit, its
+/// frames left in place. With no frame the top of the stack is not one:
+/// the control's `frames` says so first. Code run without a control
+/// (`Anchor::Control` 0) neither pushes nor takes a frame.
+///
+/// A frame left by a return that missed it stays until a later return to
+/// its address takes it or the run ends: its continuation is the
+/// translation of exactly that guest address in this run, as no
+/// translation or context changes within one, so any return to it is
+/// right to take it. A block retired by another PE meanwhile advances the
+/// epoch, which every frame of the run then fails.
+pub(crate) fn paired_return(asm: &mut crate::x86_64::asm::Asm, ran: u32) -> Option<()> {
+    let ran = i32::try_from(ran).ok()?;
+    asm.place(Rcx, CONTROL);
+    asm.test(Qword, Rcx, Rcx);
+    let uncontrolled = asm.jcc(Cond::E);
+    asm.alu_imm8(Alu::Cmp, Dword, Mem::base(Rcx, FRAMES), 0);
+    let empty = asm.jcc(Cond::E);
+    let mut misses = Vec::new();
+    asm.alu_load(Alu::Cmp, Qword, Rax, Mem::base(Rsp, 8));
+    misses.push(asm.jcc(Cond::Ne));
+    asm.mov_load(Qword, R8, Mem::base(Rcx, RETIRE_EPOCH));
+    asm.mov_load(Qword, R8, Mem::base(R8, 0));
+    asm.alu_load(Alu::Cmp, Qword, R8, Mem::base(Rsp, 24));
+    misses.push(asm.jcc(Cond::Ne));
+    misses.extend(far_interruption_gate(asm, Interruption::Epoch, R8));
+    asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rcx, 0), 0);
+    misses.push(asm.jcc(Cond::E));
+    asm.alu_imm32(Alu::Add, Qword, Mem::base(Rcx, RETIRED), ran);
+    asm.mov_load(Qword, R8, Mem::base(Rsp, 16));
+    asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
+    asm.alu_imm8(Alu::Sub, Dword, Mem::base(Rcx, FRAMES), 1);
+    asm.alu_imm8(
+        Alu::Add,
+        Qword,
+        Mem::base(Rcx, PairCount::Matched.offset()),
+        1,
+    );
+    // ret 24: into the continuation, the rest of the frame taken.
+    asm.fixed(&[0xc2, (FRAME_BYTES - 8) as u8, 0]);
+    for miss in misses {
+        asm.bind(miss);
+    }
+    asm.alu_imm8(
+        Alu::Add,
+        Qword,
+        Mem::base(Rcx, PairCount::Missed.offset()),
+        1,
+    );
+    asm.bind(empty);
+    asm.bind(uncontrolled);
+    Some(())
 }
 
 /// Bytes of the cell probe of a [`lookup_dispatcher`], which comes first.
@@ -2788,6 +2953,32 @@ pub fn cell_tail(
     let mut code = Code::new();
     code.asm().mov_imm64(R9, cell);
     tail(&mut code, at, word.into(), ran, probe)?;
+    code.try_into().ok()
+}
+
+/// Bytes in a [`paired_tail`], padded.
+pub const PAIRED_TAIL_BYTES: usize = 160;
+
+/// The tail at host address `at` of a return's exit, as a [`lookup_tail`]
+/// whose return first takes the frame of its call when that frame holds
+/// the target ([`paired_return`]): the block of `ran` instructions it
+/// leaves is counted there, as the probe would. Every RET form's exit is
+/// one, RETA*'s after its thunk authenticated the target, so a forged or
+/// stale-key address never equals a frame's. `None` as for a
+/// [`lookup_tail`].
+pub fn paired_tail(
+    at: u64,
+    word: impl Into<ExitWord>,
+    ran: u32,
+    probe: u64,
+) -> Option<[u8; PAIRED_TAIL_BYTES]> {
+    let mut code = Code::new();
+    paired_return(&mut code.asm(), ran)?;
+    tail(&mut code, at, word.into(), ran, probe)?;
+    let padding = PAIRED_TAIL_BYTES.checked_sub(code.len())?;
+    for _ in 0..padding {
+        code.asm().int3();
+    }
     code.try_into().ok()
 }
 
@@ -4007,6 +4198,8 @@ mod tests {
     mod budget;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     mod differential;
+    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+    mod paired;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
     mod patching;
     #[cfg(all(target_arch = "x86_64", target_os = "linux"))]

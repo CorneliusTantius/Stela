@@ -764,6 +764,9 @@ pub struct Machine<H: Host, D: Devices> {
     /// promotion step looks at ([`scheduler`]'s `promote_hot_exits`).
     promotion_runs: u32,
     promotion_cursor: u32,
+    /// The paired frames a native run may keep
+    /// (`chain::ChainControl::frame_bound`).
+    frame_bound: u32,
     hot_countdown: u32,
     hot_seed: u64,
     #[cfg(all(feature = "std", feature = "native-profile"))]
@@ -1303,6 +1306,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             hot_samples: Vec::new(),
             dynamic_samples: Vec::new(),
             promotion_runs: 0,
+            frame_bound: chain::DEFAULT_FRAME_BOUND,
             promotion_cursor: 0,
             hot_countdown: step_timing::HOT_SAMPLE_EVERY,
             hot_seed: 0x9e37_79b9_7f4a_7c15,

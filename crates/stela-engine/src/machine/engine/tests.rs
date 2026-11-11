@@ -3219,7 +3219,7 @@ fn returns_and_exits_out_of_the_page_go_through_lookup_dispatchers() {
                 .unwrap()
                 .to_vec()
         } else {
-            chain::lookup_tail(at, kind, ran, probes + chain::PROBE_ENTRY as u64)
+            chain::paired_tail(at, kind, ran, probes + chain::PROBE_ENTRY as u64)
                 .unwrap()
                 .to_vec()
         };
@@ -6711,7 +6711,7 @@ fn pac_returns_go_through_a_lookup_dispatcher() {
     let probes = ((installed - 1) * NATIVE_CODE_STRIDE) as u64;
     let tail = (installed * NATIVE_CODE_STRIDE) as u64;
     let probe = probes + chain::PROBE_ENTRY as u64;
-    let code = chain::lookup_tail(tail, ExitKind::Return, 1, probe).unwrap();
+    let code = chain::paired_tail(tail, ExitKind::Return, 1, probe).unwrap();
     let exit = chain::jump(site, tail).unwrap();
     let patches = machine.host.patches.len();
     assert_eq!(

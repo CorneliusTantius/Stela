@@ -6,6 +6,12 @@ use super::*;
 /// Native runs between two promotion steps, and the stamped cells each
 /// looks at: every stamped cell once in 256 steps, a lock and 256 loads
 /// in 1024 runs.
+/// Bytes of the largest tail: a stamped or a paired one.
+const TAIL_ROOM: usize = if chain::STAMPED_TAIL_BYTES > chain::PAIRED_TAIL_BYTES {
+    chain::STAMPED_TAIL_BYTES
+} else {
+    chain::PAIRED_TAIL_BYTES
+};
 const PROMOTION_RUNS: u32 = 1024;
 const PROMOTION_CELLS: u32 = 256;
 
@@ -270,6 +276,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // levels apart (`transitions`).
         self.mirrors.transitions.chain =
             u64::from(self.cpu.pmu.as_ref().is_none_or(|pmu| pmu.alike()));
+        self.chain
+            .set_frames(self.frame_bound, self.code.blocks.epoch_address());
         self.chain.begin(index, budget);
         self.cpu.state.daif = u32::from(self.cpu.pstate.daif);
         self.mirrors.selected = u64::from(self.cpu.pstate.sp);
@@ -796,14 +804,24 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if !chain::patchable(site) {
             return false;
         }
-        let Some((probe, tail)) = self.probe_and_tail(cache, site, btype, chain::TAIL_BYTES) else {
+        // A return's tail first takes its call's paired frame.
+        let returning = word.kind == ExitKind::Return;
+        let bytes = if returning {
+            chain::PAIRED_TAIL_BYTES
+        } else {
+            chain::TAIL_BYTES
+        };
+        let Some((probe, tail)) = self.probe_and_tail(cache, site, btype, bytes) else {
             return false;
         };
         let at = tail.0 as u64;
-        let (Some(code), Some(jump)) = (
-            chain::lookup_tail(at, word, retired, probe + chain::PROBE_ENTRY as u64),
-            chain::jump(site, at),
-        ) else {
+        let probe = probe + chain::PROBE_ENTRY as u64;
+        let code = if returning {
+            chain::paired_tail(at, word, retired, probe).map(|code| code.to_vec())
+        } else {
+            chain::lookup_tail(at, word, retired, probe).map(|code| code.to_vec())
+        };
+        let (Some(code), Some(jump)) = (code, chain::jump(site, at)) else {
             return false;
         };
         self.patch_native(tail, &code);
@@ -946,7 +964,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
         self.statistics.stamped_in_use = cache.targets.stamped_tails() as u64;
     }
 
-    /// The probes of `btype` and room for a tail of `bytes` that calls
+    /// The probes of `btype` and room for a tail of `bytes` (at most
+    /// [`TAIL_ROOM`]) that calls
     /// them, in one part: a tail is taken away with its part, never after
     /// its probes. In the board's arena the probes are installed once per
     /// part, under the board's lock (`cache`); a tail that met a new part
@@ -961,19 +980,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
         let code = Arc::clone(&self.code);
         let Some(arena) = &code.arena else {
             let probe = self.lookup_dispatcher(btype)?;
-            let tail = self
-                .host
-                .install(&[0; chain::STAMPED_TAIL_BYTES][..bytes])
-                .ok()?;
+            let tail = self.host.install(&[0; TAIL_ROOM][..bytes]).ok()?;
             return Some((probe, tail));
         };
         // In the generation of the exit's block, which the tail outlives
         // there ([`board::Ring::refer`]).
         let stream = self.stream_at(site);
         self.install_stream = stream;
-        let tail = self
-            .install_native(&[0; chain::STAMPED_TAIL_BYTES][..bytes], false)
-            .ok()?;
+        let tail = self.install_native(&[0; TAIL_ROOM][..bytes], false).ok()?;
         // The tail's part was chosen meanwhile: the exit stays as it is.
         if !self.note_reference(site, tail.0 as u64) {
             return None;

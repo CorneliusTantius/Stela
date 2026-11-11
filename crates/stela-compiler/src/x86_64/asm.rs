@@ -234,8 +234,7 @@ impl<'a> Asm<'a> {
     pub(crate) fn push(&mut self, register: Gpr) {
         self.opcode_reg(Size::Dword, 0x50, register);
     }
-    /// `push rm64` (FF /6). Only the old probes' differential test uses it.
-    #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
+    /// `push rm64` (FF /6).
     pub(crate) fn push_rm(&mut self, rm: impl Into<Rm>) {
         self.legacy(Size::Dword, None, &[0xff], 6, false, rm.into());
     }
