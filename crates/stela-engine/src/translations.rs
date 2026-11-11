@@ -6,6 +6,7 @@
 //! The format is the same in every container: the directory store
 //! and the pack `stela.efi` keeps
 //! ([`pack`]).
+pub mod checkpoint;
 pub mod pack;
 
 use alloc::{string::String, vec::Vec};
