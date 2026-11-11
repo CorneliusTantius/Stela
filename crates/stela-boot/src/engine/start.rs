@@ -203,6 +203,12 @@ fn start(handoff: u64) -> Started {
     // physmap; metadata and Arc are created in this active engine allocator.
     let host_firmware = unsafe { crate::host_firmware::after_ebs(&handoff.host_firmware) }
         .unwrap_or_else(|error| output::fatal(error));
+    // Before any user of the rate: this image's copy has not been found.
+    crate::firmware::adopt_tsc(
+        handoff.tsc_hz,
+        handoff.tsc_source,
+        handoff.tsc_tolerance_ppm,
+    );
     crate::status::set_clock(handoff.tsc_hz);
     stela_drivers::on_wait(crate::status::tick);
     stela_drivers::on_work(crate::status::progress);
