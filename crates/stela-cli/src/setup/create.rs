@@ -923,7 +923,20 @@ pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Resu
         }
         host.check_erase_access(&disk)?;
         let identity = wizard::Usb::from_disk(&found, host);
-        if !command.confirmed && std::io::stdin().is_terminal() {
+        // Without a terminal to ask at, the model or size typed back is the
+        // confirmation, so a mistyped disk name never erases another USB.
+        let typed_back = command
+            .confirm_disk
+            .as_deref()
+            .is_some_and(|typed| found.confirmed_by(typed));
+        if !command.confirmed && !typed_back {
+            ensure!(
+                std::io::stdin().is_terminal(),
+                "setup cannot ask before erasing {disk} ({}, {}) without a terminal; pass \
+                 --confirm-disk with its model or size to erase it",
+                found.name,
+                host::size_text(found.bytes)
+            );
             confirm_erase(host, &found)?;
         }
         // A new setup puts macOS on a USB large enough for it.
