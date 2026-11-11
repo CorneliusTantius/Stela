@@ -197,10 +197,10 @@ fn implementation_defined_refusal(register: Register, value: u64) -> Option<&'st
 
 /// The MRS encoding of a register, from its generated accessor.
 pub(super) fn encoding_of(register: Register) -> Option<Encoding> {
-    let name = alloc::format!("MRS {}", register.name());
-    let accessor = ACCESSORS
-        .iter()
-        .find(|accessor| accessor.name == name && accessor.index.is_empty())?;
+    let name = register.name();
+    let accessor = ACCESSORS.iter().find(|accessor| {
+        accessor.name.strip_prefix("MRS ") == Some(name) && accessor.index.is_empty()
+    })?;
     let key = accessor.value;
     Some(Encoding::new(
         (key >> 14) as u8,
