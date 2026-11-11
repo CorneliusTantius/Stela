@@ -409,7 +409,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     ) =>
             {
                 // On hardware an EL fetch of GL-only code enters GL at
-                // GXF_ABORT_EL1 (Sven Peter, for GL2); the saved state is
+                // GXF_ABORT_EL1 (as reported for GL2); the saved state is
                 // not documented.
                 Err(Err(self.unsupported(RequirementKind::Native(
                     "kernel-level fetch of guarded-only code (GXF abort entry)",
