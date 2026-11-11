@@ -246,7 +246,7 @@ impl Kept {
     ) -> usize {
         let reach = match everywhere {
             Everywhere::Addresses(reach) => reach,
-            Everywhere::NonGlobal | Everywhere::All => Reach::All,
+            Everywhere::NonGlobal(_) | Everywhere::All => Reach::All,
         };
         let before = self.halves.len();
         self.halves.retain_mut(|half| {
@@ -262,6 +262,40 @@ impl Kept {
         });
         before - self.halves.len()
     }
+
+    /// Apply a TLBI ASIDE1 of `asid` to the kept halves, whose contexts
+    /// share the TCR `tcr` (a change of TCR outside the lower half's own
+    /// fields empties the shadow): drop only a half that may hold a
+    /// non-global entry of `asid` ([`same_asid`]), and only if it holds a
+    /// non-global entry at all ([`Extents::private`]). ASIDE1 removes the
+    /// non-global entries of its ASID alone (Arm `TLBIMatch`): another
+    /// ASID's half, and a half of global entries alone, stay. Returns the
+    /// halves dropped.
+    pub fn drop_asid(&mut self, asid: u16, tcr: u64) -> usize {
+        let before = self.halves.len();
+        self.halves
+            .retain(|half| !(half.extents.private() && same_asid(half.key.0, tcr, asid)));
+        before - self.halves.len()
+    }
+}
+
+/// A TCR for [`Kept::drop_asid`] under which every ASID may match: TCR.A1
+/// set, so TTBR0 does not name the ASID.
+pub const UNKNOWN_ASIDS: u64 = 1 << 22;
+
+/// Whether the non-global entries a walk through TTBR0 value `ttbr0` made
+/// under TCR `tcr` may be of ASID `asid`: with TCR.A1 = 0 their ASID is
+/// TTBR0[63:48], compared on 16 bits with TCR.AS = 1 and on the low 8 bits
+/// otherwise (the TLBI's high 8 bits are then ignored); with TCR.A1 = 1 it
+/// is TTBR1's, which `ttbr0` does not tell, so any ASID may match.
+pub fn same_asid(ttbr0: u64, tcr: u64, asid: u16) -> bool {
+    const TCR_A1: u64 = 1 << 22;
+    const TCR_AS: u64 = 1 << 36;
+    if tcr & TCR_A1 != 0 {
+        return true;
+    }
+    let mask = if tcr & TCR_AS != 0 { 0xffff } else { 0xff };
+    ((ttbr0 >> 48) as u16 ^ asid) & mask == 0
 }
 
 #[cfg(test)]
@@ -443,10 +477,49 @@ mod tests {
         assert!(unmapped.is_empty());
         // A TLBI of an ASID's or of every entry drops the kept halves.
         assert_eq!(
-            kept.invalidate(Everywhere::NonGlobal, LOWER, 39, |_, _, _| {}),
+            kept.invalidate(Everywhere::NonGlobal(1), LOWER, 39, |_, _, _| {}),
             1
         );
         assert!(kept.is_empty());
+    }
+
+    /// TLBI ASIDE1 drops only the kept halves that hold a non-global entry
+    /// of its ASID; with TCR.A1 = 1 the ASID is unknown and any private
+    /// half goes.
+    #[test]
+    fn an_asid_tlbi_drops_only_its_asids_private_kept_halves() {
+        const TCR_A1: u64 = 1 << 22;
+        const TCR_AS: u64 = 1 << 36;
+        let key = |asid: u64| (asid << 48 | 0x8000_0000, 0x10);
+        let mut private = Extents::new();
+        private.record(0x1_0000_4000, 1 << 14, false);
+        let mut global = Extents::new();
+        global.record(0x1_8000_0000, 1 << 14, true);
+        let fill = |kept: &mut Kept| {
+            for (n, extents) in [(5, &private), (6, &private), (7, &global)] {
+                kept.switch(key(n), alloc::vec![(0x1000, 0, n)], extents.clone(), key(0));
+            }
+        };
+        let held = |kept: &Kept| {
+            let mut keys: Vec<u64> = kept.halves.iter().map(|half| half.key.0 >> 48).collect();
+            keys.sort_unstable();
+            keys
+        };
+        let mut kept = Kept::new();
+        fill(&mut kept);
+        assert_eq!(kept.drop_asid(5, 0), 1);
+        assert_eq!(held(&kept), [6, 7]);
+        // A global-only half stays for its own ASID too.
+        assert_eq!(kept.drop_asid(7, 0), 0);
+        // 8-bit ASIDs ignore the TLBI's high byte; 16-bit ones do not.
+        assert_eq!(kept.drop_asid(0x106, TCR_AS), 0);
+        assert_eq!(kept.drop_asid(0x106, 0), 1);
+        assert_eq!(held(&kept), [7]);
+        // TTBR1 names the ASID: every private half may hold it.
+        let mut kept = Kept::new();
+        fill(&mut kept);
+        assert_eq!(kept.drop_asid(9, TCR_A1), 2);
+        assert_eq!(held(&kept), [7]);
     }
 
     #[test]

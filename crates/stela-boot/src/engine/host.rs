@@ -968,6 +968,29 @@ impl State {
         self.legacy_translations_dirty = false;
     }
 
+    /// A TLBI ASIDE1 of the current ASID: it removes the non-global entries
+    /// of that ASID alone (Arm `TLBIMatch`), so of the current shadow only
+    /// a half that holds a non-global translation goes
+    /// (`mmu::shadow::Extents::private`); the kernel's global upper half
+    /// stays.
+    /// Clearing the lower half drops the kept halves too, as their tables
+    /// share its frames.
+    fn drop_non_global(&mut self) {
+        let mut cleared = false;
+        for half in [LOWER, UPPER] {
+            if self.extents[half].private() {
+                self.clear(half);
+                cleared = true;
+            }
+        }
+        self.tlb.clear();
+        if cleared {
+            self.resets += 1;
+            self.reset_causes[Cause::Maintained as usize] += 1;
+            self.reload();
+        }
+    }
+
     /// Drop the lower half's translations only, and the kept halves.
     fn reset_lower(&mut self) {
         self.clear(LOWER);
