@@ -40,6 +40,7 @@ use stela_formats::payload::pieces::Extent;
 use stela_runtime::pc::fat32::Fat32;
 use stela_runtime::pc::gpt::Guid;
 use stela_runtime::translation_store;
+use stela_runtime::translation_store::checkpoint::{self, Checkpoint, ExtentFile, Step};
 use uefi::{
     CString16, boot,
     proto::{
@@ -75,6 +76,9 @@ const PLACEMENT_BYTES: usize = 64;
 /// The pack file holds the bound's bytes and its volume's partition is
 /// known: the engine may rewrite it.
 const WRITABLE: u32 = 1;
+/// The pack was read through the index backup the footer names: the
+/// engine puts its index back at the file's start before it writes records.
+const FROM_BACKUP: u32 = 2;
 /// The words of the buffer a renamed file's `FileInfo` is built in: its
 /// fixed fields and an 8.3 name.
 const FILE_INFO_WORDS: usize = 64;
@@ -204,16 +208,16 @@ pub fn read(budget: u64) -> Option<Opened> {
             .or_else(|| open(&mut root, &path, FileMode::Read).map(|file| (file, false)));
         let partition = partition(handle);
         let reading = output::now();
-        let (region, pack, allocated) = match opened {
+        let (region, pack, allocated, backup) = match opened {
             Some((mut file, writable)) => {
                 let allocated = writable
                     && file
                         .get_boxed_info::<FileInfo>()
                         .is_ok_and(|info| info.file_size() >= bound);
-                let (region, pack) = read_pack(&mut file, &translator, limit);
-                (region, pack, allocated)
+                let (region, pack, backup) = read_pack(&mut file, &translator, limit);
+                (region, pack, allocated, backup)
             }
-            None => (None, PackRead::None, false),
+            None => (None, PackRead::None, false, false),
         };
         let (read, held) = match pack {
             PackRead::None | PackRead::Skipped => (0, 0),
@@ -242,7 +246,7 @@ pub fn read(budget: u64) -> Option<Opened> {
                 WRITABLE
             } else {
                 0
-            };
+            } | if backup { FROM_BACKUP } else { 0 };
         // SAFETY: the exclusive loader allocation starts with space for
         // the placement header. Initialize it before taking a mutable slice.
         let placement = unsafe {
@@ -311,22 +315,73 @@ fn read_pack(
     file: &mut RegularFile,
     translator: &Digest,
     limit: u64,
-) -> (Option<Region>, PackRead) {
+) -> (Option<Region>, PackRead, bool) {
+    let (region, read) = match head_index(file, translator, limit) {
+        Ok(prefix) => read_records(file, translator, limit, prefix),
+        Err(PackRead::None) => {
+            // A write cut while it rewrote the index: the footer names the
+            // durable backup of the index it was writing.
+            let size = file
+                .get_boxed_info::<FileInfo>()
+                .map_or(0, |info| info.file_size());
+            let mut read = |at: u64, buffer: &mut [u8]| {
+                file.set_position(at).is_ok() && read_exact(file, buffer).is_some()
+            };
+            let Some(prefix) = checkpoint::backup_index(&mut read, size, translator) else {
+                return (None, PackRead::None, false);
+            };
+            if prefix.len() as u64 > limit {
+                return (None, PackRead::Skipped, false);
+            }
+            if file.set_position(prefix.len() as u64).is_err() {
+                return (None, PackRead::None, false);
+            }
+            output::arguments(format_args!("TRANSLATIONS index torn, its backup read\n"));
+            let (region, read) = read_records(file, translator, limit, prefix);
+            let backup = region.is_some();
+            return (region, read, backup);
+        }
+        Err(other) => (None, other),
+    };
+    (region, read, false)
+}
+
+/// The header, index and index checksum at the pack file's start, checked;
+/// `Err(PackRead::Skipped)` when the index alone passes `limit`.
+fn head_index(
+    file: &mut RegularFile,
+    translator: &Digest,
+    limit: u64,
+) -> Result<alloc::vec::Vec<u8>, PackRead> {
     let mut header = [0; pack::HEADER_BYTES];
     if read_exact(file, &mut header).is_none() {
-        return (None, PackRead::None);
+        return Err(PackRead::None);
     }
     let Ok(prefix_len) = pack::prefix_bytes(&header, translator) else {
-        return (None, PackRead::None);
+        return Err(PackRead::None);
     };
     if prefix_len as u64 > limit {
-        return (None, PackRead::Skipped);
+        return Err(PackRead::Skipped);
     }
     let mut prefix = vec![0; prefix_len];
     prefix[..header.len()].copy_from_slice(&header);
-    if read_exact(file, &mut prefix[header.len()..]).is_none() {
-        return (None, PackRead::None);
+    if read_exact(file, &mut prefix[header.len()..]).is_none()
+        || Pack::length(&prefix, translator).is_err()
+    {
+        return Err(PackRead::None);
     }
+    Ok(prefix)
+}
+
+/// Read the records the checked index `prefix` names, the file positioned
+/// just past the index, into the pack's handoff region after `prefix`.
+fn read_records(
+    file: &mut RegularFile,
+    translator: &Digest,
+    limit: u64,
+    prefix: alloc::vec::Vec<u8>,
+) -> (Option<Region>, PackRead) {
+    let prefix_len = prefix.len();
     let (Ok(held), Ok(within)) = (
         Pack::length(&prefix, translator),
         translation_store::within(&prefix, translator, limit),
@@ -386,6 +441,9 @@ struct Boot {
     bound: u64,
     path: String,
     partition: Option<Box<dyn BlockDevice>>,
+    /// The index read from the footer's backup, to put back at the file's
+    /// start before the next write.
+    repair: Option<&'static [u8]>,
 }
 
 /// The parts a boot's store is split into by page key, each behind a lock
@@ -741,6 +799,7 @@ pub fn share(bound: usize) {
                 bound: 0,
                 path: String::new(),
                 partition: None,
+                repair: None,
             })
             .translator;
         install_parts(translator, None, bound);
@@ -770,6 +829,10 @@ pub fn install(contents: &'static [u8]) -> Option<Guid> {
     let pack = contents.get(PLACEMENT_BYTES..PLACEMENT_BYTES + pack_bytes)?;
     let translator = translations::translator_id();
     let parsed = (!pack.is_empty()).then(|| Pack::parse(pack, &translator));
+    let repair = (flags & FROM_BACKUP != 0)
+        .then(|| pack::prefix_bytes(pack, &translator).ok())
+        .flatten()
+        .and_then(|bytes| pack.get(..bytes));
     let pack = match parsed {
         Some(Ok(pack)) => {
             output::arguments(format_args!(
@@ -799,6 +862,7 @@ pub fn install(contents: &'static [u8]) -> Option<Guid> {
             bound,
             path: pack_path(&translator, "/"),
             partition: None,
+            repair,
         });
         let readable = if pack.is_some() { READ_PACK } else { 0 };
         AVAILABLE.shared_bound.store(0, Ordering::Release);
@@ -922,6 +986,7 @@ pub fn write() {
         bound,
         path,
         partition: Some(partition),
+        repair,
         ..
     } = boot
     else {
@@ -939,7 +1004,9 @@ pub fn write() {
     // the heap still has room for the layout and the write, and before the
     // stop waits long.
     let started = output::now();
-    let planned = store.plan(bound, || {
+    // Room stays for the index backup and the footer that make the write
+    // safe against a cut (`checkpoint`).
+    let planned = store.plan(checkpoint::plan_bound(bound), || {
         !crate::ALLOCATOR.low() && output::millis_since(started) < STOP_PROOF_MILLIS
     });
     let heap = crate::ALLOCATOR.usage();
@@ -977,11 +1044,7 @@ pub fn write() {
         "TRANSLATIONS writing extents={}\n",
         file.extents.len()
     ));
-    match stela_runtime::translation_store::write_in_place(
-        &mut *device,
-        &file.extents,
-        &planned.layout,
-    ) {
+    match write_safely(&mut *device, &file.extents, &planned.layout, repair) {
         Ok(()) => output::arguments(format_args!(
             "TRANSLATIONS written records={} bytes={} changed={written} proven={} unprovable={} \
              unproven={} evicted={} ms={}\n",
@@ -993,6 +1056,35 @@ pub fn write() {
             planned.evicted,
             output::millis_since(started)
         )),
-        Err(error) => output::arguments(format_args!("TRANSLATIONS not written: {error:?}\n")),
+        Err(error) => output::arguments(format_args!("TRANSLATIONS not written: {error}\n")),
+    }
+}
+
+/// Write `layout` over the pack file of `extents` so that a cut at any
+/// byte leaves a pack that loads (`checkpoint`): over the pack the file
+/// holds when the layout keeps its records in place, else from the start,
+/// with the footer cleared first. `repair` goes back to the start first.
+fn write_safely(
+    device: &mut dyn BlockDevice,
+    extents: &[stela_formats::payload::pieces::Extent],
+    layout: &pack::Layout,
+    repair: Option<&[u8]>,
+) -> Result<(), String> {
+    let mut file = ExtentFile { device, extents };
+    let fresh = layout.changed().is_none();
+    let mut writing = Checkpoint::plan(
+        layout,
+        checkpoint::PackFile::len(&file),
+        checkpoint::PackFile::block(&file),
+        fresh,
+        repair,
+    )
+    .map_err(|refused| format!("{refused:?}"))?;
+    loop {
+        match writing.step(layout, &mut file, 1 << 20) {
+            Ok(Step::Done) => return Ok(()),
+            Ok(Step::More) => {}
+            Err(error) => return Err(format!("{error:?}")),
+        }
     }
 }
