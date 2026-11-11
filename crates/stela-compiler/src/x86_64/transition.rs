@@ -116,6 +116,15 @@ pub struct Record {
     pub untag: [u64; 2],
     /// ERET: the event register byte the return sets.
     pub event: u64,
+    /// SVC and ERET between levels whose PAC key enables differ: nonzero,
+    /// and the PAC service's tag words ([`Places::pointer_tags`]) must be
+    /// `pointer_from` (an open service of the level left) and become
+    /// `pointer_to`, the level entered's, as the engine reopens them.
+    pub pointer_swap: u64,
+    /// The service's generation (its keys, version and layout) both are of.
+    pub pointer_generation: u64,
+    pub pointer_from: [u64; super::pointer::TAG_WORDS],
+    pub pointer_to: [u64; super::pointer::TAG_WORDS],
     /// The `readable` words of cells of the new state that close: those
     /// whose value the engine refreshes at each transition. [`Self::scratch`]
     /// where there are fewer.
@@ -217,6 +226,9 @@ pub struct Places {
     /// Nonzero while the engine holds an exclusive monitor of its own,
     /// which only it clears: ERET leaves it to the engine.
     pub monitor: Place,
+    /// The PAC service's tag words (`x86_64::pointer`) and generation.
+    pub pointer_tags: Place,
+    pub pointer_generation: Place,
 }
 
 const RECORD_BYTES: usize = size_of::<Record>();
@@ -617,6 +629,66 @@ fn saved_state(asm: &mut Asm<'_>, places: &Places) {
 /// The thunk completing `SVC #immediate` at `pc` from EL0 to EL2 in the
 /// host, or within EL2, whose ESR is `syndrome`, else exiting at `pc` for
 /// the engine (`Cpu::take`). The record fixes everything but the operands:
+/// The branch to the original exit unless the PAC service's tag words and
+/// generation are the record's, where it swaps them; RAX and RCX are
+/// clobbered.
+fn check_pointer(asm: &mut Asm<'_>, places: &Places, misses: &mut Vec<Patch>) {
+    use Gpr::{Rax, Rcx};
+    use Size::Qword;
+    asm.alu_imm8(
+        Alu::Cmp,
+        Qword,
+        record_field(offset_of!(Record, pointer_swap)),
+        0,
+    );
+    let kept = asm.jcc(Cond::E);
+    asm.place(Rcx, places.pointer_generation);
+    asm.mov_load(Qword, Rax, Mem::base(Rcx, 0));
+    asm.alu_load(
+        Alu::Cmp,
+        Qword,
+        Rax,
+        record_field(offset_of!(Record, pointer_generation)),
+    );
+    misses.push(asm.jcc(Cond::Ne));
+    asm.place(Rcx, places.pointer_tags);
+    for word in 0..super::pointer::TAG_WORDS {
+        asm.mov_load(Qword, Rax, Mem::base(Rcx, (word * 8) as i32));
+        asm.alu_load(
+            Alu::Cmp,
+            Qword,
+            Rax,
+            record_field(offset_of!(Record, pointer_from) + word * 8),
+        );
+        misses.push(asm.jcc(Cond::Ne));
+    }
+    asm.bind(kept);
+}
+
+/// The PAC service's tag words become the record's `pointer_to` where it
+/// swaps them; RAX and RCX are clobbered.
+fn swap_pointer(asm: &mut Asm<'_>, places: &Places) {
+    use Gpr::{Rax, Rcx};
+    use Size::Qword;
+    asm.alu_imm8(
+        Alu::Cmp,
+        Qword,
+        record_field(offset_of!(Record, pointer_swap)),
+        0,
+    );
+    let kept = asm.jcc8(Cond::E);
+    asm.place(Rcx, places.pointer_tags);
+    for word in 0..super::pointer::TAG_WORDS {
+        asm.mov_load(
+            Qword,
+            Rax,
+            record_field(offset_of!(Record, pointer_to) + word * 8),
+        );
+        asm.mov_store(Qword, Mem::base(Rcx, (word * 8) as i32), Rax);
+    }
+    asm.bind(kept);
+}
+
 /// SPSR takes NZCV, the masks, PAN and the fields with the record's mode;
 /// ELR the next instruction; ESR the syndrome; the SP moves to the
 /// target's; every exception is masked; PAN, UAO and SSBS become the
@@ -638,6 +710,8 @@ pub fn supervisor_call_thunk(pc: GuestAddress, syndrome: u32, places: &Places) -
     );
     misses.push(asm.jcc(Cond::Ne));
     check_host(&mut asm, &mut misses);
+    check_pointer(&mut asm, places, &mut misses);
+    swap_pointer(&mut asm, places);
     saved_state(&mut asm, places);
     asm.mov_load(Qword, Rcx, record_field(offset_of!(Record, spsr)));
     asm.mov_store(Qword, Mem::base(Rcx, 0), Rax);
@@ -721,8 +795,10 @@ pub fn exception_return_thunk(pc: GuestAddress, places: &Places) -> Thunk {
     asm.bind(lower_kept);
     asm.bind(upper_kept);
     asm.mov_store(Qword, record_field(offset_of!(Record, vector)), Rcx);
+    check_pointer(&mut asm, places, &mut misses);
     check_return_state(&mut asm, &mut misses);
     restore_pstate(&mut asm, places);
+    swap_pointer(&mut asm, places);
     swap_stack(&mut asm);
     asm.mov_rm_imm32(
         Dword,
@@ -763,6 +839,8 @@ mod tests {
         status: u64,
         lines_until: u64,
         monitor: u64,
+        pointer_tags: [u64; crate::x86_64::pointer::TAG_WORDS],
+        pointer_generation: u64,
     }
 
     /// A level's GXF registers and two stack slots.
@@ -789,6 +867,8 @@ mod tests {
         lines_until: Place::new(Anchor::Mirrors, offset_of!(Words, lines_until)),
         count: Place::new(Anchor::Count, 0),
         monitor: Place::new(Anchor::Mirrors, offset_of!(Words, monitor)),
+        pointer_tags: Place::new(Anchor::Mirrors, offset_of!(Words, pointer_tags)),
+        pointer_generation: Place::new(Anchor::Mirrors, offset_of!(Words, pointer_generation)),
     };
     const MISS: Exit = Exit {
         pc: PC.0,

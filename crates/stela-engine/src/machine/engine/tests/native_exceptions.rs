@@ -249,12 +249,14 @@ const KEY_ENABLES: u64 = 1 << 31 | 1 << 30 | 1 << 27 | 1 << 13;
 
 /// With APCTL's kernel-keys bit, EL2 signs with every key while EL0 of a
 /// process without JOP keys (SCTLR's enables clear) does not: the engine
-/// path reopens the PAC service at each level, which a native SVC or ERET
-/// would not, so neither makes a record. With SCTLR enabling the keys too,
-/// both levels sign alike and the records hold.
+/// path reopens the PAC service at each level. A native SVC or ERET
+/// switches the service's tag words only from a service with one open, so
+/// with the service never opened neither makes a record (the twin round
+/// trip below covers an open one). With SCTLR enabling the keys too, both
+/// levels sign alike and the records switch nothing.
 #[test]
 fn svc_and_eret_make_records_only_where_pac_acts_alike() {
-    for (enables, recorded) in [(0, false), (KEY_ENABLES, true)] {
+    for (enables, recorded) in [(0, [false, false]), (KEY_ENABLES, [true, true])] {
         let mut machine = host();
         let sctlr = machine.cpu.registers.get(SystemRegister::SCTLR_EL2, 0);
         machine
@@ -271,9 +273,17 @@ fn svc_and_eret_make_records_only_where_pac_acts_alike() {
             machine.finish_transition(1);
         }
         let table = &machine.mirrors.transitions;
-        for (state, kind) in [(0, SUPERVISOR_CALL), (2, EXCEPTION_RETURN)] {
-            let made = table.records[state][kind].generation == table.generation;
-            assert_eq!(made, recorded, "enables {enables:#x} kind {kind}");
+        for (index, (state, kind)) in [(0, SUPERVISOR_CALL), (2, EXCEPTION_RETURN)]
+            .into_iter()
+            .enumerate()
+        {
+            let record = &table.records[state][kind];
+            let made = record.generation == table.generation;
+            assert_eq!(made, recorded[index], "enables {enables:#x} kind {kind}");
+            if made {
+                let swaps = record.pointer_swap != 0;
+                assert_eq!(swaps, enables == 0, "enables {enables:#x} kind {kind}");
+            }
         }
     }
 }
@@ -322,7 +332,8 @@ fn svc_and_eret_records_take_new_contexts_after_ttbr0_and_permission_writes() {
 /// The twin round trip where EL2 keeps every key on (APCTL) and EL0 of a
 /// process without JOP keys has only IB: after an ERET to EL0 and an SVC
 /// back, the PAC service native PAC code runs on is the engine's at each
-/// level (IA, DA and DB off at EL0), whichever path completed them.
+/// level (IA, DA and DB off at EL0): the records switch it natively, and a
+/// service in another state takes the normal exit.
 #[test]
 fn svc_and_eret_leave_the_pac_service_of_the_level_entered() {
     let configure = |machine: &mut Machine<FakeHost, NoDevices>| {
@@ -372,12 +383,15 @@ fn svc_and_eret_leave_the_pac_service_of_the_level_entered() {
     configure(&mut engine);
     configure(&mut native);
     let (eret, svc) = thunks();
-    // Native where a record holds, else the engine path, as a run would.
-    let complete = |machine: &mut Machine<FakeHost, NoDevices>, code: &[u8], word| {
+    let table = &native.mirrors.transitions;
+    for (state, kind) in [(0, SUPERVISOR_CALL), (2, EXCEPTION_RETURN)] {
+        let record = &table.records[state][kind];
+        assert_eq!(record.generation, table.generation, "kind {kind}");
+        assert_ne!(record.pointer_swap, 0, "kind {kind}");
+    }
+    let complete = |machine: &mut Machine<FakeHost, NoDevices>, code: &[u8], _word: u32| {
         let pc = machine.cpu.pc;
-        if run_native(machine, code) == (pc, ExitKind::System as u64) {
-            machine.system_instruction(word).unwrap();
-        }
+        assert_ne!(run_native(machine, code), (pc, ExitKind::System as u64));
     };
     for machine in [&mut engine, &mut native] {
         prepare(machine);
@@ -390,4 +404,12 @@ fn svc_and_eret_leave_the_pac_service_of_the_level_entered() {
     engine.system_instruction(SVC_WORD).unwrap();
     complete(&mut native, &svc.code, SVC_WORD);
     assert_eq!(observed(&engine), observed(&native));
+    assert_eq!(native.statistics.native_transitions[..2], [1, 1]);
+    // A service in another state (closed here) takes the normal exit.
+    prepare(&mut native);
+    native.pointer.close();
+    let before = observed(&native);
+    let exit = run_native(&mut native, &eret.code);
+    assert_eq!(exit, (ERET_PC, ExitKind::System as u64));
+    assert_eq!(observed(&native), before);
 }

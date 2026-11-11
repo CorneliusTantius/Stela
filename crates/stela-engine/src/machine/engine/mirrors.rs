@@ -270,6 +270,11 @@ pub(super) const TRANSITIONS: transition::Places = transition::Places {
     lines_until: Place::new(Anchor::Mirrors, offset_of!(Mirrors, lines_until)),
     count: Place::new(Anchor::Count, 0),
     monitor: Place::new(Anchor::Mirrors, offset_of!(Mirrors, monitor)),
+    pointer_tags: super::pointer::TAGS,
+    pointer_generation: Place::new(
+        Anchor::Pointer,
+        offset_of!(super::pointer::PointerService, generation),
+    ),
 };
 const _: () = assert!(size_of::<usize>() == size_of::<u64>());
 

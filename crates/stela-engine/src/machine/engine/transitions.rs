@@ -83,7 +83,14 @@ pub(super) struct Note {
     /// GEXIT and ERET: the SPSR it restored.
     spsr: u64,
     prediction: Option<PredictionContext>,
+    /// SVC and ERET between levels whose PAC key enables differ: the PAC
+    /// service's tag words before and after the engine reopened them, and
+    /// its generation.
+    pointer: Option<([PointerTags; 2], u64)>,
 }
+
+/// The PAC service's tag words (`PointerService::tags`).
+type PointerTags = [u64; x86_64_pointer::TAG_WORDS];
 
 /// What a transition starts from ([`Machine::transition_start`]).
 #[derive(Debug, Clone, Copy)]
@@ -92,6 +99,7 @@ pub(super) struct Start {
     prediction: Option<PredictionContext>,
     watch: Watch,
     pointer: PointerUse,
+    tags: PointerTags,
 }
 
 /// How PAC instructions act at a level: the four address keys' enables
@@ -181,6 +189,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             prediction: self.prediction_context,
             watch: self.watch,
             pointer: self.pointer_use(),
+            tags: self.pointer.tags,
         }
     }
 
@@ -232,12 +241,21 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     }
             }
         };
+        // Enables that differ are switched natively from a service with a
+        // tag word open (which the engine reopens whole, a function of its
+        // generation, enables and traps) to the tags it just reopened
+        // (`transition::check_pointer`).
+        let pointer = (start.pointer != self.pointer_use()
+            && matches!(kind, SUPERVISOR_CALL | EXCEPTION_RETURN)
+            && start.tags.iter().any(|&tag| tag != 0))
+        .then_some(([start.tags, self.pointer.tags], self.pointer.generation));
         let usable = !self.monitor_tracing
             && levels
             && plain(from)
             && plain(to)
             && from.tco == to.tco
-            && start.pointer == self.pointer_use()
+            && start.pointer.1 == self.pointer_use().1
+            && (start.pointer == self.pointer_use() || pointer.is_some())
             && !self.cpu.mte()
             && match kind {
                 GUARDED_EXIT => spsr & EXIT_CLEAR == 0,
@@ -253,6 +271,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             aspsr,
             spsr,
             prediction: start.prediction,
+            pointer,
         });
     }
 
@@ -273,6 +292,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             || note.generation != self.mirrors.transitions.generation
             || note.prediction != self.prediction_context
             || to.btype != 0
+            || note.pointer.is_some_and(|([_, to], generation)| {
+                to != self.pointer.tags || generation != self.pointer.generation
+            })
         {
             return;
         }
@@ -429,6 +451,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
             event: self.cpu.event_storage(),
             close,
             scratch: 0,
+            pointer_swap: u64::from(note.pointer.is_some()),
+            pointer_generation: note.pointer.map_or(0, |(_, generation)| generation),
+            pointer_from: note
+                .pointer
+                .map_or([0; x86_64_pointer::TAG_WORDS], |([from, _], _)| from),
+            pointer_to: note
+                .pointer
+                .map_or([0; x86_64_pointer::TAG_WORDS], |([_, to], _)| to),
         };
         let slot = &mut self.mirrors.transitions.records[from_state][note.kind];
         *slot = record;
