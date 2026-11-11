@@ -102,6 +102,20 @@ pub struct Record {
     pub view: u64,
     /// RFLAGS.AC after the switch: [`AC_KEEP`], [`AC_SET`] or [`AC_CLEAR`].
     pub ac: u64,
+    /// SVC: the vector it continues at. ERET: the target the thunk
+    /// computed. `target` names this word for both.
+    pub vector: u64,
+    /// SVC: PSTATE.PAN after it (the frame's word).
+    pub pan: u64,
+    /// SVC: each PSTATE field word ([`Places::fields`]) after it is the
+    /// word before AND `fields_keep` OR `fields_set`.
+    pub fields_keep: [u64; 3],
+    pub fields_set: [u64; 3],
+    /// ERET: nonzero where the target's top byte is a tag the return
+    /// removes (`AArch64_BranchAddr`), for the lower and the upper half.
+    pub untag: [u64; 2],
+    /// ERET: the event register byte the return sets.
+    pub event: u64,
     /// The `readable` words of cells of the new state that close: those
     /// whose value the engine refreshes at each transition. [`Self::scratch`]
     /// where there are fewer.
@@ -200,6 +214,9 @@ pub struct Places {
     /// count (`register_read::Count`).
     pub lines_until: Place,
     pub count: Place,
+    /// Nonzero while the engine holds an exclusive monitor of its own,
+    /// which only it clears: ERET leaves it to the engine.
+    pub monitor: Place,
 }
 
 const RECORD_BYTES: usize = size_of::<Record>();
@@ -416,27 +433,7 @@ pub fn guarded_enter_thunk(pc: GuestAddress, syndrome: u32, places: &Places) -> 
     );
     misses.push(asm.jcc(Cond::Ne));
     check_host(&mut asm, &mut misses);
-    // SPSR: NZCV from the flag word, DAIF, PAN, the fields and the mode.
-    asm.mov_load(Dword, Rax, frame_field(offset_of!(GuestState, nzcv)));
-    asm.alu_imm32(Alu::And, Dword, Rax, WORD_MASK as i32);
-    asm.imul_imm32(Dword, Rax, Rax, UNPACK_MULTIPLIER as i32);
-    asm.alu_imm32(Alu::And, Dword, Rax, ARM_MASK as i32);
-    asm.mov_load(Dword, Rcx, frame_field(offset_of!(GuestState, daif)));
-    asm.shift_imm(ShiftOp::Shl, Dword, Rcx, SPSR_DAIF_SHIFT);
-    asm.alu(Alu::Or, Qword, Rax, Rcx);
-    asm.mov_load(Qword, Rcx, frame_field(offset_of!(GuestState, pan)));
-    asm.shift_imm(ShiftOp::Shl, Qword, Rcx, SPSR_PAN_SHIFT);
-    asm.alu(Alu::Or, Qword, Rax, Rcx);
-    asm.place(Rcx, places.fields);
-    for field in 0..3 {
-        asm.alu_load(Alu::Or, Qword, Rax, Mem::base(Rcx, field * 8));
-    }
-    asm.alu_load(
-        Alu::Or,
-        Qword,
-        Rax,
-        record_field(offset_of!(Record, spsr_fixed)),
-    );
+    saved_state(&mut asm, places);
     asm.mov_load(Qword, Rcx, record_field(offset_of!(Record, spsr)));
     asm.mov_store(Qword, Mem::base(Rcx, 0), Rax);
     asm.mov_load(Qword, Rcx, record_field(offset_of!(Record, elr)));
@@ -457,37 +454,14 @@ pub fn guarded_enter_thunk(pc: GuestAddress, syndrome: u32, places: &Places) -> 
 
 /// The thunk completing GEXIT at `pc`, else exiting at `pc` for the engine.
 pub fn guarded_exit_thunk(pc: GuestAddress, places: &Places) -> Thunk {
-    use Gpr::{Rax, Rcx, Rdx};
-    use Size::{Dword, Qword};
+    use Gpr::{Rax, Rcx};
+    use Size::Qword;
     let mut code = Vec::with_capacity(512);
     let mut misses = Vec::new();
     let mut asm = Asm::new(&mut code);
-    // No interrupt line falls due by time alone: a timer, device or PMU
-    // deadline that passed since the last step leaves the unmask to the
-    // engine, which takes what fell due at once.
-    asm.place(Rax, places.lines_until);
-    asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rax, 0), -1);
-    let timeless = asm.jcc(Cond::E);
-    asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rax, 0), 0);
-    misses.push(asm.jcc(Cond::E));
-    super::register_read::read_count(&mut asm, places.count);
-    asm.place(Rax, places.lines_until);
-    asm.alu_load(Alu::Cmp, Qword, Rdx, Mem::base(Rax, 0));
-    misses.push(asm.jcc(Cond::Ae));
-    asm.bind(timeless);
+    check_deadline(&mut asm, places, &mut misses);
     locate(&mut asm, places, GUARDED_EXIT, &mut misses);
-    // No interrupt line changed since native code was entered.
-    let epoch = offset_of!(super::chain::ChainControl, interrupt_epoch);
-    let observed = offset_of!(super::chain::ChainControl, observed_interrupt_epoch);
-    asm.place(Rcx, Place::new(Anchor::Control, epoch));
-    asm.mov_load(Qword, Rax, Mem::base(Rcx, 0));
-    asm.alu_load(
-        Alu::Cmp,
-        Qword,
-        Rax,
-        Mem::base(Rcx, (observed - epoch) as i32),
-    );
-    misses.push(asm.jcc(Cond::Ne));
+    check_epoch(&mut asm, &mut misses);
     check_host(&mut asm, &mut misses);
     // ASPSR's guarded bit and SPSR's fixed bits are the record's.
     asm.mov_load(Qword, Rcx, record_field(offset_of!(Record, aspsr)));
@@ -500,6 +474,54 @@ pub fn guarded_exit_thunk(pc: GuestAddress, places: &Places) -> Thunk {
         record_field(offset_of!(Record, aspsr_value)),
     );
     misses.push(asm.jcc(Cond::Ne));
+    check_return_state(&mut asm, &mut misses);
+    restore_pstate(&mut asm, places);
+    swap_stack(&mut asm);
+    commit(code, places, GUARDED_EXIT, misses, pc)
+}
+
+/// The branch to the original exit unless no interrupt line falls due by
+/// time alone: a timer, device or PMU deadline that passed since the last
+/// step leaves the unmask to the engine, which takes what fell due at once.
+fn check_deadline(asm: &mut Asm<'_>, places: &Places, misses: &mut Vec<Patch>) {
+    use Gpr::{Rax, Rdx};
+    use Size::Qword;
+    asm.place(Rax, places.lines_until);
+    asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rax, 0), -1);
+    let timeless = asm.jcc(Cond::E);
+    asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rax, 0), 0);
+    misses.push(asm.jcc(Cond::E));
+    super::register_read::read_count(asm, places.count);
+    asm.place(Rax, places.lines_until);
+    asm.alu_load(Alu::Cmp, Qword, Rdx, Mem::base(Rax, 0));
+    misses.push(asm.jcc(Cond::Ae));
+    asm.bind(timeless);
+}
+
+/// The branch to the original exit unless no interrupt line changed since
+/// native code was entered.
+fn check_epoch(asm: &mut Asm<'_>, misses: &mut Vec<Patch>) {
+    use Gpr::{Rax, Rcx};
+    use Size::Qword;
+    let epoch = offset_of!(super::chain::ChainControl, interrupt_epoch);
+    let observed = offset_of!(super::chain::ChainControl, observed_interrupt_epoch);
+    asm.place(Rcx, Place::new(Anchor::Control, epoch));
+    asm.mov_load(Qword, Rax, Mem::base(Rcx, 0));
+    asm.alu_load(
+        Alu::Cmp,
+        Qword,
+        Rax,
+        Mem::base(Rcx, (observed - epoch) as i32),
+    );
+    misses.push(asm.jcc(Cond::Ne));
+}
+
+/// SPSR into RAX, then the branches to the original exit unless its bits
+/// `check_mask` names are the record's `check` and it unmasks no interrupt
+/// waiting since entry. RDX at the record.
+fn check_return_state(asm: &mut Asm<'_>, misses: &mut Vec<Patch>) {
+    use Gpr::{Rax, Rcx};
+    use Size::{Dword, Qword};
     asm.mov_load(Qword, Rcx, record_field(offset_of!(Record, spsr)));
     asm.mov_load(Qword, Rax, Mem::base(Rcx, 0));
     asm.mov(Qword, Rcx, Rax);
@@ -529,7 +551,13 @@ pub fn guarded_exit_thunk(pc: GuestAddress, places: &Places) -> Thunk {
     );
     asm.alu_imm8(Alu::And, Dword, Rcx, 0b11);
     misses.push(asm.jcc(Cond::Ne));
-    // PSTATE from SPSR in RAX.
+}
+
+/// PSTATE's operands from the SPSR in RAX: NZCV, the masks, PAN, the
+/// fields and the stack selection. RDX stays at the record.
+fn restore_pstate(asm: &mut Asm<'_>, places: &Places) {
+    use Gpr::{Rax, Rcx, Rdx};
+    use Size::{Dword, Qword};
     asm.mov(Qword, Rcx, Rax);
     asm.shift_imm(ShiftOp::Shr, Qword, Rcx, ARM_SHIFT);
     asm.alu_imm8(Alu::And, Dword, Rcx, 0xf);
@@ -556,8 +584,155 @@ pub fn guarded_exit_thunk(pc: GuestAddress, places: &Places) -> Thunk {
     asm.alu_imm8(Alu::And, Dword, Rcx, 1);
     asm.mov_store(Qword, Mem::base(Rdx, 0), Rcx);
     asm.pop(Rdx);
+}
+
+/// The SPSR an exception entry saves from the PE's operands into RAX:
+/// NZCV from the flag word, the masks, PAN and the fields, with the
+/// record's `spsr_fixed` bits (the mode and TCO). Clobbers RCX.
+fn saved_state(asm: &mut Asm<'_>, places: &Places) {
+    use Gpr::{Rax, Rcx};
+    use Size::{Dword, Qword};
+    asm.mov_load(Dword, Rax, frame_field(offset_of!(GuestState, nzcv)));
+    asm.alu_imm32(Alu::And, Dword, Rax, WORD_MASK as i32);
+    asm.imul_imm32(Dword, Rax, Rax, UNPACK_MULTIPLIER as i32);
+    asm.alu_imm32(Alu::And, Dword, Rax, ARM_MASK as i32);
+    asm.mov_load(Dword, Rcx, frame_field(offset_of!(GuestState, daif)));
+    asm.shift_imm(ShiftOp::Shl, Dword, Rcx, SPSR_DAIF_SHIFT);
+    asm.alu(Alu::Or, Qword, Rax, Rcx);
+    asm.mov_load(Qword, Rcx, frame_field(offset_of!(GuestState, pan)));
+    asm.shift_imm(ShiftOp::Shl, Qword, Rcx, SPSR_PAN_SHIFT);
+    asm.alu(Alu::Or, Qword, Rax, Rcx);
+    asm.place(Rcx, places.fields);
+    for field in 0..3 {
+        asm.alu_load(Alu::Or, Qword, Rax, Mem::base(Rcx, field * 8));
+    }
+    asm.alu_load(
+        Alu::Or,
+        Qword,
+        Rax,
+        record_field(offset_of!(Record, spsr_fixed)),
+    );
+}
+
+/// The thunk completing `SVC #immediate` at `pc` from EL0 to EL2 in the
+/// host, or within EL2, whose ESR is `syndrome`, else exiting at `pc` for
+/// the engine (`Cpu::take`). The record fixes everything but the operands:
+/// SPSR takes NZCV, the masks, PAN and the fields with the record's mode;
+/// ELR the next instruction; ESR the syndrome; the SP moves to the
+/// target's; every exception is masked; PAN, UAO and SSBS become the
+/// record's (with PSTATE.PAN the record's `check`), DIT stays; and the PE
+/// continues at the record's vector.
+pub fn supervisor_call_thunk(pc: GuestAddress, syndrome: u32, places: &Places) -> Thunk {
+    use Gpr::{Rax, Rcx};
+    use Size::{Dword, Qword};
+    let mut code = Vec::with_capacity(512);
+    let mut misses = Vec::new();
+    let mut asm = Asm::new(&mut code);
+    locate(&mut asm, places, SUPERVISOR_CALL, &mut misses);
+    asm.mov_load(Qword, Rax, frame_field(offset_of!(GuestState, pan)));
+    asm.alu_load(
+        Alu::Cmp,
+        Qword,
+        Rax,
+        record_field(offset_of!(Record, check)),
+    );
+    misses.push(asm.jcc(Cond::Ne));
+    check_host(&mut asm, &mut misses);
+    saved_state(&mut asm, places);
+    asm.mov_load(Qword, Rcx, record_field(offset_of!(Record, spsr)));
+    asm.mov_store(Qword, Mem::base(Rcx, 0), Rax);
+    asm.mov_load(Qword, Rcx, record_field(offset_of!(Record, elr)));
+    asm.mov_imm64(Rax, pc.0.wrapping_add(4));
+    asm.mov_store(Qword, Mem::base(Rcx, 0), Rax);
+    asm.mov_load(Qword, Rcx, record_field(offset_of!(Record, esr)));
+    asm.mov_imm32(Rax, syndrome);
+    asm.mov_store(Qword, Mem::base(Rcx, 0), Rax);
     swap_stack(&mut asm);
-    commit(code, places, GUARDED_EXIT, misses, pc)
+    asm.mov_rm_imm32(Dword, frame_field(offset_of!(GuestState, daif)), 0xf);
+    asm.place(Rcx, places.selected);
+    asm.mov_rm_imm32(Qword, Mem::base(Rcx, 0), 1);
+    asm.mov_load(Qword, Rax, record_field(offset_of!(Record, pan)));
+    asm.mov_store(Qword, frame_field(offset_of!(GuestState, pan)), Rax);
+    asm.place(Rcx, places.fields);
+    for field in 0..3 {
+        let word = Mem::base(Rcx, (field * 8) as i32);
+        asm.mov_load(Qword, Rax, word);
+        asm.alu_load(
+            Alu::And,
+            Qword,
+            Rax,
+            record_field(offset_of!(Record, fields_keep) + field * 8),
+        );
+        asm.alu_load(
+            Alu::Or,
+            Qword,
+            Rax,
+            record_field(offset_of!(Record, fields_set) + field * 8),
+        );
+        asm.mov_store(Qword, word, Rax);
+    }
+    commit(code, places, SUPERVISOR_CALL, misses, pc)
+}
+
+/// The thunk completing ERET at `pc` from EL2 to EL0 in the host or to EL2,
+/// else exiting at `pc` for the engine (`Cpu::exception_return`). As for
+/// GEXIT: no deadline due, no notification since entry, SPSR's bits other
+/// than the operands (NZCV, A, I, F, DIT, UAO, SSBS) the record's, so
+/// neither an illegal return nor PACM, single-step or another EL, and no
+/// waiting interrupt unmasked; and the engine holds no exclusive monitor of
+/// its own (`Places::monitor`). PSTATE's operands come from SPSR, the PC
+/// from ELR with its tag removed where the record says, the SP moves, the
+/// frame's local monitor clears and the event register is set.
+pub fn exception_return_thunk(pc: GuestAddress, places: &Places) -> Thunk {
+    use Gpr::{Rax, Rcx};
+    use Size::{Byte, Dword, Qword};
+    let mut code = Vec::with_capacity(640);
+    let mut misses = Vec::new();
+    let mut asm = Asm::new(&mut code);
+    check_deadline(&mut asm, places, &mut misses);
+    locate(&mut asm, places, EXCEPTION_RETURN, &mut misses);
+    check_epoch(&mut asm, &mut misses);
+    asm.place(Rcx, places.monitor);
+    asm.alu_imm8(Alu::Cmp, Qword, Mem::base(Rcx, 0), 0);
+    misses.push(asm.jcc(Cond::Ne));
+    check_host(&mut asm, &mut misses);
+    // The target: ELR, its top byte bit 55's copy where the half's TBI
+    // applies.
+    asm.mov_load(Qword, Rcx, record_field(offset_of!(Record, elr)));
+    asm.mov_load(Qword, Rcx, Mem::base(Rcx, 0));
+    asm.mov(Qword, Rax, Rcx);
+    asm.shift_imm(ShiftOp::Shr, Qword, Rax, 55);
+    asm.alu_imm8(Alu::And, Dword, Rax, 1);
+    let upper = asm.jcc8(Cond::Ne);
+    asm.alu_imm8(Alu::Cmp, Qword, record_field(offset_of!(Record, untag)), 0);
+    let lower_kept = asm.jcc8(Cond::E);
+    let lower_untag = asm.jmp8();
+    asm.bind(upper);
+    asm.alu_imm8(
+        Alu::Cmp,
+        Qword,
+        record_field(offset_of!(Record, untag) + 8),
+        0,
+    );
+    let upper_kept = asm.jcc8(Cond::E);
+    asm.bind(lower_untag);
+    asm.shift_imm(ShiftOp::Shl, Qword, Rcx, 8);
+    asm.shift_imm(ShiftOp::Sar, Qword, Rcx, 8);
+    asm.bind(lower_kept);
+    asm.bind(upper_kept);
+    asm.mov_store(Qword, record_field(offset_of!(Record, vector)), Rcx);
+    check_return_state(&mut asm, &mut misses);
+    restore_pstate(&mut asm, places);
+    swap_stack(&mut asm);
+    asm.mov_rm_imm32(
+        Dword,
+        frame_field(offset_of!(GuestState, exclusive_bytes)),
+        0,
+    );
+    asm.mov_load(Qword, Rcx, record_field(offset_of!(Record, event)));
+    asm.mov_imm32(Rax, 1);
+    asm.mov_store(Byte, Mem::base(Rcx, 0), Rax);
+    commit(code, places, EXCEPTION_RETURN, misses, pc)
 }
 
 #[cfg(all(
@@ -587,6 +762,7 @@ mod tests {
         fields: [u64; 3],
         status: u64,
         lines_until: u64,
+        monitor: u64,
     }
 
     /// A level's GXF registers and two stack slots.
@@ -612,6 +788,7 @@ mod tests {
         interrupt_status: Place::new(Anchor::Mirrors, offset_of!(Words, status)),
         lines_until: Place::new(Anchor::Mirrors, offset_of!(Words, lines_until)),
         count: Place::new(Anchor::Count, 0),
+        monitor: Place::new(Anchor::Mirrors, offset_of!(Words, monitor)),
     };
     const MISS: Exit = Exit {
         pc: PC.0,

@@ -102,6 +102,11 @@ pub(super) struct Mirrors {
     /// was entered, which the engine takes when it returns
     /// ([`Machine::take_thread_switches`]).
     pub(super) switches: register_read::SwitchLog,
+    /// Nonzero while the engine holds an exclusive monitor of its own
+    /// (`Cpu::monitor`) or the PE's monitor and event register live in its
+    /// canonical memory, set as native code is entered: native ERET then
+    /// leaves clearing and signalling them to the engine.
+    pub(super) monitor: u64,
 }
 
 /// Where native code finds the cell at `index` of the PE's state.
@@ -245,6 +250,7 @@ impl Default for Mirrors {
             transitions: transition::Table::default(),
             lines_until: 0,
             switches: register_read::SwitchLog::default(),
+            monitor: 0,
         }
     }
 }
@@ -263,6 +269,7 @@ pub(super) const TRANSITIONS: transition::Places = transition::Places {
     interrupt_status: INTERRUPT_STATUS,
     lines_until: Place::new(Anchor::Mirrors, offset_of!(Mirrors, lines_until)),
     count: Place::new(Anchor::Count, 0),
+    monitor: Place::new(Anchor::Mirrors, offset_of!(Mirrors, monitor)),
 };
 const _: () = assert!(size_of::<usize>() == size_of::<u64>());
 

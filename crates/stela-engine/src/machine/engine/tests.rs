@@ -9099,6 +9099,7 @@ mod arena;
 mod context_id;
 mod exits;
 mod floating_point_traps;
+mod native_exceptions;
 mod one_sided;
 mod process_switching;
 mod pstate_features;

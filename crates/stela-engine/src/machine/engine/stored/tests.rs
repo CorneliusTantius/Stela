@@ -120,11 +120,13 @@ fn sealed_shared_handoff_rejects_other_source_pc_and_profile_before_install() {
             (receiver.statistics.shared, receiver.statistics.compiled),
             (0, 1)
         );
+        // The block compiled anew, then the SVC's thunk.
         assert_eq!(
-            receiver.host.installed,
-            core::slice::from_ref(&genuine.block().native.x86_64_code),
+            receiver.host.installed.first(),
+            Some(&genuine.block().native.x86_64_code),
             "wrong handoff never reaches installation"
         );
+        assert_eq!(receiver.host.installed.len(), 2);
     }
 }
 

@@ -87,13 +87,18 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// write that could exit, and every step sets it again before native
     /// code runs.
     fn refresh_interrupt_status(&mut self, now: u64) {
-        let deadline = if self.cpu.pstate.el == 2 {
+        // EL0 of the host takes its interrupts at EL2 as EL2 does: a native
+        // ERET or GEXIT may unmask there too (`lines_until`). ISR_EL1 reads
+        // stay EL2's.
+        let pstate = self.cpu.pstate;
+        let host_user = pstate.el == 0 && !pstate.guarded && self.cpu.in_host();
+        let deadline = if pstate.el == 2 || host_user {
             self.lines_steady_until(now)
         } else {
             0
         };
         self.mirrors.interrupt_status = register_read::Cell {
-            readable: deadline,
+            readable: if pstate.el == 2 { deadline } else { 0 },
             value: self.chain.acknowledged_interrupt(),
         };
         self.mirrors.lines_until = deadline;

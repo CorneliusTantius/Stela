@@ -1188,8 +1188,9 @@ impl Heartbeat {
             // or none), contexts made, TLBIs its mail merged, and pages
             // walked again at once for contexts made anew.
             // Per PE: GENTER completed natively and by the engine, then
-            // GEXIT's.
-            let mut transitions = String::from("PES TRANSITIONS genter/engine/gexit/engine");
+            // GEXIT's, SVC's and ERET's.
+            let mut transitions =
+                String::from("PES TRANSITIONS genter/engine/gexit/engine/svc/engine/eret/engine");
             // All PEs: why GENTER and GEXIT at EL2 took the engine path.
             let mut transition_misses = [0u64; 16];
             let mut itlb_sources = String::from(concat!(
