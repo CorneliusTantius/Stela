@@ -492,7 +492,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 }
                 self.forget_lookups(addresses, asid);
             }
-            mmu::tlbi::Everywhere::NonGlobal => {
+            mmu::tlbi::Everywhere::NonGlobal(_) => {
                 let last = usize::from(self.private_fetches[1]);
                 match asid {
                     Some(asid) => self.forget_asid(0..=last, asid),

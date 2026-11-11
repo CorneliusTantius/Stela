@@ -1076,7 +1076,10 @@ fn a_call_the_tables_refuse_gives_up_every_translation_of_the_callers_asid() {
     let mut machine = board(&[], serve(u64::MAX - 0xfff), Vec::new());
     let forgets = machine.statistics.lookup_forgets[0];
     machine.device_transfer(0).unwrap();
-    assert_eq!(machine.host.reaches, [(Reach::All, Everywhere::NonGlobal)]);
+    assert_eq!(
+        machine.host.reaches,
+        [(Reach::All, Everywhere::NonGlobal(0))]
+    );
     assert!(machine.statistics.lookup_forgets[0] > forgets);
 }
 
@@ -3353,7 +3356,7 @@ fn lookup_contexts_follow_translation_inputs_and_outlive_a_return_to_them() {
     let aside1 = |machine: &mut Machine<FakeHost, NoDevices>| {
         machine.tlb_maintained(
             mmu::tlbi::Reach::Nothing,
-            mmu::tlbi::Everywhere::NonGlobal,
+            mmu::tlbi::Everywhere::NonGlobal(0),
             None,
         )
     };
@@ -3381,7 +3384,7 @@ fn lookup_contexts_follow_translation_inputs_and_outlive_a_return_to_them() {
             machine.private_fetches[1] = true;
             machine.tlb_maintained(
                 mmu::tlbi::Reach::Nothing,
-                mmu::tlbi::Everywhere::NonGlobal,
+                mmu::tlbi::Everywhere::NonGlobal(0),
                 None,
             )
         },
@@ -4354,8 +4357,8 @@ fn tlbis_reach_their_address_range_or_asid_without_a_regime_change() {
                 Reach::Containing(high),
                 Everywhere::Addresses(Reach::Containing(high))
             ),
-            (Reach::Nothing, Everywhere::NonGlobal),
-            (Reach::All, Everywhere::NonGlobal),
+            (Reach::Nothing, Everywhere::NonGlobal(3)),
+            (Reach::All, Everywhere::NonGlobal(0)),
             (range, Everywhere::Addresses(range)),
             (Reach::All, Everywhere::All),
         ]
