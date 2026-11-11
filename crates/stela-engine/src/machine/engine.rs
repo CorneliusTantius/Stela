@@ -181,6 +181,9 @@ const FIRST_WINDOW_BYTES: usize = 32 * INSTRUCTION as usize;
 const FETCH_CACHE: usize = 1024;
 /// Bits in each half's filter of the leaves fetched through.
 const FETCHED_LEAVES: usize = 1 << 21;
+/// The set words of a half's filter of the leaves fetched through that a
+/// clear zeroes one by one; past them it zeroes the whole filter.
+const FETCHED_WORDS: usize = 4096;
 /// The leaves of one size a TLBI is checked against one by one; one that
 /// reaches more counts as reaching what was fetched.
 const SCANNED_LEAVES: u64 = 1 << 16;
@@ -878,6 +881,11 @@ pub struct Machine<H: Host, D: Devices> {
     /// and no cached fetch, as most by far do not. Each half allocates
     /// its filter at its first recorded fetch.
     fetched_leaves: [Vec<u64>; 2],
+    /// The words of each half's `fetched_leaves` that a fetch set since it
+    /// was last cleared, up to [`FETCHED_WORDS`], or None past that: a
+    /// clear zeroes these alone instead of the whole filter, which a
+    /// TLBI VMALLE1 would otherwise write at every address space switch.
+    fetched_words: [Option<Vec<u32>>; 2],
     /// The registers of the stored cells, in the order of the cells, which
     /// the board's machines share ([`numbering`]).
     stored_reads: Arc<numbering::Registry<Encoding>>,
@@ -1340,6 +1348,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             private_fetches: [false; 2],
             lower_globals: NO_GLOBALS,
             fetched_leaves: [Vec::new(), Vec::new()],
+            fetched_words: [Some(Vec::new()), Some(Vec::new())],
             stored_reads: numbering.stored_reads,
             stored_writes: numbering.stored_writes,
             code_posted: None,

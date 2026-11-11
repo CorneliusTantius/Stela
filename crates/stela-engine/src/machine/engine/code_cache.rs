@@ -264,7 +264,18 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.recent[half] = [None; RECENT];
             // Bits are inserted with a fetched size and only cleared here.
             if core::mem::take(&mut self.fetched_sizes[half]) != 0 {
-                self.fetched_leaves[half].fill(0);
+                let filter = &mut self.fetched_leaves[half];
+                match &mut self.fetched_words[half] {
+                    Some(words) => {
+                        for word in words.drain(..) {
+                            filter[word as usize] = 0;
+                        }
+                    }
+                    words @ None => {
+                        filter.fill(0);
+                        *words = Some(Vec::new());
+                    }
+                }
             }
             self.private_fetches[half] = false;
             if half == 0 {
@@ -286,7 +297,14 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if filter.is_empty() {
             *filter = vec![0; FETCHED_LEAVES / 64];
         }
+        let words = &mut self.fetched_words[half];
         for (word, bit) in fetched_leaf_bits(pc & !(leaf - 1), leaf) {
+            if filter[word] == 0 {
+                match words {
+                    Some(set) if set.len() < FETCHED_WORDS => set.push(word as u32),
+                    _ => *words = None,
+                }
+            }
             filter[word] |= bit;
         }
         self.fetched_sizes[half] |= leaf;

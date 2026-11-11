@@ -3429,6 +3429,24 @@ fn fetched_leaf_filters_allocate_once_for_each_used_half() {
     assert_ne!(machine.fetched_leaves[0].as_ptr(), upper);
 }
 
+/// Forgetting a half's contexts zeroes its filter of fetched leaves, by
+/// the words fetches set while they are few and whole past them.
+#[test]
+fn forgetting_contexts_zeroes_the_fetched_leaf_filter_by_its_set_words() {
+    let mut machine = machine(&[]);
+    for count in [3, FETCHED_WORDS as u64 + 1000] {
+        for page in 0..count {
+            machine.fetched_through(0, page * 0x4000, 0x4000, false);
+        }
+        assert!(machine.fetched_leaves[0].iter().any(|&word| word != 0));
+        assert_eq!(machine.fetched_words[0].is_none(), count > 3);
+        machine.forget_spaces(0..=0, 1);
+        assert!(machine.fetched_leaves[0].iter().all(|&word| word == 0));
+        assert_eq!(machine.fetched_words[0].as_deref(), Some(&[][..]));
+        assert_eq!(machine.fetched_sizes[0], 0);
+    }
+}
+
 #[test]
 fn a_tlbi_by_va_drops_the_itlb_entries_of_its_leaf_in_every_context() {
     use mmu::tlbi::{Everywhere, Reach};
