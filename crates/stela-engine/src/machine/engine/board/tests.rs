@@ -692,25 +692,34 @@ fn records_are_read_without_locks_while_others_grow() {
 
 #[test]
 fn the_code_lock_counts_its_waits_and_the_report_starts_the_longest_over() {
-    let code = Arc::new(Code::new(1 << 16, 1 << 16, None));
-    let held = code.cache();
-    let waiting = Arc::clone(&code);
-    let started = Arc::new(AtomicBool::new(false));
-    let seen = Arc::clone(&started);
-    let waiter = thread::spawn(move || {
-        seen.store(true, Ordering::Release);
-        drop(waiting.cache());
-    });
-    while !started.load(Ordering::Acquire) {
-        thread::yield_now();
-    }
-    thread::sleep(Duration::from_millis(20));
-    drop(held);
-    waiter.join().unwrap();
-    let report = code.report();
-    // The holder, the waiter and the report's own.
-    assert_eq!(report.lock.acquired, 3);
-    assert_eq!(report.lock.contended, 1);
+    // The waiter announces itself before it asks for the lock, so a loaded
+    // host can hold it off until the lock is free again and its take goes
+    // uncontended. Such a round proves nothing; run a fresh one, boundedly.
+    let (code, report) = (0..20)
+        .map(|_| {
+            let code = Arc::new(Code::new(1 << 16, 1 << 16, None));
+            let held = code.cache();
+            let waiting = Arc::clone(&code);
+            let started = Arc::new(AtomicBool::new(false));
+            let seen = Arc::clone(&started);
+            let waiter = thread::spawn(move || {
+                seen.store(true, Ordering::Release);
+                drop(waiting.cache());
+            });
+            while !started.load(Ordering::Acquire) {
+                thread::yield_now();
+            }
+            thread::sleep(Duration::from_millis(20));
+            drop(held);
+            waiter.join().unwrap();
+            let report = code.report();
+            // The holder, the waiter and the report's own.
+            assert_eq!(report.lock.acquired, 3);
+            assert!(report.lock.contended <= 1);
+            (code, report)
+        })
+        .find(|(_, report)| report.lock.contended == 1)
+        .expect("the waiter met the held lock in one of 20 rounds");
     assert!(report.lock.longest > 0 && report.lock.longest == report.lock.waited);
     let again = code.report();
     assert_eq!(again.lock.acquired, 4);
