@@ -397,6 +397,8 @@ pub struct Signing {
     retry: Option<(Vec<u8>, Backoff)>,
     /// The counter origin of the retry clock.
     origin: u64,
+    /// Whether a request has gone to the network yet (said once on serial).
+    announced: bool,
 }
 
 impl Signing {
@@ -406,6 +408,7 @@ impl Signing {
             exchange: None,
             retry: None,
             origin: output::now(),
+            announced: false,
         }
     }
 }
@@ -466,6 +469,12 @@ impl stela_runtime::restore::tss::Transport for Signing {
         let (_, post) = match &mut self.exchange {
             Some(exchange) => exchange,
             None => {
+                if !self.announced {
+                    self.announced = true;
+                    output::arguments(format_args!(
+                        "TSS NETWORK a signing request the USB does not answer goes to {host} with this machine's ECID, the restore's nonces and its component hashes\n"
+                    ));
+                }
                 let url = format!("http://{host}{path}");
                 match network.open_post(&url, headers, content_type, body) {
                     Ok(post) => self.exchange.insert((body.to_vec(), post)),

@@ -850,9 +850,9 @@ fn run_machine<H: Host>(
     }
     if options.install.is_some() {
         output::arguments(format_args!(
-            "INSTALL SIGNING: the restore host sends this machine's ECID, the restore's nonces \
-             and its component hashes to gs.apple.com for its root tickets and recoveryOS \
-             LocalPolicy\n"
+            "INSTALL SIGNING: the restore host answers its root tickets, Cryptex1 ticket and \
+             recoveryOS LocalPolicy from the USB's staged answers when they match, else sends \
+             this machine's ECID, the restore's nonces and its component hashes to gs.apple.com\n"
         ));
     }
     // Waits return to this loop often enough that a press of the host's

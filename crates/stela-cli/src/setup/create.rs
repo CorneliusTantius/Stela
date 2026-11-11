@@ -512,6 +512,39 @@ fn staged(directory: &Path) -> bool {
         .is_some_and(|set| set.complete())
 }
 
+/// The full installer's promise before setup has asked Apple: it holds only
+/// once every signing answer is on the USB.
+pub(super) const FULL_BEFORE_NOTE: &str = "Full installer: macOS goes on the USB; the install \
+    needs no network once Apple's signing answers are fetched.";
+
+/// What the wizard says about the network before setup asks Apple; the plan
+/// says the final answer from the written bundles ([`network_notes`]).
+pub(super) fn expected_network_notes(full: bool) -> Vec<String> {
+    match full {
+        true => vec![FULL_BEFORE_NOTE.into(), FIRST_START_NOTE.into()],
+        false => vec![stela_runtime::restore::tss::network_reason(true).into()],
+    }
+}
+
+/// Whether an install needs no network: macOS on the USB and every restore
+/// bundle holding all of its signing answers.
+fn offline(remote: bool, restore_bundles: &[PathBuf]) -> bool {
+    !remote && !restore_bundles.is_empty() && restore_bundles.iter().all(|b| staged(b))
+}
+
+/// `status`'s install line: whether the active build's install needs a
+/// network, by the same test as the plan's ([`network_notes`]).
+pub(super) fn network_status(remote: bool, restore_bundles: &[PathBuf]) -> &'static str {
+    match offline(remote, restore_bundles) {
+        true => STATUS_OFFLINE,
+        false => stela_runtime::restore::tss::network_reason(remote),
+    }
+}
+
+/// `status`'s install line for a USB that installs without a network.
+pub(super) const STATUS_OFFLINE: &str =
+    "needs no network: macOS and every signing answer are on the USB";
+
 /// What the plan says about the network: none needed for the install with
 /// macOS and every signing answer on the USB, else why it is needed.
 pub(super) fn network_notes(remote: bool, offline: bool) -> Vec<String> {
@@ -755,9 +788,7 @@ pub(super) fn plan(
                 .map(|bundle| bundle.directory(&record.volume)),
         )
         .collect();
-    let offline =
-        !remote && !restore_bundles.is_empty() && restore_bundles.iter().all(|b| staged(b));
-    notes.extend(network_notes(remote, offline));
+    notes.extend(network_notes(remote, offline(remote, &restore_bundles)));
     notes.push(SIGNING_NOTE.into());
     notes.extend(installed.notes.iter().cloned());
     // The firmware of this computer's GPU; a USB made elsewhere gets none,

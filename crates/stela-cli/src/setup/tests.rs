@@ -1243,6 +1243,10 @@ fn install_reads_full_or_streamed_image() {
         status.contains("(macOS ") && status.contains(", downloads during installation): intact"),
         "{status}"
     );
+    assert!(
+        status.contains(stela_runtime::restore::tss::network_reason(true)),
+        "{status}"
+    );
     // Repair makes it full: the IPSW in pieces on the USB.
     let switch = |image| {
         rerun(&f, |c| {
@@ -4308,6 +4312,25 @@ fn a_full_installer_with_every_signing_answer_says_the_install_needs_no_network(
     assert!(
         plan.contains(stela_runtime::restore::tss::network_reason(false)),
         "{plan}"
+    );
+    // The written USB's status says the same.
+    setup(&staged, command(&f, &f.esp)).unwrap();
+    let mut status = command(&f, &f.esp);
+    status.ipsw = None;
+    status.model = None;
+    status.action = Action::Status;
+    let report = status.dispatch(&staged).unwrap();
+    assert!(report.contains(create::STATUS_OFFLINE), "{report}");
+}
+
+#[test]
+fn the_wizard_promises_no_network_only_once_the_answers_are_fetched() {
+    let full = create::expected_network_notes(true);
+    assert_eq!(full[0], create::FULL_BEFORE_NOTE);
+    assert!(!full.iter().any(|note| note == create::OFFLINE_NOTE));
+    assert_eq!(
+        create::expected_network_notes(false),
+        [stela_runtime::restore::tss::network_reason(true)]
     );
 }
 
