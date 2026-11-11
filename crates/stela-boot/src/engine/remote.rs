@@ -152,7 +152,7 @@ impl Remote {
     }
 
     /// Copy `out` from a kept segment that holds all of it.
-    fn from_segment(&self, offset: u64, out: &mut [u8]) -> bool {
+    fn read_segment(&self, offset: u64, out: &mut [u8]) -> bool {
         let found = self.segments.iter().rev().find(|(start, bytes)| {
             offset >= *start && offset + out.len() as u64 <= *start + bytes.len() as u64
         });
@@ -307,7 +307,7 @@ impl ReadAt for Remote {
         if until > self.len {
             return Err(NetError::Invalid("read past the remote image's end"));
         }
-        if self.from_segment(offset, out) {
+        if self.read_segment(offset, out) {
             return Ok(());
         }
         if offset < self.start || offset > self.end() + SKIP {
