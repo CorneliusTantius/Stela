@@ -178,6 +178,7 @@ impl<const N: usize> Runtime<N> {
     /// Callback contexts must be provider-owned stable objects, not escaped
     /// references into this dispatcher stack. Queue ownership covers them.
     pub fn step(self: Pin<&Self>) -> Result<bool, WorkError> {
+        let entry = step_counts::now();
         self.queue.process()?;
         if self.current.get() != NONE {
             return Err(WorkError::WouldDeadlock);
@@ -215,6 +216,7 @@ impl<const N: usize> Runtime<N> {
                     .next(task.lane, stack_requirement::Geometry::of(&task.stack))
                 {
                     Ok(Some(job)) => {
+                        step_counts::add(&step_counts::STEP_COUNTS.scans, 1);
                         let inserted = (|| {
                             self.queue.lock()?.state().scheduling.insert(
                                 task.id,
@@ -227,7 +229,7 @@ impl<const N: usize> Runtime<N> {
                         }
                         task.assign(job, flags);
                     }
-                    Ok(None) => {}
+                    Ok(None) => step_counts::add(&step_counts::STEP_COUNTS.scans, 1),
                     Err(e) => {
                         // SAFETY: `flags` came from the save_disable above, and no lock is held.
                         unsafe { self.queue.cpu.restore(flags) };
@@ -311,6 +313,9 @@ impl<const N: usize> Runtime<N> {
         let Some(i) = selected else {
             // SAFETY: `flags` came from the save_disable above, and no lock is held.
             unsafe { self.queue.cpu.restore(flags) };
+            let counts = &step_counts::STEP_COUNTS;
+            step_counts::add(&counts.empty, step_counts::now().wrapping_sub(entry));
+            step_counts::add(&counts.empty_steps, 1);
             return Ok(false);
         };
         if !(due_service && i == 2) {
@@ -378,6 +383,7 @@ impl<const N: usize> Runtime<N> {
         #[cfg(feature = "linux-kernel")]
         self.physical_enter(i)
             .unwrap_or_else(|error| self.queue.cpu.fatal(error));
+        let switched = step_counts::now();
         // SAFETY: both frames are held, pinned and initialized; IRQs stay disabled
         // across the switch, and no lock or borrow spans it.
         unsafe {
@@ -386,6 +392,7 @@ impl<const N: usize> Runtime<N> {
                 core::ptr::addr_of!((*self.task(i)).frame),
             )
         };
+        let returned = step_counts::now();
         if self.current.get() != NONE || self.queue.active.id.load(Ordering::Acquire) != 0 {
             self.queue.cpu.fatal(WorkError::CorruptContext);
         }
@@ -401,7 +408,12 @@ impl<const N: usize> Runtime<N> {
         unsafe { self.queue.cpu.restore(flags) };
         // The completing/parked frame is stopped, Task/active metadata is clear,
         // and exact outer IF restoration finished before any observer executes.
-        self.publish_general_resources()?;
+        let published = self.publish_general_resources();
+        let counts = &step_counts::STEP_COUNTS;
+        step_counts::add(&counts.select, switched.wrapping_sub(entry));
+        step_counts::add(&counts.body, returned.wrapping_sub(switched));
+        step_counts::add(&counts.after, step_counts::now().wrapping_sub(returned));
+        published?;
         Ok(true)
     }
 

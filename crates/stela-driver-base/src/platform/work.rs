@@ -55,6 +55,8 @@ pub mod scheduling;
 #[cfg(target_arch = "x86_64")]
 pub mod service;
 #[cfg(target_arch = "x86_64")]
+pub mod step_counts;
+#[cfg(target_arch = "x86_64")]
 mod terminal;
 
 #[cfg(all(target_arch = "x86_64", feature = "linux-kernel"))]
@@ -414,6 +416,8 @@ impl<const N: usize> Queue<N> {
         }))
     }
     fn lock(&self) -> Result<Guard<'_, N>, WorkError> {
+        #[cfg(target_arch = "x86_64")]
+        step_counts::add(&step_counts::STEP_COUNTS.locks, 1);
         let flags = self.cpu.save_disable()?;
         if self
             .held

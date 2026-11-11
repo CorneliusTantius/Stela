@@ -48,6 +48,9 @@ static ACTIVE_GS: AtomicU64 = AtomicU64::new(0);
 /// (a hand-back with no guest deadline leaves it masked): the host keeps
 /// its LVT write only while this is unchanged (`bare_host::arm_timer`).
 pub(crate) static TIMER_HANDOVERS: AtomicU64 = AtomicU64::new(0);
+/// Counts clock samples (`RootCpu::sample_ticks`), for the `GPU LINUX`
+/// report's `clocks=`.
+pub(crate) static SAMPLES: AtomicU64 = AtomicU64::new(0);
 
 fn processor_id() -> u32 {
     let highest = core::arch::x86_64::__cpuid(0).eax;
@@ -124,6 +127,7 @@ impl RootCpu {
     /// Caller holds local IRQ exclusion. A source fault does not
     /// revoke the time-free CPU identity needed to drain/release resources.
     fn sample_ticks(&self) -> Result<u64, WorkError> {
+        SAMPLES.fetch_add(1, Ordering::Relaxed);
         self.health.check()?;
         let result = (|| {
             self.deadline_control.check()?;
