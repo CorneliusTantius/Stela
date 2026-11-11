@@ -2,8 +2,10 @@
 //! These methods neither call providers nor grant CPU, IRQ, current or root access.
 use super::*;
 /// The number of [`Lane`]s.
+#[cfg(target_arch = "x86_64")]
 pub(super) const LANES: usize = 7;
 /// A dense index for each [`Lane`].
+#[cfg(target_arch = "x86_64")]
 pub(super) const fn lane_index(lane: Lane) -> usize {
     match lane {
         Lane::Foreground => 0,
