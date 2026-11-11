@@ -762,6 +762,7 @@ impl Experiment {
                 Verify::OnRead => "on-read",
             }
         ));
+        let remote = source.remote.is_some();
         let mut store = Store::open(source, manifest, identity)
             .map_err(|error| refuse!("restore store: {error}", %error))?;
         store.set_verify(verify);
@@ -844,6 +845,17 @@ impl Experiment {
             answers.clock = Some(Box::new(move || {
                 wall.unix_seconds_at(super::host::rdtsc(), hz)
             }));
+        }
+        if remote {
+            // Reads are unbounded until the guest runs (`work`/`prefetch`
+            // bound them), so what StartRestore needs is read here, not on
+            // a serving PE where a slow first byte leaves it pending.
+            // Recorded hashes (every remote inventory the CLI writes) need
+            // no read; a scanned inventory reads its hashed members once.
+            answers
+                .store
+                .prepare()
+                .map_err(|error| refuse!("restore store: {error}", %error))?;
         }
         let driver = Driver::new(answers, route)
             .map_err(|error| refuse!("restore driver: {error}", %error))?;
