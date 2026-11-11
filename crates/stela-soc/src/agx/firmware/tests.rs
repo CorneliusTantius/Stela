@@ -205,6 +205,73 @@ fn initialized_sleep_waits_for_startup_then_acknowledges_with_state_kept_on_ever
     }
 }
 
+#[test]
+fn a_sleep_after_a_refused_start_is_acknowledged_and_a_later_valid_root_starts() {
+    for sleep in [0, 0x201, 0x202] {
+        let mut firmware = booted_gfx(&G14G);
+        let mut outbox = Vec::new();
+        let power = |state| Mail {
+            endpoint: 0,
+            payload: 6 << 52 | state,
+        };
+        firmware.receive(power(0x220), &mut outbox).unwrap();
+        outbox.clear();
+        // The root's first word is not the kext's magic.
+        let mut memory = Flat::new(BASE, 0x20000);
+        kext_root(&mut memory);
+        memory.put_u64(ROOT, 0);
+        for message in [
+            Mail {
+                endpoint: MESSAGE_ENDPOINT,
+                payload: MSG_INIT << TYPE_SHIFT | ROOT & INIT_VA_BITS,
+            },
+            Mail {
+                endpoint: DOORBELL_ENDPOINT,
+                payload: doorbell_payload(DOORBELL_FWCTL, 0x11),
+            },
+        ] {
+            firmware.receive(message, &mut outbox).unwrap();
+        }
+        // Before the first DMA step the start is still in progress.
+        let reason = firmware.receive(power(sleep), &mut outbox).unwrap_err();
+        assert_eq!(firmware.error_reply(power(sleep), &reason), None);
+        let bytes = memory.bytes.clone();
+        let refusal = firmware
+            .protocol
+            .0
+            .borrow_mut()
+            .dma(&mut memory, &mut outbox)
+            .unwrap_err();
+        assert!(refusal.to_string().contains("lacks its magic"));
+        // The refused start wrote nothing and still asks for DMA steps, yet a
+        // sleep does not wait for it or for the doorbell it cannot run.
+        assert_eq!(memory.bytes, bytes);
+        assert!(firmware.dma_pending());
+        let reason = firmware.receive(power(sleep), &mut outbox).unwrap_err();
+        assert!(outbox.is_empty());
+        assert_eq!(
+            firmware.error_reply(power(sleep), &reason),
+            Some(alloc::vec![Mail {
+                endpoint: 0,
+                payload: 7 << 52 | sleep,
+            }])
+        );
+        assert_eq!(firmware.rtkit.iop_power(), sleep);
+        // A root that becomes valid starts the firmware, and a sleep then
+        // waits for the queued doorbell again.
+        firmware.receive(power(0x220), &mut outbox).unwrap();
+        outbox.clear();
+        memory.put_u64(ROOT, G14G.initdata_magic.unwrap());
+        let _ = firmware
+            .protocol
+            .0
+            .borrow_mut()
+            .dma(&mut memory, &mut outbox);
+        assert!(firmware.protocol.with(|state| state.initdata_checked));
+        assert!(!firmware.protocol.with(|state| state.start_refused));
+    }
+}
+
 const CONTROL_STATE: u64 = BASE + 0x8000;
 const CONTROL_ENTRIES: u64 = BASE + 0xa000;
 
