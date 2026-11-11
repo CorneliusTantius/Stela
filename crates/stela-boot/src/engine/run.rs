@@ -1569,11 +1569,12 @@ fn board_code(
     // with its ring part, an IC IVAU, a part taken for want of a slot or
     // anything else; IC IVAU ones of unchanged bytes; again within one
     // turn of the ring, four, or later; at a frame offset that held a
-    // block of another PC, or of the same PC in another variant.
+    // block of another PC, or of the same PC in another variant; ghosts
+    // that took another block's ghost slot (re-installs seen as new).
     let churn = now.churn.since(&was.churn);
     let churn = format!(
         " churn=new/ring/ivau/slot/other:{}/{}/{}/{}/{} same_bytes={} \
-         ages=turn/four/older:{}/{}/{} aliases=pc/variant:{}/{}",
+         ages=turn/four/older:{}/{}/{} aliases=pc/variant:{}/{} ghosts_overwritten={}",
         churn.new,
         churn.again[0],
         churn.again[1],
@@ -1585,6 +1586,7 @@ fn board_code(
         churn.ages[2],
         churn.aliases,
         churn.variants,
+        churn.overwritten,
     );
     // The parts young and tenured code hold, installs sent to the tenured
     // generation, and parts taken away: the oldest young one, the tenured

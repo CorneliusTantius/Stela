@@ -66,6 +66,10 @@ pub struct ChurnCounts {
     pub ages: [u64; 3],
     pub aliases: u64,
     pub variants: u64,
+    /// Departures whose ghost took the slot of another block's ghost: each
+    /// is a re-install the table can no longer tell from new code, and a
+    /// block the guest keeps running that goes back to the young generation.
+    pub overwritten: u64,
 }
 
 impl ChurnCounts {
@@ -80,6 +84,7 @@ impl ChurnCounts {
             ages: core::array::from_fn(|at| less(self.ages[at], was.ages[at])),
             aliases: less(self.aliases, was.aliases),
             variants: less(self.variants, was.variants),
+            overwritten: less(self.overwritten, was.overwritten),
         }
     }
 }
@@ -123,12 +128,24 @@ impl Churn {
 
     /// A block of `identity` with source hash `source` left the index in
     /// ring generation `generation`, for `cause`.
-    pub(super) fn gone(&self, identity: u64, source: u64, generation: u32, cause: Gone) {
+    pub(super) fn gone(
+        &self,
+        counts: &mut ChurnCounts,
+        identity: u64,
+        source: u64,
+        generation: u32,
+        cause: Gone,
+    ) {
         let ghost = tag(identity) << TAG_SHIFT
             | (cause as u32) << CAUSE_SHIFT
             | ((source & SOURCE_MASK) as u32) << SOURCE_SHIFT
             | generation & GENERATION_MASK;
-        self.ghosts[self.slot(identity)].store(ghost, Ordering::Relaxed);
+        let slot = &self.ghosts[self.slot(identity)];
+        let before = slot.load(Ordering::Relaxed);
+        if before != 0 && before >> TAG_SHIFT != tag(identity) {
+            counts.overwritten += 1;
+        }
+        slot.store(ghost, Ordering::Relaxed);
     }
 
     /// Whether a block of `identity` compiled in generation `generation`
@@ -201,8 +218,8 @@ mod tests {
         );
         assert_ne!(a, c);
         churn.installed(&mut counts, a, 7, 0, None, 32);
-        churn.gone(a, 7, 3, Gone::Ring);
-        churn.gone(b, 9, 3, Gone::Invalidated);
+        churn.gone(&mut counts, a, 7, 3, Gone::Ring);
+        churn.gone(&mut counts, b, 9, 3, Gone::Invalidated);
         // A block the ring took within four turns goes to the tenured
         // generation; one an IC IVAU took, or one long gone, does not.
         assert!(churn.promotes(a, 40, 32));
@@ -237,7 +254,7 @@ mod tests {
         let (churn, mut counts) = (Churn::new(1 << 16), ChurnCounts::default());
         let a = identity(0x3000, 0xa000, 0);
         // Generations count on past the ghost's 10 bits: ages still hold.
-        churn.gone(a, 0x5, 1020, Gone::Ring);
+        churn.gone(&mut counts, a, 0x5, 1020, Gone::Ring);
         assert!(churn.promotes(a, 1030, 32));
         assert!(churn.promotes(a, 1020 + 4 * 32, 32));
         assert!(!churn.promotes(a, 1020 + 4 * 32 + 1, 32));
@@ -249,10 +266,31 @@ mod tests {
     }
 
     #[test]
+    fn a_ghost_over_another_blocks_ghost_counts_as_overwritten() {
+        let (churn, mut counts) = (Churn::new(1 << 16), ChurnCounts::default());
+        let a = identity(0x4000, 0xb000, 0);
+        let b = (1..)
+            .map(|step| identity(0x4000 + step * 4, 0xb000 + step * 4, 0))
+            .find(|&other| churn.slot(other) == churn.slot(a) && tag(other) != tag(a))
+            .expect("a block hashed to the same ghost slot");
+        churn.gone(&mut counts, a, 1, 2, Gone::Ring);
+        assert_eq!(counts.overwritten, 0);
+        churn.gone(&mut counts, b, 1, 3, Gone::Ring);
+        assert_eq!(counts.overwritten, 1);
+        // Its own ghost again is no loss.
+        churn.gone(&mut counts, b, 1, 4, Gone::Ring);
+        assert_eq!(counts.overwritten, 1);
+        // The lost ghost's block reads as new and stays young.
+        assert!(!churn.promotes(a, 5, 32));
+        churn.installed(&mut counts, a, 1, 5, None, 32);
+        assert_eq!((counts.new, counts.since(&counts).overwritten), (1, 0));
+    }
+
+    #[test]
     fn new_bytes_after_an_invalidation_are_not_the_same() {
         let (churn, mut counts) = (Churn::new(1 << 16), ChurnCounts::default());
         let a = identity(0x2000, 0x9000, 2);
-        churn.gone(a, 0x11, 5, Gone::Invalidated);
+        churn.gone(&mut counts, a, 0x11, 5, Gone::Invalidated);
         churn.installed(&mut counts, a, 0x12, 5, None, 32);
         assert_eq!(counts.again[Gone::Invalidated as usize], 1);
         assert_eq!(counts.same_bytes, 0);

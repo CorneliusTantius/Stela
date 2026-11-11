@@ -947,13 +947,17 @@ impl<H: Host, D: Devices> Machine<H, D> {
 
     /// Note that block `slot` leaves the index for `cause`
     /// ([`churn::Churn::gone`]). Under the board's lock, `cache`.
-    pub(super) fn note_gone(&self, _cache: &mut board::Cache, slot: usize, cause: churn::Gone) {
+    pub(super) fn note_gone(&self, cache: &mut board::Cache, slot: usize, cause: churn::Gone) {
         let block = &self.code.blocks[slot];
         let identity = churn::identity(block.pc, block.physical, block.variant.0);
         let (generation, _) = self.ring_position();
-        self.code
-            .ghosts
-            .gone(identity, block.source_hash, generation, cause);
+        self.code.ghosts.gone(
+            &mut cache.churn,
+            identity,
+            block.source_hash,
+            generation,
+            cause,
+        );
         // A hole in a part that stays: its part may go early.
         if cause == churn::Gone::Invalidated
             && let Some(arena) = &self.code.arena
