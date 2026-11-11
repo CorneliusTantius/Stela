@@ -116,9 +116,7 @@ fn run_while_patching(
                 // SAFETY: the page stays mapped until join; its code has the
                 // block ABI and touches only the frame's control.
                 let result = unsafe {
-                    let run: unsafe extern "sysv64" fn(*mut GuestState) -> u128 =
-                        core::mem::transmute(entry as usize as *const ());
-                    run(&mut *frame)
+                    crate::x86_64::native::enter(entry as usize as *const u8, &mut *frame, 0, 0)
                 };
                 let (value, word) = (result as u64, (result >> 64) as u64);
                 if (value, ExitWord::split(word).0) == (TARGET.0, ExitKind::Direct as u64) {

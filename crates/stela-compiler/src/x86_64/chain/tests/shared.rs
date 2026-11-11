@@ -146,9 +146,12 @@ fn readers_take_whole_entries_while_one_writer_rewrites_them() {
                     // the block ABI and touches the frame's control and the
                     // tables, which outlive the runners.
                     let result = unsafe {
-                        let run: unsafe extern "sysv64" fn(*mut GuestState, u64) -> u128 =
-                            core::mem::transmute(code.0.add(entry));
-                        run(&mut *frame, target)
+                        crate::x86_64::native::enter(
+                            code.0.add(entry) as *const u8,
+                            &mut *frame,
+                            target,
+                            0,
+                        )
                     };
                     let value = result as u64;
                     if value == target {

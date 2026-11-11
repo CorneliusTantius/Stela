@@ -124,8 +124,9 @@ mod tests {
                 let entered = crate::x86_64::pinned::entered(&code.code);
                 core::ptr::copy_nonoverlapping(entered.as_ptr(), page.cast(), entered.len());
                 assert_eq!(mprotect(page, 4096, 5), 0);
-                let run: unsafe extern "sysv64" fn(*mut GuestState) -> Exit =
-                    core::mem::transmute(page);
+                let run = |state: *mut crate::GuestState| -> Exit {
+                    crate::x86_64::native::call::<Exit>(page as *const u8, state, 0, 0)
+                };
                 let mut before = GuestState::default();
                 for (i, value) in before.x.iter_mut().enumerate() {
                     *value = 0xfeed_0000_0000_0000 | i as u64;

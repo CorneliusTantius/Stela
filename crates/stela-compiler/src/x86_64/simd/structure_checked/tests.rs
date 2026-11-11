@@ -508,12 +508,15 @@ mod native {
                 memory: (&mut view as *mut MemoryContextView).cast(),
                 ..ExecutionContext::default()
             };
-            // SAFETY: the exact generated wrapper implements this borrowed ABI.
-            let entry: unsafe extern "sysv64" fn(*mut GuestState, *mut ExecutionContext) -> u32 =
-                unsafe { core::mem::transmute(self.0) };
+            let entry = |state: *mut crate::GuestState, second: *mut ExecutionContext| -> u32 {
+                // SAFETY: the exact generated wrapper implements this borrowed ABI.
+                unsafe {
+                    crate::x86_64::native::call::<u32>(self.0 as *const u8, state, second as u64, 0)
+                }
+            };
             let before = mxcsr();
             // SAFETY: state, context, view and Harness outlive this call through the generated ABI.
-            let status = unsafe { entry(state, &mut context) };
+            let status = entry(state, &mut context);
             assert_eq!(
                 mxcsr(),
                 before,

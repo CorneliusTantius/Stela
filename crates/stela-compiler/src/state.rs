@@ -114,6 +114,32 @@ pub struct GuestState {
     /// has retired in the iterations before the one it runs, which its exits
     /// move to the chain's count and a fault's settlement adds: 0 outside one.
     pub loop_retired: u64,
+    /// The host stack pointer at native code's entry, pointing at the
+    /// entry's return address: every exit to the engine reloads RSP from it
+    /// before its `ret` ([`crate::x86_64::chain::EXIT_RETURN`]), so frames
+    /// native code pushed between blocks are discarded. Set by each entry.
+    pub exit_rsp: ExitStack,
+}
+
+/// [`GuestState::exit_rsp`]: a host stack address of the native run in
+/// progress, no part of the guest's state, so any two compare equal and
+/// none prints.
+#[repr(transparent)]
+#[derive(Clone, Copy, Default)]
+pub struct ExitStack(pub u64);
+
+impl PartialEq for ExitStack {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for ExitStack {}
+
+impl core::fmt::Debug for ExitStack {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str("ExitStack")
+    }
 }
 
 /// [`GuestState::lower_limit`]: the host's, no part of the guest's state, so
@@ -155,6 +181,7 @@ impl Default for GuestState {
             anchors: Anchors::default(),
             lower_limit: Limit(0),
             loop_retired: 0,
+            exit_rsp: ExitStack(0),
         }
     }
 }
@@ -168,9 +195,9 @@ mod tests {
     #[test]
     fn layout_matches_native_abi() {
         for profile in [BlockProfile::ORDINARY, BlockProfile::new(Features::LEAF)] {
-            assert!(profile.abi().starts_with("x86_64-sysv-guest-state-v13-"));
+            assert!(profile.abi().starts_with("x86_64-sysv-guest-state-v14-"));
         }
-        assert_eq!(size_of::<GuestState>(), 904);
+        assert_eq!(size_of::<GuestState>(), 912);
         assert_eq!(align_of::<GuestState>(), 8);
         assert_eq!(offset_of!(GuestState, x), 0);
         assert_eq!(offset_of!(GuestState, sp), 248);
@@ -184,6 +211,7 @@ mod tests {
         assert_eq!(offset_of!(GuestState, pan), 816);
         assert_eq!(offset_of!(GuestState, lower_limit), 888);
         assert_eq!(offset_of!(GuestState, loop_retired), 896);
+        assert_eq!(offset_of!(GuestState, exit_rsp), 904);
     }
 
     #[test]

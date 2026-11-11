@@ -289,11 +289,8 @@ impl Run {
         // probes with the block ABI; they touch the frame, the control, the
         // memo, the service, the tables and the blocks, which outlive the
         // call, and call `service`.
-        let result = unsafe {
-            let run: unsafe extern "sysv64" fn(*mut GuestState) -> u128 =
-                core::mem::transmute(self.region.0);
-            run(state)
-        };
+        let result =
+            unsafe { crate::x86_64::native::enter(self.region.0 as *const u8, state, 0, 0) };
         (result as u64, (result >> 64) as u64)
     }
 }
@@ -743,11 +740,8 @@ fn branch_cell_probes_take_entries_that_accept_their_btype() {
             frame.anchors[Anchor::Control] = &raw mut control as u64;
             // SAFETY: the region holds the stub, its tail and the probes;
             // they touch the frame, the control, the tables and the blocks.
-            let result = unsafe {
-                let run: unsafe extern "sysv64" fn(*mut GuestState) -> u128 =
-                    core::mem::transmute(region.0);
-                run(&mut *frame)
-            };
+            let result =
+                unsafe { crate::x86_64::native::enter(region.0 as *const u8, &mut *frame, 0, 0) };
             let result = (result as u64, (result >> 64) as u64);
             if targets & 1 << btype != 0 {
                 assert_eq!(result, (0x7703, 99), "btype {btype} targets {targets:#b}");

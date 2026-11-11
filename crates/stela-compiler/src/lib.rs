@@ -24,7 +24,7 @@ mod testing;
 pub mod wkdm;
 pub mod x86_64;
 
-pub use state::{Anchor, Anchors, GuestState, Limit, Place};
+pub use state::{Anchor, Anchors, ExitStack, GuestState, Limit, Place};
 pub use target::{TargetCpu, TargetParseError};
 
 use serde::{Deserialize, Serialize};

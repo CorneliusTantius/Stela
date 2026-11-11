@@ -114,13 +114,16 @@ impl<'rx, S: ExecutableStorage + ?Sized> NativeImage<'rx, S> {
         budget: &mut stela_compiler::block::loop_budget::LoopBudget,
     ) -> Result<ReachedCall<BlockExit, S::Error>, S::Error> {
         self.revalidate()?;
-        let function: unsafe extern "sysv64" fn(
-            *mut GuestState,
-            *mut stela_compiler::block::loop_budget::LoopBudget,
-            // SAFETY: `entry` starts this storage's revalidated code, compiled for this signature.
-        ) -> BlockExit = unsafe { core::mem::transmute(self.storage.entry().as_ptr()) };
-        // SAFETY: the caller upholds this ABI's contract, documented above.
-        let returned = unsafe { function(state, budget) };
+        // SAFETY: `entry` starts this storage's revalidated code, compiled
+        // for this signature, and the caller upholds its contract, above.
+        let returned = exit(unsafe {
+            stela_compiler::x86_64::block_entry::enter(
+                self.storage.entry().as_ptr(),
+                state,
+                budget as *mut _ as u64,
+                0,
+            )
+        });
         Ok(ReachedCall {
             returned,
             storage_after: self.revalidate(),
@@ -164,14 +167,22 @@ impl<'rx, S: ExecutableStorage + ?Sized> NativeImage<'rx, S> {
         state: &mut GuestState,
     ) -> Result<ReachedCall<BlockExit, S::Error>, S::Error> {
         self.revalidate()?;
-        let function: unsafe extern "sysv64" fn(*mut GuestState) -> BlockExit =
-            // SAFETY: `entry` starts this storage's revalidated code, compiled for this signature.
-            unsafe { core::mem::transmute(self.storage.entry().as_ptr()) };
-        // SAFETY: the caller upholds this ABI's contract, documented above.
-        let returned = unsafe { function(state) };
+        // SAFETY: `entry` starts this storage's revalidated code, compiled
+        // for this signature, and the caller upholds its contract, above.
+        let returned = exit(unsafe {
+            stela_compiler::x86_64::block_entry::enter(self.storage.entry().as_ptr(), state, 0, 0)
+        });
         Ok(ReachedCall {
             returned,
             storage_after: self.revalidate(),
         })
+    }
+}
+
+/// The block exit RAX and RDX hold, as the block entry returns them.
+fn exit(returned: u128) -> BlockExit {
+    BlockExit {
+        next_pc: returned as u64,
+        kind: (returned >> 64) as u64,
     }
 }

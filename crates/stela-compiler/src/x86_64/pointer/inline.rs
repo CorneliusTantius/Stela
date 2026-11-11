@@ -294,8 +294,9 @@ mod tests {
             assert!(bytes.len() <= BYTES);
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), page.cast(), bytes.len());
             assert_eq!(mprotect(page, BYTES, 5), 0);
-            let entry: unsafe extern "sysv64" fn(*mut GuestState) -> Exit =
-                core::mem::transmute(page);
+            let entry = |state: *mut crate::GuestState| -> Exit {
+                crate::x86_64::native::call::<Exit>(page as *const u8, state, 0, 0)
+            };
             let exit = entry(&mut state);
             assert_eq!(munmap(page, BYTES), 0);
             exit

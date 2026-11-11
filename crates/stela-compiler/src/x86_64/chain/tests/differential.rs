@@ -268,11 +268,8 @@ fn run(region: &Pages, control: &mut ChainControl, target: u64) -> (u64, u64) {
     // SAFETY: the region holds the stub, a tail and probes with the block
     // ABI; they touch the frame's control, the tables and the blocks, which
     // outlive the call.
-    let result = unsafe {
-        let run: unsafe extern "sysv64" fn(*mut GuestState, u64) -> u128 =
-            core::mem::transmute(region.0);
-        run(&mut *frame, target)
-    };
+    let result =
+        unsafe { crate::x86_64::native::enter(region.0 as *const u8, &mut *frame, target, 0) };
     (result as u64, (result >> 64) as u64)
 }
 

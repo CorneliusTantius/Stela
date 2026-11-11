@@ -65,11 +65,7 @@ impl Mapping {
         let mut frame = frame(control);
         // SAFETY: installed thunk has the SysV128 return ABI and touches only
         // its frame and control/table. It clobbers caller-volatile registers.
-        unsafe {
-            let enter: unsafe extern "sysv64" fn(*mut GuestState) -> u128 =
-                core::mem::transmute(self.page);
-            enter(&mut *frame)
-        }
+        unsafe { crate::x86_64::native::enter(self.page as *const u8, &mut *frame, 0, 0) }
     }
 }
 impl Drop for Mapping {
@@ -377,11 +373,7 @@ fn interrupt_at_rendezvous(policy: Interruption) -> InterruptionOutcome {
         // SAFETY: main keeps the RX mapping until join; both allocations
         // remain owned, and the generated program writes only their declared
         // native counters/test rendezvous using caller-volatile registers.
-        let result = unsafe {
-            let run: unsafe extern "sysv64" fn(*mut GuestState) -> u128 =
-                core::mem::transmute(entry);
-            run(&mut *frame)
-        };
+        let result = unsafe { crate::x86_64::native::enter(entry as *const u8, &mut *frame, 0, 0) };
         (result, retained, retained_gate)
     });
     let began = Instant::now();
@@ -730,11 +722,8 @@ fn ring_costs(report: &mut fs::File) {
             let start = Instant::now();
             // SAFETY: the installed ring has the block ABI and touches only
             // its control and table; it clobbers caller-volatile registers.
-            let result = unsafe {
-                let enter: unsafe extern "sysv64" fn(*mut GuestState) -> u128 =
-                    core::mem::transmute(base);
-                enter(&mut *state)
-            };
+            let result =
+                unsafe { crate::x86_64::native::enter(base as *const u8, &mut *state, 0, 0) };
             let elapsed = start.elapsed();
             assert_eq!(
                 ExitWord::split((result >> 64) as u64).0,

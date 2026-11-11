@@ -305,12 +305,15 @@ impl NativeCode {
             memory: (view as *mut MemoryContextView).cast(),
             ..ExecutionContext::default()
         };
-        // SAFETY: exact generated entry implements this borrowed SystemV ABI.
-        let entry: unsafe extern "sysv64" fn(*mut GuestState, *mut ExecutionContext) -> u32 =
-            unsafe { core::mem::transmute(self.0) };
+        let entry = |state: *mut crate::GuestState, second: *mut ExecutionContext| -> u32 {
+            // SAFETY: exact generated entry implements this borrowed SystemV ABI.
+            unsafe {
+                crate::x86_64::native::call::<u32>(self.0 as *const u8, state, second as u64, 0)
+            }
+        };
         let before = mxcsr();
         // SAFETY: the entry ABI matches; state, context, view and callback Harness remain live.
-        let status = unsafe { entry(state, &mut context) };
+        let status = entry(state, &mut context);
         assert_eq!(
             mxcsr(),
             before,

@@ -95,8 +95,9 @@ const MAX_PAD: usize = 4;
 /// Bytes of a [`link`]'s body, without and with the interruption gate.
 pub const LINK_BODY_BYTES: usize = 34;
 pub const POLLED_LINK_BODY_BYTES: usize = LINK_BODY_BYTES + 10;
-/// Bytes in the largest [`thunk`]: the body and a return's `mov edx; ret`.
-pub const THUNK_BYTES: usize = POLLED_LINK_BODY_BYTES + 6;
+/// Bytes in the largest [`thunk`]: the body and a return's `mov edx` and
+/// [`EXIT_RETURN`].
+pub const THUNK_BYTES: usize = POLLED_LINK_BODY_BYTES + 5 + EXIT_RETURN_BYTES;
 /// Bytes of the link slot before an exit in its page ([`link_slot`]): the
 /// pad, the patch point and the body, without and with the gate.
 pub const LINK_BYTES: usize = MAX_PAD + PATCH_BYTES + LINK_BODY_BYTES;
@@ -104,11 +105,32 @@ pub const POLLED_LINK_BYTES: usize = MAX_PAD + PATCH_BYTES + POLLED_LINK_BODY_BY
 /// The span within which a link needs no translation of its own.
 const LINK_PAGE: u64 = 4096;
 /// Bytes in an exit to a dynamic target in RAX: `mov edx, kind`, a pad,
-/// then the patch point `ret` with room for a `jmp rel32`
-/// ([`dynamic_patch`]).
-pub const DYNAMIC_EXIT_BYTES: usize = 5 + MAX_PAD + PATCH_BYTES;
-/// An unlinked exit's patch point: `ret` and the room a jump takes.
-pub const RET_ROOM: [u8; PATCH_BYTES] = [0xc3, 0xcc, 0xcc, 0xcc, 0xcc];
+/// then the patch point, a `jmp rel32` ([`dynamic_patch`]), and the
+/// [`EXIT_RETURN`] it falls into while unlinked.
+pub const DYNAMIC_EXIT_BYTES: usize = 5 + MAX_PAD + PATCH_BYTES + EXIT_RETURN_BYTES;
+/// [`crate::GuestState::exit_rsp`], from RDI.
+pub const EXIT_RSP_OFFSET: i32 = core::mem::offset_of!(crate::GuestState, exit_rsp) as i32;
+/// Bytes of [`EXIT_RETURN`].
+pub const EXIT_RETURN_BYTES: usize = 8;
+/// Every return of native code to the engine: `mov rsp, [rdi + exit_rsp]`
+/// and `ret`. RSP is then where the entry's `call` left it, whatever frames
+/// native code pushed since, so the `ret` reaches the entry.
+pub const EXIT_RETURN: [u8; EXIT_RETURN_BYTES] = {
+    let d = EXIT_RSP_OFFSET.to_le_bytes();
+    [0x48, 0x8b, 0xa7, d[0], d[1], d[2], d[3], 0xc3]
+};
+/// What an entry runs right before it calls native code (RSP 8 bytes above
+/// where the `call` leaves it, RDI at the state): `lea r11, [rsp - 8]` and
+/// `mov [rdi + exit_rsp], r11`.
+pub const EXIT_RSP_STORE: [u8; 12] = {
+    let d = EXIT_RSP_OFFSET.to_le_bytes();
+    [
+        0x4c, 0x8d, 0x5c, 0x24, 0xf8, 0x4c, 0x89, 0x9f, d[0], d[1], d[2], d[3],
+    ]
+};
+/// An unlinked exit's patch point: a `jmp rel32` to the [`EXIT_RETURN`]
+/// right after it.
+pub const RET_ROOM: [u8; PATCH_BYTES] = [0xe9, 0, 0, 0, 0];
 /// A linked slot's patch point: the 5-byte NOP that falls into its body.
 pub const NOP5: [u8; PATCH_BYTES] = [0x0f, 0x1f, 0x44, 0x00, 0x00];
 /// The bits of a PC above which [`lookup_slot`] folds the next ones in:
@@ -1853,8 +1875,8 @@ fn direct_exit_padded(target: GuestAddress, word: u32, pad: usize) -> [u8; DIREC
     bytes
 }
 
-/// MOV EDX with `word`, a NOP of `pad` bytes, then the patch point: RET
-/// and the room a jump takes, INT3s to the exit's end
+/// MOV EDX with `word`, a NOP of `pad` bytes, then the patch point, which
+/// jumps to the [`EXIT_RETURN`] right after it, and INT3s to the exit's end
 /// ([`super::block::exit_kind_with`]).
 fn exit_word_bytes(word: u32, pad: usize) -> [u8; DYNAMIC_EXIT_BYTES] {
     const MOV_EDX: u8 = 0xba;
@@ -1862,8 +1884,22 @@ fn exit_word_bytes(word: u32, pad: usize) -> [u8; DYNAMIC_EXIT_BYTES] {
     bytes[0] = MOV_EDX;
     bytes[1..5].copy_from_slice(&word.to_le_bytes());
     bytes[5..5 + pad].copy_from_slice(NOPS[pad]);
-    bytes[5 + pad..5 + pad + PATCH_BYTES].copy_from_slice(&RET_ROOM);
+    let point = 5 + pad;
+    bytes[point..point + PATCH_BYTES].copy_from_slice(&RET_ROOM);
+    let back = point + PATCH_BYTES;
+    bytes[back..back + EXIT_RETURN_BYTES].copy_from_slice(&EXIT_RETURN);
     bytes
+}
+
+/// The unpadded dynamic exit of the encoded `word` ([`ExitWord::encoded`]).
+#[cfg(test)]
+pub(crate) fn exit_word(word: u32) -> [u8; DYNAMIC_EXIT_BYTES] {
+    exit_word_bytes(word, 0)
+}
+
+/// The return to the engine ([`EXIT_RETURN`]).
+pub(crate) fn exit_return(asm: &mut crate::x86_64::asm::Asm) {
+    asm.fixed(&EXIT_RETURN);
 }
 
 /// The NOP of each length up to [`MAX_PAD`] (Intel SDM vol. 2, NOP).
@@ -2191,7 +2227,7 @@ fn link_body(
         Fall::Thunk(Fallback::Return(word)) => {
             let mut asm = code.asm();
             asm.mov_imm32(Rdx, word.encoded());
-            asm.ret();
+            exit_return(&mut asm);
             body
         }
         Fall::Thunk(Fallback::Jump(exit)) => {
@@ -2624,7 +2660,7 @@ fn stamped_with_policy(
     let mut asm = code.asm();
     asm.bind(exhausted);
     asm.mov_imm32(Rdx, word.encoded() | ran << ExitWord::RAN_SHIFT);
-    asm.ret();
+    exit_return(&mut asm);
     // A miss counts its cause and takes the cell tail.
     let mut to_tail = Vec::new();
     for (miss, count) in [
@@ -2718,7 +2754,7 @@ fn found(asm: &mut crate::x86_64::asm::Asm) {
 /// A probe's exit to the engine, with RAX and EDX as the tail left them: the
 /// return of the native run, as the tail jumped to the probe.
 fn missed(asm: &mut crate::x86_64::asm::Asm) {
-    asm.ret();
+    exit_return(asm);
 }
 
 /// The tail at host address `at` that an exit's patch point jumps to once
@@ -3234,7 +3270,7 @@ mod tests {
         }
         assert!(link(0, LINK_BYTES + 1, 3, 7, 0).is_none());
         let word = 0x1122_3344_5566_7788;
-        assert_eq!(patch_word(word, 0x1003, RET_ROOM), 0xcccc_cccc_c366_7788);
+        assert_eq!(patch_word(word, 0x1003, RET_ROOM), 0x0000_0000_e966_7788);
     }
 
     #[test]
@@ -3252,7 +3288,7 @@ mod tests {
         expected.extend((0x2000i32 - 0x102c).to_le_bytes());
         expected.push(0xba);
         expected.extend(word.encoded().to_le_bytes());
-        expected.push(0xc3);
+        expected.extend(EXIT_RETURN);
         assert_eq!(code, expected);
         assert_eq!(code.len(), THUNK_BYTES);
         let back = thunk(0x1000, 7, 3, 0x2000, Fallback::Jump(0x800)).unwrap();
@@ -3399,10 +3435,14 @@ mod tests {
             core::ptr::copy_nonoverlapping(code.as_ptr(), base, code.len());
             core::ptr::copy_nonoverlapping(block.as_ptr(), base.add(BLOCK_AT), block.len());
             assert_eq!(mprotect(page, PAGE, 5), 0);
-            type Thunk = unsafe extern "sysv64" fn(u64, u64) -> u128;
-            let dynamic: Thunk = core::mem::transmute(page);
-            let fixed: Thunk = core::mem::transmute(base.add(fixed_at));
-            let branch: Thunk = core::mem::transmute(base.add(branch_at));
+            let thunk = |at: *const u8| {
+                move |frame: u64, target: u64| {
+                    crate::x86_64::native::enter(at, frame as *mut crate::GuestState, target, 0)
+                }
+            };
+            let dynamic = thunk(page as *const u8);
+            let fixed = thunk(base.add(fixed_at));
+            let branch = thunk(base.add(branch_at));
             let exit = |result: u128| {
                 let word = (result >> 64) as u64;
                 (result as u64, ExitWord::split(word).0)
@@ -3749,7 +3789,14 @@ mod tests {
                     core::ptr::copy_nonoverlapping(block.as_ptr(), base.add(at), block.len());
                 }
                 assert_eq!(mprotect(page, PAGE, 5), 0);
-                let run: unsafe extern "sysv64" fn(u64) -> u128 = core::mem::transmute(page);
+                let run = |frame: u64| {
+                    crate::x86_64::native::enter(
+                        page as *const u8,
+                        frame as *mut crate::GuestState,
+                        0,
+                        0,
+                    )
+                };
                 let exit = |result: u128| {
                     let word = (result >> 64) as u64;
                     (result as u64, ExitWord::split(word).0)
@@ -3915,7 +3962,14 @@ mod tests {
                 );
             }
             assert_eq!(mprotect(page, PAGE, 5), 0);
-            let ret: unsafe extern "sysv64" fn(u64, u64) -> u128 = core::mem::transmute(page);
+            let ret = |frame: u64, target: u64| {
+                crate::x86_64::native::enter(
+                    page as *const u8,
+                    frame as *mut crate::GuestState,
+                    target,
+                    0,
+                )
+            };
             let exit = |result: u128| (result as u64, ExitWord::split((result >> 64) as u64).0);
             control.budget = 100;
             // Returns to each caller in turn, through one site's tail.

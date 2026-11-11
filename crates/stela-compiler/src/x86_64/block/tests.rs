@@ -1969,10 +1969,12 @@ fn conditional_exits_branch_over_the_fallthrough_exit() {
     );
     let fallthrough = super::super::chain::direct_exit(GuestAddress(0x1004), ExitKind::Fallthrough);
     let taken = super::super::chain::direct_exit(GuestAddress(0x2000), ExitKind::Direct);
-    assert_eq!(code[..6], [0x0f, 0x85, 24, 0, 0, 0]);
-    assert_eq!(code[6..30], fallthrough);
-    assert_eq!(code[30..], taken);
-    assert_eq!(code.instructions(), 23);
+    assert_eq!(code[..6], [0x0f, 0x85, DIRECT_EXIT_BYTES as u8, 0, 0, 0]);
+    assert_eq!(code[6..6 + DIRECT_EXIT_BYTES], fallthrough);
+    assert_eq!(code[6 + DIRECT_EXIT_BYTES..], taken);
+    // The branch, then MOVABS, MOV, the patch point, the return (one
+    // emission) and four INT3s each.
+    assert_eq!(code.instructions(), 17);
 }
 
 #[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
@@ -2712,8 +2714,9 @@ fn vector_fused_multiply_add_keeps_zero_lanes_in_the_block() {
                 assert_ne!(page as usize, usize::MAX);
                 core::ptr::copy_nonoverlapping(code.as_ptr(), page.cast(), code.len());
                 assert_eq!(mprotect(page, bytes, 5), 0);
-                let entry: unsafe extern "sysv64" fn(*mut GuestState) -> Exit =
-                    core::mem::transmute(page);
+                let entry = |state: *mut crate::GuestState| -> Exit {
+                    crate::x86_64::native::call::<Exit>(page as *const u8, state, 0, 0)
+                };
                 let exit = entry(&mut state);
                 assert_eq!(munmap(page, bytes), 0);
                 exit
@@ -2781,8 +2784,9 @@ fn out_of_line_slow_paths_run_as_the_inline_layout() {
             assert_ne!(page as usize, usize::MAX);
             core::ptr::copy_nonoverlapping(code.as_ptr(), page.cast(), code.len());
             assert_eq!(mprotect(page, bytes, 5), 0);
-            let entry: unsafe extern "sysv64" fn(*mut GuestState) -> Exit =
-                core::mem::transmute(page);
+            let entry = |state: *mut crate::GuestState| -> Exit {
+                crate::x86_64::native::call::<Exit>(page as *const u8, state, 0, 0)
+            };
             let exit = entry(state);
             assert_eq!(munmap(page, bytes), 0);
             exit
@@ -2990,9 +2994,7 @@ fn clock_exit_requests_runtime_service_without_counter_or_guest_writes() {
         );
         let mut expected = vec![0x48, 0xb8];
         expected.extend(pc.0.to_le_bytes());
-        expected.extend([
-            0xba, 7, 0, 0, 0, 0xc3, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
-        ]);
+        expected.extend(super::super::chain::exit_word(7));
         // No RDTSC, host helper address, guessed counter, destination write
         // or placeholder ISB: only the checked runtime service may complete.
         assert_eq!(native.x86_64_code, expected);
@@ -3034,9 +3036,7 @@ fn pac_helper_exit_has_no_guest_writes_or_embedded_service_address() {
         );
         let mut expected = vec![0x48, 0xb8];
         expected.extend(pc.0.to_le_bytes());
-        expected.extend([
-            0xba, 6, 0, 0, 0, 0xc3, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
-        ]);
+        expected.extend(super::super::chain::exit_word(6));
         // Only the SysV return registers RAX/RDX are touched, including for
         // RETAB: the runtime must keep signed LR while authenticating target.
         assert_eq!(native.x86_64_code, expected);
@@ -3073,9 +3073,7 @@ fn ordinary_native_prefix_is_preserved_before_pac_boundary() {
     assert_eq!(native.source_map[1].0, pc);
     assert_eq!(
         &native.x86_64_code[native.x86_64_code.len() - DYNAMIC_EXIT_BYTES..],
-        &[
-            0xba, 6, 0, 0, 0, 0xc3, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc
-        ]
+        super::super::chain::exit_word(6)
     );
 }
 
@@ -3100,9 +3098,7 @@ fn trap_exit_uses_instruction_pc_and_only_native_return_scratch_registers() {
         );
         let mut expected = vec![0x48, 0xb8]; // movabs rax,instruction_pc
         expected.extend(pc.0.to_le_bytes());
-        expected.extend([
-            0xba, 5, 0, 0, 0, 0xc3, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
-        ]); // mov edx,Trap; ret
+        expected.extend(super::super::chain::exit_word(5)); // mov edx,Trap; ret
         assert_eq!(native.x86_64_code, expected);
         assert_eq!(native.source_map, [(pc, 0)]);
     }

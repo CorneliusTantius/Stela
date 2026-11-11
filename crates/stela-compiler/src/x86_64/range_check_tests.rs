@@ -152,7 +152,9 @@ fn the_emitted_checks_run_as_modelled() {
                 assert_ne!(page as usize, usize::MAX);
                 core::ptr::copy_nonoverlapping(code.as_ptr(), page.cast(), code.len());
                 assert_eq!(mprotect(page, PAGE, 5), 0);
-                let entry: unsafe extern "sysv64" fn(*mut GuestState) = core::mem::transmute(page);
+                let entry = |state: *mut crate::GuestState| -> () {
+                    crate::x86_64::native::call::<()>(page as *const u8, state, 0, 0)
+                };
                 for address in addresses(check) {
                     let mut state = GuestState {
                         lower_limit: crate::Limit(check.lower_limit()),

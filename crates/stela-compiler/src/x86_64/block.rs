@@ -20,15 +20,18 @@ pub(super) fn exit_kind(code: &mut Code, kind: ExitKind) {
     exit_kind_with(&mut code.asm(), kind);
 }
 
-/// `mov edx,word; ret`: the exit to the target in RAX, unpadded
+/// `mov edx,word`, the patch point's `jmp` to the return after it, and the
+/// return to the engine: the exit to the target in RAX, unpadded
 /// (`chain::dynamic_exit`).
 pub(super) fn exit_kind_with(asm: &mut Asm, word: impl Into<ExitWord>) {
+    use super::chain::{DYNAMIC_EXIT_BYTES, EXIT_RETURN_BYTES, PATCH_BYTES, RET_ROOM};
     // MOV EDX zero-extends to the ABI's u64.
     asm.mov_imm32(Gpr::Rdx, word.into().encoded());
-    asm.ret();
-    // The rest of the room a jump at the RET takes, and of the pad that
-    // makes the RET patchable where the code lands (`chain::dynamic_patch`).
-    for _ in 6..super::chain::DYNAMIC_EXIT_BYTES {
+    asm.fixed(&RET_ROOM);
+    super::chain::exit_return(asm);
+    // The pad that makes the patch point patchable where the code lands
+    // (`chain::dynamic_patch`).
+    for _ in 5 + PATCH_BYTES + EXIT_RETURN_BYTES..DYNAMIC_EXIT_BYTES {
         asm.int3();
     }
 }

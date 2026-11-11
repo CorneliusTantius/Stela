@@ -536,7 +536,7 @@ pub fn capture(state: &mut GuestState) -> HostGprSnapshot {
 }
 
 /// `body`, whose exits return, in code that runs it as the engine does: the
-/// pinned registers loaded around it. The engine's own entry does this; this
+/// pinned registers loaded around it and the exit stack pointer set. The engine's own entry does this; this
 /// is for running a block anywhere else.
 pub fn entered(body: &[u8]) -> alloc::vec::Vec<u8> {
     const SAVE: [u8; 10] = [0x53, 0x55, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57];
@@ -549,6 +549,7 @@ pub fn entered(body: &[u8]) -> alloc::vec::Vec<u8> {
     write_back(&mut stores);
     let mut code = SAVE.to_vec();
     code.extend_from_slice(&loads);
+    code.extend(super::chain::EXIT_RSP_STORE);
     code.push(0xe8);
     code.extend(((stores.len() + RESTORE.len()) as i32).to_le_bytes());
     code.extend_from_slice(&stores);
@@ -569,6 +570,7 @@ pub fn entry() -> alloc::vec::Vec<u8> {
     write_back(&mut stores);
     let mut code = TAKE_BLOCK.to_vec();
     code.extend_from_slice(&loads);
+    code.extend(super::chain::EXIT_RSP_STORE);
     code.extend(CALL_BLOCK);
     code.extend_from_slice(&stores);
     code.push(RET);

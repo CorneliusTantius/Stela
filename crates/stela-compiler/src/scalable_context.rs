@@ -29,9 +29,10 @@ use alloc::{collections::BTreeMap, vec, vec::Vec};
 pub const PROFILE_ID: &str = "apple-sme2-streaming-v1";
 pub const DECLARED_PROFILE_ID: &str = "sme-streaming-v2";
 const INSTRUCTION_BYTES: usize = size_of::<u32>();
-/// `push r15; mov r15, rsi; call body; pop r15; ret`: the context ABI's
-/// entry, which keeps the context pointer in R15 across the body.
-pub const CONTEXT_WRAPPER_BYTES: usize = 13;
+/// `push r15; mov r15, rsi`, the exits' stack pointer
+/// (`x86_64::chain::EXIT_RSP_STORE`), `call body; pop r15; ret`: the context
+/// ABI's entry, which keeps the context pointer in R15 across the body.
+pub const CONTEXT_WRAPPER_BYTES: usize = 13 + x86_64::chain::EXIT_RSP_STORE.len();
 
 pub(crate) fn context_wrapper() -> Code {
     use x86_64::asm::{Gpr, Size};
@@ -39,6 +40,7 @@ pub(crate) fn context_wrapper() -> Code {
     let mut asm = code.asm();
     asm.push(Gpr::R15);
     asm.mov(Size::Qword, Gpr::R15, Gpr::Rsi);
+    asm.fixed(&x86_64::chain::EXIT_RSP_STORE);
     let body = asm.call();
     asm.pop(Gpr::R15);
     asm.ret();

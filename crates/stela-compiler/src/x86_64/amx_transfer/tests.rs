@@ -313,8 +313,9 @@ fn run(code: &[u8], state: &mut crate::GuestState) -> (u64, u64) {
         assert!(bytes.len() <= BYTES);
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), page.cast(), bytes.len());
         assert_eq!(mprotect(page, BYTES, 5), 0);
-        let entry: unsafe extern "sysv64" fn(*mut crate::GuestState) -> u128 =
-            core::mem::transmute(page);
+        let entry = |state: *mut crate::GuestState| -> u128 {
+            crate::x86_64::native::call::<u128>(page as *const u8, state, 0, 0)
+        };
         let exit = entry(state);
         assert_eq!(munmap(page, BYTES), 0);
         (exit as u64, (exit >> 64) as u64)
@@ -370,8 +371,9 @@ fn amx_transfer_costs() {
             let page = mmap(core::ptr::null_mut(), BYTES, 3, 0x22, -1, 0);
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), page.cast(), bytes.len());
             assert_eq!(mprotect(page, BYTES, 5), 0);
-            let entry: unsafe extern "sysv64" fn(*mut crate::GuestState) -> u128 =
-                core::mem::transmute(page);
+            let entry = |state: *mut crate::GuestState| -> u128 {
+                crate::x86_64::native::call::<u128>(page as *const u8, state, 0, 0)
+            };
             assert_eq!(entry(&mut state) as u64, PC + 32);
             let started = std::time::Instant::now();
             for _ in 0..RUNS {

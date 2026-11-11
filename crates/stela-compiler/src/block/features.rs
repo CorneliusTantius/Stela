@@ -6,7 +6,7 @@ use alloc::string::String;
 use serde::{Serialize, Serializer, ser::SerializeSeq};
 
 /// Shared by every compiled function; the features follow it in the identity.
-const ABI_PREFIX: &str = "x86_64-sysv-guest-state-v13";
+const ABI_PREFIX: &str = "x86_64-sysv-guest-state-v14";
 
 /// A set of guest services. Each member admits the instructions that need the
 /// service, as runtime exits or native completions, and names itself in the
@@ -224,17 +224,17 @@ mod tests {
     fn the_abi_names_each_feature_and_the_checked_profile() {
         assert_eq!(
             BlockProfile::ORDINARY.abi(),
-            "x86_64-sysv-guest-state-v13-block-exit"
+            "x86_64-sysv-guest-state-v14-block-exit"
         );
         assert_eq!(
             BlockProfile::new(F::LEAF | F::CONTEXT).abi(),
-            "x86_64-sysv-guest-state-v13-leaf+context"
+            "x86_64-sysv-guest-state-v14-leaf+context"
         );
         assert_eq!(
             BlockProfile::new(F::PROCESS_HELPERS)
                 .with_checked_memory(SpAlignmentEnabled)
                 .abi(),
-            "x86_64-sysv-guest-state-v13-block-exit+pointer-authentication+clock\
+            "x86_64-sysv-guest-state-v14-block-exit+pointer-authentication+clock\
              +thread-registers+checked-gpr-memory-sa0-on-normal-wb-v4"
         );
     }

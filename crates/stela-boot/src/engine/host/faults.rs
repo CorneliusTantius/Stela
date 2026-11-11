@@ -52,6 +52,9 @@ stela_enter_owned:
     mov rbp, [rdi + 8]
     mov r12, [rdi + 128]
     mov r13, [rdi + 136]
+    // Every exit reloads RSP from here before its RET (block ABI v14).
+    lea r11, [rsp - 8]
+    mov [rdi + {exit_rsp}], r11
     call rax
     mov [rdi + {sp}], rbx
     mov [rdi + 64], rsi
@@ -67,6 +70,8 @@ stela_enter_owned:
     mov [rdi + {nzcv}], ecx
     jmp stela_native_owned_return
 stela_enter_owned_context:
+    lea r11, [rsp - 8]
+    mov [rdi + {exit_rsp}], r11
     call rdx
 stela_native_owned_return:
     cmp qword ptr gs:[{helper}], 0
@@ -93,6 +98,7 @@ stela_native_restore_host:
     ret
 "#,
     sp = const core::mem::offset_of!(GuestState, sp),
+    exit_rsp = const core::mem::offset_of!(GuestState, exit_rsp),
     nzcv = const core::mem::offset_of!(GuestState, nzcv),
     arm_shift = const flag_word::ARM_SHIFT,
     pack = const flag_word::PACK_MULTIPLIER,

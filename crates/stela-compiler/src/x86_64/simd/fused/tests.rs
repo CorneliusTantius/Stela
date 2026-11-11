@@ -69,8 +69,9 @@ impl Native {
         // SAFETY: the block has the frame ABI and writes only `state` and its
         // own stack slots.
         unsafe {
-            let entry: unsafe extern "sysv64" fn(*mut GuestState) -> Exit =
-                core::mem::transmute(self.page);
+            let entry = |state: *mut crate::GuestState| -> Exit {
+                crate::x86_64::native::call::<Exit>(self.page as *const u8, state, 0, 0)
+            };
             entry(state)
         }
     }

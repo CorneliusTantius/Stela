@@ -403,8 +403,14 @@ mod tests {
                     assert_ne!(page as usize, usize::MAX);
                     core::ptr::copy_nonoverlapping(code.as_ptr(), page.cast(), code.len());
                     assert_eq!(mprotect(page, PAGE, 5), 0);
-                    let entry: unsafe extern "sysv64" fn(*mut GuestState) =
-                        core::mem::transmute(page.cast::<u8>().add(offset));
+                    let entry = |state: *mut crate::GuestState| -> () {
+                        crate::x86_64::native::call::<()>(
+                            page.cast::<u8>().add(offset) as *const u8,
+                            state,
+                            0,
+                            0,
+                        )
+                    };
                     entry(&mut state);
                     assert_eq!(munmap(page, PAGE), 0);
                 }

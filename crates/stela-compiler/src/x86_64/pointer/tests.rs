@@ -160,8 +160,9 @@ fn thunks_complete_hits_and_computed_misses_natively() {
             assert_ne!(page as usize, usize::MAX);
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), page.cast(), bytes.len());
             assert_eq!(mprotect(page, PAGE, 5), 0);
-            let entry: unsafe extern "sysv64" fn(*mut GuestState) -> Exit =
-                core::mem::transmute(page);
+            let entry = |state: *mut crate::GuestState| -> Exit {
+                crate::x86_64::native::call::<Exit>(page as *const u8, state, 0, 0)
+            };
             let exit = entry(state);
             assert_eq!(munmap(page, PAGE), 0);
             exit
