@@ -497,8 +497,13 @@ impl<R: ReadAt> Disk<'_, R> {
                 payload_type: im4p.payload_type,
                 description: im4p.description,
                 container_sha256: sha256(&file),
+                decoded_sha256: None,
                 manifest: parts.manifest.map(<[u8]>::to_vec),
             }
+        };
+        let decoded_sha256 = match decoded.decoded_sha256 {
+            Some(digest) => digest,
+            None => sha256(&decoded.bytes),
         };
         let source = Source {
             component: format!("Preboot {}", String::from_utf8_lossy(kind)),
@@ -507,7 +512,7 @@ impl<R: ReadAt> Disk<'_, R> {
             payload_type: decoded.payload_type,
             description: decoded.description,
             decoded_bytes: decoded.bytes.len() as u64,
-            decoded_sha256: sha256(&decoded.bytes),
+            decoded_sha256,
         };
         Ok((
             Decoded {
