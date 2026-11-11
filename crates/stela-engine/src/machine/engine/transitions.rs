@@ -747,6 +747,40 @@ pub(super) mod tests {
         assert_eq!(observed(&native), after_write);
     }
 
+    /// A write of SPRR's field registers (`S3_6_C15_C3_0`), which SPTM
+    /// makes at every address-space switch, keeps the records: no access
+    /// and nothing derived reads them; as does a stored IMPLEMENTATION
+    /// DEFINED register's.
+    #[test]
+    fn stored_register_writes_keep_the_records() {
+        const MSR_SPRR_FIELDS_0: u32 = 0xd51e_f300; // msr s3_6_c15_c3_0, x0
+        let mut machine = gxf2();
+        machine.cpu.pc = BASE + 0x100;
+        for _ in 0..2 {
+            machine.system_instruction(GENTER_WORD).unwrap();
+            machine.finish_transition(1);
+            machine.system_instruction(GEXIT).unwrap();
+            machine.finish_transition(1);
+        }
+        let generation = machine.mirrors.transitions.generation;
+        assert_eq!(
+            machine.mirrors.transitions.records[2][GUARDED_ENTER].generation,
+            generation
+        );
+        for value in [0x40800, 0] {
+            machine.cpu.state.x[0] = value;
+            machine.system_instruction(MSR_SPRR_FIELDS_0).unwrap();
+            assert_eq!(machine.cpu.apple.sprr_fields[0], value);
+            assert_eq!(machine.mirrors.transitions.generation, generation);
+        }
+        // So does a write of an IMPLEMENTATION DEFINED register a store
+        // takes in full: XNU's thread keys at each thread switch.
+        const MSR_THREAD_KEY_0: u32 = 0xd51c_fdc6; // msr s3_4_c15_c13_6, x6
+        machine.cpu.state.x[6] = 0x1234_5678;
+        machine.system_instruction(MSR_THREAD_KEY_0).unwrap();
+        assert_eq!(machine.mirrors.transitions.generation, generation);
+    }
+
     /// Any change of what records depend on drops them; lookup contexts
     /// going only keeps them from continuing in their new state until the
     /// next native entry there gives them its contexts.
