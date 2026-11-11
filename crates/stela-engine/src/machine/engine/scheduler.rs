@@ -67,6 +67,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // The host may have changed the devices between runs (`devices` is
         // theirs too): their lines are asked again.
         self.device_lines = None;
+        // The loop's phases start where the one before ended (`timing_resume`).
+        self.timing_mark = self.timing_start();
         loop {
             if self.statistics.blocks >= self.block_limit
                 || deadline
@@ -78,7 +80,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             if let Some(hub) = &self.parallel {
                 hub.pass(self.current);
             }
-            let started = self.timing_start();
+            let started = self.timing_resume();
             let scheduled = match deadline {
                 Some(deadline) => self.schedule_with_deadline(Some(deadline)),
                 None => self.schedule(),
@@ -145,7 +147,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
     }
 
     pub(super) fn step(&mut self) -> Step {
-        let started = self.timing_start();
+        // The Schedule charge just before ended here.
+        let started = self.timing_resume();
         self.poll_due_devices()?;
         let delivered = self.deliver_interrupts();
         self.timing_charge(step_timing::Phase::Devices, started);
@@ -187,7 +190,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         // PSTATE.PACM applies to the one instruction after PACM.
         let pacm = self.cpu.pstate.pacm;
         let single = mode.breakpoints || mode.step || pacm;
-        let fetching = self.timing_start();
+        let fetching = self.timing_resume();
         let fetched = self.fetch_block(pc, single);
         self.timing_charge(step_timing::Phase::Fetch, fetching);
         let index = match fetched? {

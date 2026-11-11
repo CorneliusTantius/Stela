@@ -80,6 +80,17 @@ impl<H: Host, D: Devices> Machine<H, D> {
         }
     }
 
+    /// Where the run loop's next phase starts: the profile clock at the
+    /// last phase charge or exit, which ends right before it, instead of a
+    /// fresh read; zero without step timing.
+    #[inline]
+    pub(super) fn timing_resume(&self) -> u64 {
+        match self.step_timing {
+            Some(_) => self.timing_mark,
+            None => 0,
+        }
+    }
+
     /// The profile clock's ticks since `since`, or none without step timing.
     #[inline]
     pub(super) fn timing_since(&mut self, since: u64) -> u64 {
@@ -96,6 +107,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             return 0;
         }
         let now = self.host.profile_ticks();
+        self.timing_mark = now;
         self.host.profile_boundary(phase, now);
         if let Some(timing) = &mut self.step_timing {
             let spent = now.wrapping_sub(since);
@@ -132,6 +144,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             _ => slot,
         };
         let now = self.host.profile_ticks();
+        self.timing_mark = now;
         self.host.profile_boundary(step_timing::Phase::Exit, now);
         let closed = core::mem::take(&mut self.timed_closed);
         let waited = device.map_or(0, |_| self.devices.take_lock_wait());

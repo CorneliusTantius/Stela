@@ -747,6 +747,9 @@ pub struct Machine<H: Host, D: Devices> {
     /// System exits by instruction word, with their handling time under step
     /// timing ([`Self::system_words`]).
     system_words: BTreeMap<u32, DeviceRegister>,
+    /// The profile clock at the last phase charge or exit under step timing:
+    /// where the run loop's next phase starts ([`Self::timing_resume`]).
+    timing_mark: u64,
     /// The word of the system exit being handled.
     timed_word: Option<u32>,
     /// The System exit being handled closed every mirror cell.
@@ -1290,6 +1293,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             timed_device: None,
             timed_write: None,
             system_words: BTreeMap::new(),
+            timing_mark: 0,
             timed_word: None,
             timed_closed: false,
             system_exits: Box::default(),
