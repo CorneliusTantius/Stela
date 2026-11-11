@@ -1051,6 +1051,11 @@ fn claim(
     views
         .check(&mut function)
         .map_err(|error| cold_refusal(address, gpu::cold::Error::Views(error)))?;
+    if let Some(chip) =
+        gpu::nouveau_chip::Chip::from_boot0(boot0).filter(|chip| chip.waits_for_firmware_boot())
+    {
+        wait_for_firmware_boot(services, &resources[0], chip)?;
+    }
     // SAFETY: this scoped BAR observation was the sole user of the UC mapping.
     unsafe { views.registers.retire() }.map_err(ServiceError::Mapping)?;
     let capabilities = function
@@ -1106,6 +1111,120 @@ fn claim(
         #[cfg(feature = "nvk")]
         link,
     })
+}
+
+/// Read one BAR0 register through a scoped read-only page of `registers`,
+/// or `None` when it cannot be mapped or read.
+fn read_register(
+    services: &dyn NativeServices,
+    registers: &owned::Resource,
+    offset: usize,
+) -> Option<u32> {
+    let page = offset & !(PAGE as usize - 1);
+    let mut window = services
+        .authority()
+        .ok()?
+        .map(
+            registers.clone(),
+            page,
+            PAGE as usize,
+            CacheAttribute::Uncached,
+            Protection::ReadOnly,
+        )
+        .ok()?;
+    let value = window.read32(offset - page).ok();
+    // SAFETY: the read above was this scoped mapping's only use.
+    unsafe { window.retire() }.ok()?;
+    value
+}
+
+/// After the claim's function-level reset a Turing-to-Ada GPU's own firmware
+/// runs devinit again. nouveau reads the VBIOS before it waits for that
+/// (`firmware_boot`), so wait here first, by nouveau's bound, and print what
+/// the start of the old boot flow depends on: the firmware boot, WPR2 (which
+/// FWSEC-FRTS sets) and the VBIOS window the PRAMIN shadow reads.
+/// `GPU AD107: firmware boot completed after N polls: gfw=… plm=… wpr2=…-…
+/// display_fuse=… vbios_window=…`, or `did not complete` and a refusal.
+fn wait_for_firmware_boot(
+    services: &dyn NativeServices,
+    registers: &owned::Resource,
+    chip: &gpu::nouveau_chip::Chip,
+) -> Result<(), ServiceError> {
+    use gpu::nouveau_chip::firmware_boot::{self, Error as BootError};
+    let page = firmware_boot::PRIV_LEVEL_MASK & !(PAGE as usize - 1);
+    let mut window = services
+        .authority()?
+        .map(
+            registers.clone(),
+            page,
+            PAGE as usize,
+            CacheAttribute::Uncached,
+            Protection::ReadOnly,
+        )
+        .map_err(ServiceError::Mapping)?;
+    let timer = services.minimum_delay()?;
+    let result = firmware_boot::wait(
+        |offset| {
+            window
+                .read32(offset - page)
+                .map_err(|_| "a register read failed")
+        },
+        |micros| timer.wait_us(micros).map_err(|_| "the timer failed"),
+    );
+    // SAFETY: the polls above were this scoped mapping's only use.
+    unsafe { window.retire() }.map_err(ServiceError::Mapping)?;
+    let read = |offset| read_register(services, registers, offset);
+    let hex =
+        |value: Option<u32>| value.map_or_else(|| String::from("unread"), |v| format!("{v:#010x}"));
+    // nouveau's PRAMIN shadow reads the window only with the display fused
+    // on (`shadowramin.c` `pramin_init`: 0x820c04 from GA100, else 0x021c04).
+    let fuse = read(match chip.architecture {
+        gpu::nouveau_chip::Architecture::Turing => 0x02_1c04,
+        _ => 0x82_0c04,
+    });
+    let window = fuse
+        .filter(|fuse| fuse & 1 == 0)
+        .and_then(|_| read(0x62_5f04));
+    let state = format!(
+        "wpr2={}-{} display_fuse={} vbios_window={}",
+        hex(read(0x1f_a824)),
+        hex(read(0x1f_a828)),
+        hex(fuse),
+        hex(window),
+    );
+    match result {
+        Ok(reading) => {
+            output::arguments(format_args!(
+                "GPU {}: firmware boot completed after {} polls: gfw={:#010x} plm={:#010x} {state}\n",
+                chip.name, reading.polls, reading.progress, reading.priv_level_mask
+            ));
+            Ok(())
+        }
+        Err(BootError::Timeout(reading)) => {
+            output::arguments(format_args!(
+                "GPU {}: firmware boot did not complete after its reset in {} polls of {} us: \
+                 gfw={:#010x} (expected low byte {:#04x}) plm={:#010x} (expected bit 0) {state}\n",
+                chip.name,
+                reading.polls,
+                firmware_boot::POLL_MICROS,
+                reading.progress,
+                firmware_boot::COMPLETED,
+                reading.priv_level_mask
+            ));
+            Err(ServiceError::Refused(
+                "the GPU's firmware boot did not complete after its reset",
+            ))
+        }
+        Err(BootError::Access(error)) => {
+            output::arguments(format_args!(
+                "GPU {}: firmware boot wait stopped: {error}\n",
+                chip.name
+            ));
+            Err(ServiceError::Refused(
+                "the GPU's firmware boot registers could not be read",
+            ))
+        }
+    }
 }
 
 fn cold_refusal(
