@@ -79,6 +79,15 @@ pub enum RequirementKind {
     FaultRecovery(stela_compiler::block::FaultRecoveryError),
     /// Detailed refusal before a checked native frame was executed.
     NativePreparation(String),
+    /// Other PEs did not apply posted TLB or code maintenance within the
+    /// bounded wait: `pe` is one of the `unapplied` PEs, still short of
+    /// mail `serial` after `ticks` of the system count.
+    MaintenanceOverrun {
+        pe: usize,
+        serial: u64,
+        unapplied: usize,
+        ticks: u64,
+    },
 }
 
 impl fmt::Display for Requirement {
@@ -149,6 +158,16 @@ impl fmt::Display for Requirement {
             RequirementKind::NativePreparation(detail) => {
                 write!(f, "native preparation: {detail}")?
             }
+            RequirementKind::MaintenanceOverrun {
+                pe,
+                serial,
+                unapplied,
+                ticks,
+            } => write!(
+                f,
+                "maintenance overrun: PE {pe} has not applied mail {serial} after {ticks} \
+                 counter ticks ({unapplied} PEs waited on)"
+            )?,
         }
         if let Some(syndrome) = self.syndrome {
             write!(f, " esr={syndrome:#x}")?;
