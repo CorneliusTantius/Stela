@@ -2738,6 +2738,36 @@ fn ic_ivau_forgets_its_pages_blocks_and_ic_iallu_every_block() {
     assert_eq!(machine.statistics.code_discards.iter().sum::<u64>(), 1);
 }
 
+/// A block ending with SVC counts the SVC among its instructions: the
+/// engine path's System exit retires the words before it and the SVC's
+/// completion the SVC, and a native transition thunk's exit (a return to
+/// the vector, as `transition_branch` names it) retires the whole block, so
+/// both paths retire the same count.
+#[test]
+fn native_transition_exits_retire_the_transition_word() {
+    const SVC: u32 = 0xd400_1001; // svc #0x80
+    const ADD: u32 = 0x9100_0400; // add x0, x0, #1
+    let (mut engine, mut native) = (machine(&[ADD, SVC]), machine(&[ADD, SVC]));
+    let base = engine.cpu.pc;
+    engine.host.exits = vec![NativeExit::Exit {
+        next_pc: base + 4,
+        kind: ExitKind::System as u64,
+    }];
+    let retired = engine.cpu.retired;
+    engine.step().unwrap();
+    assert_eq!(engine.code.blocks[0].instructions, 2);
+    assert_eq!(engine.cpu.retired, retired + 2);
+    let vector = engine.cpu.pc;
+    native.host.exits = vec![NativeExit::Exit {
+        next_pc: vector,
+        kind: ExitKind::Return as u64,
+    }];
+    let retired = native.cpu.retired;
+    native.step().unwrap();
+    assert_eq!(native.cpu.pc, vector);
+    assert_eq!(native.cpu.retired, retired + 2);
+}
+
 /// A side exit retires what ran of its block, in the engine and in the
 /// thunk that chains it.
 #[test]

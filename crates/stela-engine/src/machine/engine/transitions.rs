@@ -501,9 +501,11 @@ impl<H: Host, D: Devices> Machine<H, D> {
     /// What an engine-path transition does after its own effects
     /// ([`Self::transitioned`]) for the `counts` native code made, the
     /// last block's `ending` instructions not yet retired. The PAC service
-    /// stays: records are made only where both states take the same keys,
-    /// version and controls and PAC acts alike at both levels (key
-    /// enables and traps, [`Self::pointer_use`]). With counters that tell the levels
+    /// is native code's: records are made only where both states take the
+    /// same keys, version and controls, and where the key enables differ
+    /// (SVC, ERET) the thunk swaps the service's tag words to those the
+    /// engine path reopened (`transition::check_pointer`); traps agree at
+    /// both levels ([`Self::pointer_use`]). With counters that tell the levels
     /// apart a run ends at its first transition, so the counts before it
     /// stay the old level's.
     pub(super) fn adopt_transitions(&mut self, counts: [u64; KINDS], ending: u64) {
