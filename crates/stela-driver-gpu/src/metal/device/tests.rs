@@ -140,6 +140,51 @@ fn a_marked_poll_needs_no_driver_query() {
     assert!(third > second);
 }
 
+/// A marked poll tells the backend which submissions finished, so it frees
+/// their command buffers without the query it would otherwise make once
+/// enough wait: every one before the marked serial, which the queue ran
+/// first, not the marked one, whose last command wrote the marker.
+#[test]
+fn a_marked_poll_lets_the_backend_recycle_finished_submissions() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    let mut backend = MockBackend::new();
+    backend.marker = Some(alloc::boxed::Box::new(AtomicU32::new(0)));
+    let mut device = device_on(backend);
+    let first = submit(&mut device);
+    let second = submit(&mut device);
+    device.backend().semaphore_error = Some(Error::DeviceLost);
+    assert_eq!(device.poll_marked(), Ok(0));
+    assert!(device.backend().passed.is_empty(), "nothing marked yet");
+    let mark = |device: &mut TestDevice, serial: u64| {
+        device
+            .backend()
+            .marker
+            .as_ref()
+            .unwrap()
+            .store(serial as u32, Ordering::SeqCst)
+    };
+    mark(&mut device, first);
+    assert_eq!(device.poll_marked(), Ok(first));
+    assert!(
+        device
+            .backend()
+            .passed
+            .iter()
+            .all(|&(_, value)| value < first),
+        "the marked submission may still run"
+    );
+    mark(&mut device, second);
+    assert_eq!(device.poll_marked(), Ok(second));
+    let passed = device.backend().passed.clone();
+    assert_eq!(passed.last().map(|&(_, value)| value), Some(first));
+    assert!(
+        passed
+            .iter()
+            .all(|&(semaphore, _)| semaphore == passed[0].0)
+    );
+    assert!(!device.is_lost(), "no driver query was made");
+}
+
 #[test]
 fn destruction_waits_for_submitted_work() {
     let mut device = device();

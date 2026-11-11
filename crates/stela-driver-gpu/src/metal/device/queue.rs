@@ -1806,6 +1806,19 @@ impl<B: Backend, C: Compiler> Device<B, C> {
             // A value that shows no progress may hide a loss, which only the
             // driver's answer says.
             Some(timeline) if !self.late_in_flight() && (trusted || timeline > self.completed) => {
+                // The backend recycles what finished submissions held, as
+                // after a query; else it asks the driver itself once enough
+                // wait. The marker shows the submission at `timeline` writing
+                // it, not finished: the queue runs its submissions in order,
+                // so every earlier one is.
+                let passed = if trusted {
+                    timeline.saturating_sub(1)
+                } else {
+                    timeline
+                };
+                if passed != 0 {
+                    self.backend.timeline_passed(self.timeline, passed);
+                }
                 timeline
             }
             _ => {
