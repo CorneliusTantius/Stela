@@ -88,10 +88,11 @@ pub(super) fn profile_report(
 
 /// `PES SYSTEM count/ns/closes`: every PE's System exits since the last
 /// beat by key (`step_timing::system_key_name`), the eight most frequent,
-/// then the eight costliest, each with its total handling time and the exits
+/// then the sixteen costliest, each with its total handling time and the exits
 /// that closed every mirror cell; `other` holds keys past the table's.
 fn system_exits_report(exits: &step_timing::SystemExits, tsc_hz: u64) {
     const SHOWN: usize = 8;
+    const SHOWN_BY_TIME: usize = 16;
     let nanos = |ticks: u64| u128::from(ticks) * 1_000_000_000 / u128::from(tsc_hz.max(1));
     let item = |name: &str, exit: &step_timing::SystemExit| {
         format!(
@@ -109,7 +110,7 @@ fn system_exits_report(exits: &step_timing::SystemExits, tsc_hz: u64) {
     }
     line.push_str(" by_time");
     keys.sort_unstable_by_key(|exit| core::cmp::Reverse(exit.ticks));
-    for exit in keys.iter().take(SHOWN) {
+    for exit in keys.iter().take(SHOWN_BY_TIME) {
         line.push_str(&item(&step_timing::system_key_name(exit.key), exit));
     }
     if exits.other.count != 0 {
