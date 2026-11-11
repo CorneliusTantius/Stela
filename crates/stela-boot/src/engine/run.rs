@@ -977,6 +977,14 @@ impl Heartbeat {
         let budget = tsc_hz / 1_000_000 * STEP_MICROS;
         let more = || host::rdtsc().wrapping_sub(started) < budget;
         let (name, next) = match stage {
+            // The walk of every block costs about 16 ms a beat on a booted
+            // desktop: it runs only while profiling.
+            BeatStage::Exits(_) if machine.step_timing().is_none() => (
+                "exits",
+                Some(BeatStage::ExitsDiff(WordsDiff::unwalked(core::mem::take(
+                    &mut self.exits.words,
+                )))),
+            ),
             BeatStage::Exits(mut walk) => {
                 let next = if machine.exit_words_step(&mut walk, more) {
                     BeatStage::ExitsDiff(WordsDiff::new(machine.exit_words_finish(walk)))
