@@ -1748,7 +1748,7 @@ pub(super) fn beat_report<H: Host>(
          compiled={} discards={}{} evictions={} unlinks={} chained={}% exceptions={} interrupts={} \
          waits={} \
          heap={}M/{}M carved={}M peak={}M largest={}M extents={} carves={} \
-         shadow_peak={}M/{}M/{}M exhausted={} code_peak={}M/{}M\n",
+         shadow_peak={}M/{}M/{}M/{}M exhausted={} code_peak={}M/{}M\n",
         next.blocks,
         cpu.pc,
         level_name(cpu.pstate.guarded),
@@ -1774,7 +1774,8 @@ pub(super) fn beat_report<H: Host>(
         heap.carves,
         shadow.shadow_peak[0] >> 20,
         shadow.shadow_peak[1] >> 20,
-        shadow.shadow_bytes >> 20,
+        shadow.shadow_bytes[0] >> 20,
+        shadow.shadow_bytes[1] >> 20,
         shadow.exhausted,
         shadow.code_peak >> 20,
         shadow.code_bytes >> 20,

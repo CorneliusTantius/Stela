@@ -66,19 +66,22 @@ const POOL_RUNNER_FLOOR: u64 = 32 * MIB;
 /// halves reset as a cache of the guest's working set, rather than hold a
 /// tenth of a large host's RAM.
 const POOL_PER_RUNNER: u64 = GIB;
-/// Past small guests a runner's pool is [`POOL_BASE`] and a byte per
-/// [`POOL_GROWTH`] bytes of guest DRAM, not a sixty-fourth. Its upper half
-/// holds the kernel's mappings: PE0's peaked at 23 MiB with 6.7 GiB of guest
-/// DRAM and at 22 MiB with 10.4 GiB (`BEAT shadow_peak=52M/23M/52M` and
-/// `64M/22M/64M`), so it hardly grows with the DRAM. Its lower half is a
-/// cache of recent address spaces: it fills whatever it has, and ran out
-/// about once in 1.6 heartbeats with 52 MiB as with 64 MiB (74 times in 117,
-/// 106 in 178), while TLB maintenance reset the shadow about 190 times a
-/// heartbeat (`SHADOW exhausted= maintained=`). Each half, 48 MiB and a
-/// 2048th of the guest, holds about the 52 MiB lower half of the 12 GiB
-/// run (51 MiB on a 12 GiB host, 54 on 16) and twice the upper half's peak.
-const POOL_BASE: u64 = 96 * MIB;
-const POOL_GROWTH: u64 = 1024;
+/// Past small guests a runner's pool is its two halves' sizes, not a
+/// sixty-fourth of the guest: [`LOWER_BASE`] and a [`LOWER_GROWTH`]th of the
+/// guest's DRAM for the lower half, [`UPPER_BASE`] and an
+/// [`UPPER_GROWTH`]th for the upper. The lower half (TTBR0, user address
+/// spaces) is a cache of recent address spaces: it fills whatever it has,
+/// and ran out about once in 1.6 heartbeats with 52 MiB as with 64 MiB (74
+/// times in 117, 106 in 178), while TLB maintenance reset the shadow about
+/// 190 times a heartbeat (`SHADOW exhausted= maintained=`); 48 MiB and a
+/// 2048th holds about the 52 MiB of the 12 GiB run. The upper half (TTBR1,
+/// the kernel) peaked at 22-29 MiB per runner whatever the guest's size
+/// (`BEAT shadow_peak=52M/23M/52M`, `64M/22M/64M`, 29 MiB in a 4-hour 16
+/// GiB run): 32 MiB and a 1024th, 42 MiB at 16 GiB.
+const LOWER_BASE: u64 = 48 * MIB;
+const LOWER_GROWTH: u64 = 2048;
+const UPPER_BASE: u64 = 32 * MIB;
+const UPPER_GROWTH: u64 = 1024;
 /// The least guest DRAM Stela boots macOS with. Below it macOS spends its
 /// time paging; 26A434 reaches the desktop with 3.1 GiB.
 pub const GUEST_FLOOR: u64 = 3 * GIB;
@@ -172,10 +175,10 @@ impl Shortfall {
 ///   per runner within free RAM / 16, or [`SMALL_WINDOW_PER_RUNNER`] where
 ///   the larger window would leave the guest under its floor;
 /// - the pool, for each of up to [`POOL_SHARERS`] runners, 1/[`POOL_SHARE`]
-///   of the guest's DRAM, which is what the other parts leave, or
-///   [`POOL_BASE`] and 1/[`POOL_GROWTH`] of it if that is less: `pool =
-///   sharers * (free - heap - code - pool) / 64`, solved for `pool`; at least
-///   [`POOL_RUNNER_FLOOR`] per runner, at most [`POOL_PER_RUNNER`] per sharer.
+///   of the guest's DRAM, which is what the other parts leave, or its halves'
+///   sizes ([`pool_halves`]) if that is less: `pool = sharers * (free - heap -
+///   code - pool) / 64`, solved for `pool`; at least [`POOL_RUNNER_FLOOR`] per
+///   runner, at most [`POOL_PER_RUNNER`] per sharer.
 ///
 /// A guest share under [`GUEST_FLOOR`] is a [`Shortfall`].
 pub fn sizes(free: u64, cores: usize, runners: usize) -> Result<Sizes> {
@@ -235,10 +238,13 @@ fn estimate_with(free: u64, cores: usize, runners: usize, per_runner: u64) -> Re
     let rest = free.saturating_sub(heap).saturating_sub(code.bytes);
     let sharers = u128::from(running.min(POOL_SHARERS));
     let rest = u128::from(rest);
-    // A sixty-fourth of the guest each, or the base and a 1024th if less.
+    // A sixty-fourth of the guest each, or both halves' sizes if less:
+    // pool = sharers * (bases + guest / 2048 + guest / 1024), guest = rest - pool.
     let share = sharers * rest / (u128::from(POOL_SHARE) + sharers);
-    let growth = u128::from(POOL_GROWTH);
-    let grown = sharers * (growth * u128::from(POOL_BASE) + rest) / (growth + sharers);
+    let (lower, upper) = (u128::from(LOWER_GROWTH), u128::from(UPPER_GROWTH));
+    let base = u128::from(LOWER_BASE + UPPER_BASE);
+    let parts = lower / upper + 1;
+    let grown = sharers * (lower * base + parts * rest) / (lower + parts * sharers);
     let pool = share.min(grown) as u64;
     let (rest, sharers) = (rest as u64, sharers as u64);
     let pool = (pool / ALIGNMENT * ALIGNMENT).clamp(
@@ -253,6 +259,27 @@ fn estimate_with(free: u64, cores: usize, runners: usize, per_runner: u64) -> Re
         pool,
         guest: rest.saturating_sub(pool),
     })
+}
+
+/// The bytes a runner's pool keeps for each guest half's shadow tables, for
+/// `guest` bytes of guest DRAM: the lower half's (user address spaces) and
+/// the upper half's (the kernel). [`sizes`] sizes the pool as their sum.
+pub fn pool_halves(guest: u64) -> (u64, u64) {
+    (
+        LOWER_BASE + guest / LOWER_GROWTH,
+        UPPER_BASE + guest / UPPER_GROWTH,
+    )
+}
+
+/// The bytes of a runner's `shadow` frames (its pool less the permanent
+/// roots) that the upper half takes, in whole `page`s, for `guest` bytes of
+/// guest DRAM: its [`pool_halves`] size, or its share of the part in their
+/// sizes' ratio where the part is smaller than both (a pool sized as a
+/// sixty-fourth of a small guest, or the pool's rounding); at least a page.
+pub fn upper_half(shadow: u64, guest: u64, page: u64) -> u64 {
+    let (lower, upper) = pool_halves(guest);
+    let share = (u128::from(shadow) * u128::from(upper) / u128::from(lower + upper)) as u64;
+    (upper.min(share) / page * page).max(page)
 }
 
 #[cfg(test)]

@@ -980,7 +980,7 @@ fn finish<H: Host>(
     dump_report(machine, &options.dumps);
     let host = host::statistics();
     output::arguments(format_args!(
-        "STATISTICS {:?} shadow_fills={} shadow_prefills={} shadow_resets={} shadow_exhausted={} shadow_peak={}M/{}M/{}M lower_resets={} scoped_invalidations={} stray_interrupts={} helper_calls={} helper_fills={} bounces={} guard_faults={} events={} seconds={seconds:.3}\n",
+        "STATISTICS {:?} shadow_fills={} shadow_prefills={} shadow_resets={} shadow_exhausted={} shadow_peak={}M/{}M/{}M/{}M lower_resets={} scoped_invalidations={} stray_interrupts={} helper_calls={} helper_fills={} bounces={} guard_faults={} events={} seconds={seconds:.3}\n",
         machine.statistics,
         host.fills,
         host.prefills,
@@ -988,7 +988,8 @@ fn finish<H: Host>(
         host.exhausted,
         host.shadow_peak[0] >> 20,
         host.shadow_peak[1] >> 20,
-        host.shadow_bytes >> 20,
+        host.shadow_bytes[0] >> 20,
+        host.shadow_bytes[1] >> 20,
         host.lower_resets,
         host.scoped,
         host.stray,
