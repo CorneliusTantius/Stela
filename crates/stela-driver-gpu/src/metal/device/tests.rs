@@ -185,6 +185,56 @@ fn a_marked_poll_lets_the_backend_recycle_finished_submissions() {
     assert!(!device.is_lost(), "no driver query was made");
 }
 
+/// While held work completes on the late timeline, a marked poll asks the
+/// driver for that timeline alone: the marker still stands for the queue's
+/// own, as a late submission writes it only after all submitted before it.
+#[test]
+fn a_marked_poll_with_late_work_asks_only_for_the_late_timeline() {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    let mut backend = MockBackend::new();
+    backend.marker = Some(alloc::boxed::Box::new(AtomicU32::new(0)));
+    let mut device = device_on(backend);
+    let event = device.new_event().unwrap();
+    let semaphore = device.event_semaphore(event).unwrap();
+    let mut commands = device.new_command_buffer();
+    commands
+        .encode_wait_for_event(&mut device.resolver(), semaphore, 1)
+        .unwrap();
+    let held = device.commit_for(2, commands).unwrap();
+    let later = submit(&mut device);
+    assert!(later > held && device.holds());
+    // The later command buffer completes; the held one is released after
+    // it, so it completes on the late timeline.
+    device.backend().finish();
+    let store = |device: &mut TestDevice, serial: u64| {
+        device
+            .backend()
+            .marker
+            .as_ref()
+            .unwrap()
+            .store(serial as u32, Ordering::SeqCst)
+    };
+    store(&mut device, later);
+    device.set_signaled_value(event, 1).unwrap();
+    assert!(device.holds(), "the released command buffer completes late");
+    device.backend().queried.clear();
+    device.poll_marked().unwrap();
+    let timeline = device.timeline;
+    assert!(
+        !device.backend().queried.contains(&timeline),
+        "the marker answers for the queue's own timeline"
+    );
+    assert!(device.reached_for(0) >= later);
+    // The held one runs and writes its serial late; the late timeline says
+    // it completed.
+    device.backend().finish();
+    store(&mut device, held);
+    device.poll_marked().unwrap();
+    assert!(!device.backend().queried.contains(&timeline));
+    assert_eq!(device.reached_for(2), device.submitted_serial());
+    assert!(!device.is_lost());
+}
+
 #[test]
 fn destruction_waits_for_submitted_work() {
     let mut device = device();

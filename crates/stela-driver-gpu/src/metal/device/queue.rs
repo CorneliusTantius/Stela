@@ -1753,7 +1753,8 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     }
 
     /// [`Self::poll`] taking the completion marker's serial as the queue's
-    /// timeline when no work completes on the late timeline: a guest's
+    /// timeline, and asking only for the late timeline while work completes
+    /// there: a guest's
     /// poll then needs no driver query (a host kernel call a guest
     /// processor waits for the boot processor to serve) even while held
     /// work keeps completion from being published, and even when nothing
@@ -1761,15 +1762,19 @@ impl<B: Backend, C: Compiler> Device<B, C> {
     /// may lag, never lead. A loss is still noticed by the platform's look,
     /// which asks the driver whenever the marker shows nothing new.
     pub fn poll_marked(&mut self) -> Result<u64> {
+        // Work completing on the late timeline still asks for that
+        // timeline alone: the marker stands for the queue's own timeline
+        // whatever was submitted late, as every late submission writes it
+        // only after everything submitted before it.
         match self.marker_serial() {
-            Some(marked) if !self.late_in_flight() => {
+            Some(marked) => {
                 let result = self.poll_inner(Some(marked.max(self.completed)), true);
                 if result == Err(Error::DeviceLost) {
                     self.mark_lost();
                 }
                 result
             }
-            _ => self.poll(),
+            None => self.poll(),
         }
     }
 
@@ -1805,7 +1810,7 @@ impl<B: Backend, C: Compiler> Device<B, C> {
         let timeline = match known {
             // A value that shows no progress may hide a loss, which only the
             // driver's answer says.
-            Some(timeline) if !self.late_in_flight() && (trusted || timeline > self.completed) => {
+            Some(timeline) if trusted || (!self.late_in_flight() && timeline > self.completed) => {
                 // The backend recycles what finished submissions held, as
                 // after a query; else it asks the driver itself once enough
                 // wait. The marker shows the submission at `timeline` writing
