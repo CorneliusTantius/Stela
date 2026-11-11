@@ -170,8 +170,13 @@ const STORED_WRITE_CELLS: usize = TABLE_BASE_KEPT + 1;
 /// that get a cell of their own the first time code naming them is installed
 /// ([`Machine::stored_write_cell`]), open on the register's value once a
 /// write completes plainly. A kernel writes them around each thread switch.
-/// When there are more, the rest take System exits.
-pub(super) const STORED_WRITES: usize = 32;
+/// When there are more, the rest take System exits. Numbers go in install
+/// order and never free, and boot installs writes of dozens of tuning,
+/// control and counter registers (26A434 XNU alone writes over 40 stored
+/// ones) before the first thread switch, so room for the ones a kernel
+/// writes at every switch (thread keys, SPRR's field registers) must
+/// outlast those.
+pub(super) const STORED_WRITES: usize = 128;
 
 const CELLS: usize = STORED_WRITE_CELLS + STORED_WRITES;
 
