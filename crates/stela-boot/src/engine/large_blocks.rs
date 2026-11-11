@@ -12,6 +12,8 @@ use core::sync::atomic::{AtomicU64, Ordering};
 const SLOTS: usize = 256;
 /// Image offsets kept from each allocating stack.
 const WORDS: usize = 12;
+/// The stack words searched for them.
+const SCANNED: usize = 512;
 
 struct Slot {
     /// The payload's address; zero for a free slot.
@@ -27,8 +29,11 @@ static BLOCKS: [Slot; SLOTS] = [const {
         words: [const { AtomicU64::new(0) }; WORDS],
     }
 }; SLOTS];
-/// Large blocks made while every slot was taken, which no line names.
+/// Large blocks made while every slot was taken, which no line names: a
+/// count of blocks made, not of live ones.
 static UNTRACKED: AtomicU64 = AtomicU64::new(0);
+/// Large blocks whose stack scan found no code offset.
+static EMPTY: AtomicU64 = AtomicU64::new(0);
 /// Blocks made or freed so far, and the count the last report saw.
 static CHANGES: AtomicU64 = AtomicU64::new(0);
 static REPORTED: AtomicU64 = AtomicU64::new(0);
@@ -66,16 +71,20 @@ fn allocated_or_freed(pointer: usize, bytes: usize, allocated: bool) {
         return;
     };
     let mut words = [0; WORDS];
-    stack_offsets(&mut words);
+    if !stack_offsets(&mut words) {
+        EMPTY.fetch_add(1, Ordering::Relaxed);
+    }
     for (word, offset) in slot.words.iter().zip(words) {
         word.store(offset, Ordering::Relaxed);
     }
     slot.bytes.store(bytes as u64, Ordering::Release);
 }
 
-/// The image offsets among the stack's words from the stack pointer to the
-/// end of its page, which is mapped: the page above may be a stack's guard.
-fn stack_offsets(out: &mut [u64; WORDS]) {
+/// The image offsets among the stack's words from the stack pointer on, at
+/// most [`SCANNED`] words: its own page, which is mapped, then the page above
+/// through a read that a fault ends, as that page may be the stack's guard.
+/// Whether any was found.
+fn stack_offsets(out: &mut [u64; WORDS]) -> bool {
     const PAGE: u64 = 4096;
     unsafe extern "C" {
         static __ImageBase: u8;
@@ -96,11 +105,30 @@ fn stack_offsets(out: &mut [u64; WORDS]) {
     unsafe {
         core::arch::asm!("mov {}, rsp", out(reg) stack, options(nomem, nostack, preserves_flags));
     }
-    let words = ((PAGE - stack as u64 % PAGE) / 8) as usize;
+    let own = ((PAGE - stack as u64 % PAGE) / 8) as usize;
     let mut kept = 0;
-    for word in 0..words {
-        // SAFETY: within the stack pointer's own page.
-        let offset = unsafe { stack.add(word).read() }.wrapping_sub(base);
+    for word in 0..SCANNED {
+        let value = if word < own {
+            // SAFETY: within the stack pointer's own page.
+            unsafe { stack.add(word).read() }
+        } else {
+            let mut value = 0u64;
+            // SAFETY: the engine's host fault handler is active (the hook is
+            // installed after it), and `value` is this frame's own; a fault
+            // ends the read with bytes unread.
+            let unread = unsafe {
+                stela_boot_core::nofault_read::read(
+                    (&raw mut value).cast(),
+                    stack.wrapping_add(word).cast(),
+                    8,
+                )
+            };
+            if unread != 0 {
+                break;
+            }
+            value
+        };
+        let offset = value.wrapping_sub(base);
         if offset.wrapping_sub(code) < size {
             out[kept] = offset;
             kept += 1;
@@ -109,9 +137,10 @@ fn stack_offsets(out: &mut [u64; WORDS]) {
             }
         }
     }
+    kept != 0
 }
 
-/// `HEAP LARGE blocks=31 bytes=612M untracked=0`, then each live block,
+/// `HEAP LARGE blocks=31 bytes=612M untracked=0 empty_stacks=0`, then each live block,
 /// largest first, as `HEAP LARGE 64M stack 0x… 0x…`: every
 /// [`REPORT_CALLS`]th call, when blocks were made or freed since the last
 /// report.
@@ -138,7 +167,7 @@ pub(super) fn report() {
         })
         .filter(|&(bytes, _)| bytes != 0)
         .collect();
-    blocks.sort_by(|a, b| b.0.cmp(&a.0));
+    blocks.sort_unstable_by_key(|&(bytes, _)| core::cmp::Reverse(bytes));
     output::arguments(format_args!("{}\n", summary(&blocks)));
     for (bytes, words) in &blocks {
         output::arguments(format_args!("{}\n", line(*bytes, words)));
@@ -148,10 +177,11 @@ pub(super) fn report() {
 fn summary(blocks: &[(u64, [u64; WORDS])]) -> String {
     let bytes: u64 = blocks.iter().map(|&(bytes, _)| bytes).sum();
     format!(
-        "HEAP LARGE blocks={} bytes={}M untracked={}",
+        "HEAP LARGE blocks={} bytes={}M untracked={} empty_stacks={}",
         blocks.len(),
         bytes >> 20,
-        UNTRACKED.load(Ordering::Relaxed)
+        UNTRACKED.load(Ordering::Relaxed),
+        EMPTY.load(Ordering::Relaxed)
     )
 }
 
