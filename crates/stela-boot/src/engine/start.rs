@@ -1382,6 +1382,9 @@ fn open_gpus(
         #[cfg(feature = "nvk")]
         heap_bytes,
     };
+    // Store the claim's lines before Linux starts, so the USB keeps them
+    // even when the start never returns.
+    output::flush_log();
     let opening = host::rdtsc();
     let opened = gpu::open(machine, claimed);
     // `GPU START claim_ms=… linux_ms=… probe_ms=… total_ms=…`: claiming the
@@ -2746,15 +2749,17 @@ fn start_devices(
                     count(disks, "disk", "disks")
                 ),
             });
+            // Before the GPU starts, so the USB keeps its step and how it
+            // ended, or where it stopped.
+            if let Some(log) = log {
+                crate::log_file::resume(log);
+            }
             if options.boots_macos()
                 && open_gpus(work, mmio, remappers, handoff, host_firmware, gpus)
             {
                 gpu::serve(handoff.screen.map_or((0, 0), |screen| screen.resolution()));
             }
             disks.profile_callbacks(options.profile);
-            if let Some(log) = log {
-                crate::log_file::resume(log);
-            }
             if let Some(store) = store {
                 translations::set_partition(store);
             }
