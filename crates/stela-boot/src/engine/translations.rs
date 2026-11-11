@@ -1074,7 +1074,7 @@ fn write_safely(
     let fresh = layout.changed().is_none();
     let mut writing = Checkpoint::plan(
         layout,
-        checkpoint::PackFile::len(&file),
+        checkpoint::PackFile::file_bytes(&file),
         checkpoint::PackFile::block(&file),
         fresh,
         repair,

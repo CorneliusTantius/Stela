@@ -59,7 +59,7 @@ pub trait PackFile {
     /// The device block size: a power of two of at most [`FOOTER_BYTES`].
     fn block(&self) -> u64;
     /// The file's bytes: the pack may use them all but the footer's.
-    fn len(&self) -> u64;
+    fn file_bytes(&self) -> u64;
     fn write(&mut self, at: u64, data: &[u8]) -> Result<(), Self::Error>;
     fn flush(&mut self) -> Result<(), Self::Error>;
 }
@@ -157,7 +157,7 @@ impl Checkpoint {
                 // never leads to a backup whose records this write moves.
                 ops.push(Op::Bytes(footer_at, Vec::new()));
                 ops.push(Op::Flush);
-                vec![index..layout.bytes()]
+                core::iter::once(index..layout.bytes()).collect()
             }
             None => return Err(Refused::Relayout),
         };
@@ -376,7 +376,7 @@ impl PackFile for ExtentFile<'_> {
         u64::from(self.device.identity().block_size)
     }
 
-    fn len(&self) -> u64 {
+    fn file_bytes(&self) -> u64 {
         self.extents.iter().map(|extent| extent.bytes).sum()
     }
 
@@ -406,7 +406,7 @@ impl PackFile for ExtentFile<'_> {
             start += extent.bytes;
         }
         Err(super::WriteError::Small {
-            file: self.len(),
+            file: self.file_bytes(),
             pack: at + data.len() as u64,
         })
     }
@@ -440,7 +440,7 @@ mod tests {
         fn block(&self) -> u64 {
             BLOCK
         }
-        fn len(&self) -> u64 {
+        fn file_bytes(&self) -> u64 {
             self.durable.len() as u64
         }
         fn write(&mut self, at: u64, data: &[u8]) -> Result<(), Cut> {
