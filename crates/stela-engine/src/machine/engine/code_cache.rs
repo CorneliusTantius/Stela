@@ -49,16 +49,6 @@ fn fetched_leaf_bits(base: u64, size: u64) -> [(usize, u64); 2] {
     })
 }
 
-/// The bits of [`Machine::global_leaves`] for the leaf of `size` bytes at
-/// `base`.
-fn global_leaf_bits(base: u64, size: u64) -> [(usize, u64); 2] {
-    let hash = (base | u64::from(size.trailing_zeros())).wrapping_mul(0xc2b2_ae3d_27d4_eb4f);
-    [hash >> 40, hash >> 14].map(|bits| {
-        let bit = bits as usize & (GLOBAL_LEAVES - 1);
-        (bit / 64, 1 << (bit % 64))
-    })
-}
-
 /// Whether `slot`'s bit is set in `bits`.
 fn bit_set(bits: &[u64], slot: u32) -> bool {
     bits.get(slot as usize / 64)
@@ -279,9 +269,6 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.private_fetches[half] = false;
             if half == 0 {
                 self.lower_globals = NO_GLOBALS;
-                if core::mem::take(&mut self.global_sizes) != 0 {
-                    self.global_leaves.fill(0);
-                }
             }
         }
     }
@@ -307,45 +294,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
         if half == 0 && global {
             let (first, last) = self.lower_globals;
             self.lower_globals = (first.min(pc), last.max(pc.saturating_add(size)));
-            if self.global_leaves.is_empty() {
-                self.global_leaves = vec![0; GLOBAL_LEAVES / 64];
-            }
-            for (word, bit) in global_leaf_bits(pc & !(leaf - 1), leaf) {
-                self.global_leaves[word] |= bit;
-            }
-            self.global_sizes |= leaf;
         }
-    }
-
-    /// Whether a lower-half fetch since its contexts were last forgotten may
-    /// have translated through a global leaf that holds or overlaps
-    /// `first..=last`: no TLBI by VA and ASID of the span reaches another
-    /// ASID's entries otherwise (Arm `TLBIMatch`: a non-global entry
-    /// matches only its own ASID).
-    fn global_span(&self, first: u64, last: u64) -> bool {
-        let (global_first, global_last) = self.lower_globals;
-        if last < global_first || first > global_last {
-            return false;
-        }
-        let mut sizes = self.global_sizes;
-        while sizes != 0 {
-            let size = sizes.isolate_lowest_one();
-            sizes &= sizes - 1;
-            let (start, end) = (first & !(size - 1), last | (size - 1));
-            let leaves = (end - start) / size;
-            if leaves >= SCANNED_LEAVES {
-                return true;
-            }
-            let held = (0..=leaves).any(|leaf| {
-                global_leaf_bits(start + leaf * size, size)
-                    .iter()
-                    .all(|&(word, bit)| self.global_leaves[word] & bit != 0)
-            });
-            if held {
-                return true;
-            }
-        }
-        false
     }
 
     /// Whether a fetch of `half` translated through the leaf of `size` bytes
@@ -410,17 +359,26 @@ impl<H: Host, D: Devices> Machine<H, D> {
     }
 
     /// Drop the ITLB entries of the pages a TLBI by VA reaches
-    /// ([`Self::fetched_span`]): those of every context, or of `asid`'s
-    /// contexts alone while no global page was fetched in its span of the
-    /// lower half, which only such a page shares. A process's exit reaches
-    /// the shared libraries this way, which every other process's entries
-    /// still hold good for. The ITLB finds the entries of the span's pages
-    /// in every context from its index of where each granule's went
-    /// (`chain::LookupTable`), and keeps those of contexts of other ASIDs,
-    /// whatever salt they share. Contexts stay: the hot pages of one that
-    /// went would each cost an exit on every PE that runs them. The block
-    /// table's entries stay too: a page translated anew finds them again by
-    /// its frame.
+    /// ([`Self::fetched_span`]), as Arm `TLBIMatch` selects TLB entries:
+    /// - without an ASID (VAAE1, VAALE1, RVAAE1, RVAALE1 and their IS/OS
+    ///   forms, and every upper-half span): those of every context;
+    /// - with `asid` (VAE1, VALE1, RVAE1, RVALE1 and their IS/OS forms) in
+    ///   the lower half: those of `asid`'s contexts, and in any context
+    ///   those whose walk ended in a global leaf
+    ///   ([`chain::LookupEntry::is_global_page`]), which match every ASID.
+    ///   A non-global entry of another ASID stays. A context's ASID is the
+    ///   one its regime's TCR.A1 selects from TTBR0 or TTBR1
+    ///   ([`mmu::current_asid`]), both of which its key holds, with the
+    ///   8 high bits ignored as for TCR.AS=0 (more entries go, never
+    ///   fewer).
+    ///
+    /// A process's exit reaches its own pages this way and leaves the other
+    /// processes' private pages. The ITLB finds the entries of the span's
+    /// pages in every context from its index of where each granule's went
+    /// (`chain::LookupTable`). Contexts stay: the hot pages of one that went
+    /// would each cost an exit on every PE that runs them. The block table's
+    /// entries stay too: a page translated anew finds them again by its
+    /// frame.
     pub(super) fn forget_lookups(&mut self, reach: mmu::tlbi::Reach, asid: Option<u16>) {
         let (first, last) = match reach {
             mmu::tlbi::Reach::Nothing => return,
@@ -432,25 +390,25 @@ impl<H: Host, D: Devices> Machine<H, D> {
             let Some((first, last)) = self.fetched_span(half, first, last) else {
                 continue;
             };
-            let scoped = asid.filter(|_| half == 0 && !self.global_span(first, last));
-            let source = match scoped {
-                Some(_) => ItlbSource::DropAsid,
-                None => ItlbSource::DropEvery,
-            };
+            let scoped = asid.filter(|_| half == 0);
             let spaces = &self.spaces[half];
             let (ghosts, statistics) = (&mut self.itlb_ghosts, &mut self.statistics);
             let forget = |entry: &chain::LookupEntry| {
-                let reached = scoped.is_none_or(|asid| {
-                    spaces
+                let source = match scoped {
+                    None => Some(ItlbSource::DropEvery),
+                    Some(_) if entry.is_global_page() => Some(ItlbSource::DropEvery),
+                    Some(asid) => spaces
                         .live(entry.key)
                         .is_some_and(|space| same_asid(space, asid))
-                });
-                if reached {
-                    statistics.itlb_drops[1] += 1;
-                    statistics.itlb_sources[source as usize] += 1;
-                    super::compilation::note_itlb_ghost(ghosts, entry, ItlbMiss::Forgotten);
-                }
-                reached
+                        .then_some(ItlbSource::DropAsid),
+                };
+                let Some(source) = source else {
+                    return false;
+                };
+                statistics.itlb_drops[1] += 1;
+                statistics.itlb_sources[source as usize] += 1;
+                super::compilation::note_itlb_ghost(ghosts, entry, ItlbMiss::Forgotten);
+                true
             };
             if self.itlb.forget_range_where(first..=last, forget) {
                 self.statistics.lookup_forgets[2] += 1;
