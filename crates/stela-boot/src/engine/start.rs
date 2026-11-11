@@ -1405,7 +1405,10 @@ fn open_gpus(
             true
         }
         Err(error) => {
-            crate::status::warn(&format!("the GPU could not start: {error}"));
+            crate::status::warn(&stela_boot_core::gpu_status::failed(
+                &found,
+                &format!("{error}"),
+            ));
             false
         }
     }

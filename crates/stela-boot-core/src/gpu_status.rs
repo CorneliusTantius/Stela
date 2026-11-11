@@ -36,6 +36,33 @@ pub fn refused(address: &str, device: u16, reason: Reason) -> String {
     }
 }
 
+/// The screen line for the NVIDIA GPUs among `adapters` that were claimed
+/// but did not start, `error` naming the step that ended the start.
+pub fn failed(adapters: &[Adapter], error: &str) -> String {
+    let named: Vec<String> = adapters
+        .iter()
+        .filter(|found| found.vendor == Vendor::Nvidia)
+        .map(|found| match nvidia_chip(found.device) {
+            Some(chip) => format!(
+                "NVIDIA {chip} GPU at {} (device {:04x})",
+                found.address, found.device
+            ),
+            None => format!(
+                "NVIDIA GPU at {} (device {:04x})",
+                found.address, found.device
+            ),
+        })
+        .collect();
+    let gpu = match named.is_empty() {
+        true => String::from("NVIDIA GPU"),
+        false => named.join(" and "),
+    };
+    format!(
+        "the {gpu} could not start: {error}. macOS starts without it; the boot log on this USB \
+         says why"
+    )
+}
+
 /// How the screen names a display adapter: its maker, PCI address and
 /// device ID.
 pub fn adapter(adapter: &Adapter) -> String {
@@ -136,5 +163,29 @@ mod tests {
              ported to Stela"
         );
         assert!(adapter(&at(1, Vendor::Other(0x1af4), 0x1050)).contains("PCI vendor 1af4"));
+    }
+
+    #[test]
+    fn a_gpu_that_failed_to_start_is_named_with_its_step() {
+        use stela_drivers::bus::pci::Address;
+        let at = |bus, vendor, device| Adapter {
+            address: Address {
+                segment: 0,
+                bus,
+                device: 0,
+                function: 0,
+            },
+            vendor,
+            device,
+            class: [3, 0, 0],
+        };
+        // An RTX 4060 (AD107) beside an Intel iGPU.
+        let found = [at(0, Vendor::Intel, 0xa780), at(1, Vendor::Nvidia, 0x2882)];
+        assert_eq!(
+            failed(&found, "GPU startup exceeded its deadline"),
+            "the NVIDIA ad107 GPU at 0000:01:00.0 (device 2882) could not start: GPU startup \
+             exceeded its deadline. macOS starts without it; the boot log on this USB says why"
+        );
+        assert!(failed(&[], "x").starts_with("the NVIDIA GPU could not start: x."));
     }
 }
