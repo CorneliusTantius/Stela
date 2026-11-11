@@ -6981,6 +6981,54 @@ fn stored_reads_complete_natively_from_the_live_register() {
     assert_eq!(fp.host.installed.last(), Some(&thunk.code));
 }
 
+/// APCTL_EL1, which the kernel reads before each write around its PAC
+/// sections, reads its level's word as stored: a plain read opens a stored
+/// cell on that word, which sees later writes (themselves still exits, which
+/// reopen the PAC service), and each level's cell names its own word.
+#[test]
+fn apctl_reads_complete_natively_from_the_levels_word() {
+    const ADD: u32 = 0x9100_0400; // add x0, x0, #1
+    const MRS: u32 = 0xd53c_f088; // mrs x8, apctl_el1
+    const MSR: u32 = 0xd51c_f089; // msr apctl_el1, x9
+    let mut machine = machine(&[ADD, MRS, ADD]);
+    let base = machine.cpu.pc;
+    machine.host.exits = vec![NativeExit::Exit {
+        next_pc: base + 8,
+        kind: ExitKind::Fallthrough as u64,
+    }];
+    machine.step().unwrap();
+    assert_eq!(
+        machine.stored_reads.to_vec(),
+        [registers::encodings::APCTL_EL1]
+    );
+    let index = MIRRORED.len();
+    let thunk = register_read::stored_thunk(GuestAddress(base + 4), 8, cell_place(index));
+    assert_eq!(machine.host.installed.last(), Some(&thunk.code));
+    for el in [2, 1] {
+        machine.cpu.pstate = Pstate::reset(el);
+        machine.derived_changed();
+        let level = usize::from(el) - 1;
+        machine.cpu.apple.apctl[level] = 0x11 + level as u64;
+        machine.cpu.pc = base + 4;
+        machine.system_instruction(MRS).unwrap();
+        assert_eq!(machine.cpu.state.x[8], 0x11 + level as u64);
+        let open = machine.mirrors[index];
+        let word = &machine.cpu.apple.apctl[level] as *const u64 as u64;
+        assert_eq!(
+            open,
+            register_read::Cell {
+                readable: 1,
+                value: word
+            }
+        );
+        machine.cpu.state.x[9] = 0x10;
+        machine.system_instruction(MSR).unwrap();
+        assert_eq!(machine.mirrors[index], open);
+        // SAFETY: the PE's APCTL word, read as the thunk reads it.
+        assert_eq!(unsafe { *(open.value as *const u64) }, 0x10);
+    }
+}
+
 #[test]
 fn mirrored_reads_complete_natively_from_the_open_cell() {
     const ADD: u32 = 0x9100_0400; // add x0, x0, #1

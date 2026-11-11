@@ -964,6 +964,8 @@ impl Cpu {
         match self.apple(encoding)?.ok()? {
             Apple::SprrPerm(index) => Some(&self.apple.sprr_perm[index] as *const u64 as u64),
             Apple::SprrFields(which) => Some(&self.apple.sprr_fields[which] as *const u64 as u64),
+            // A read returns the level's word as stored (`Apple::read`).
+            Apple::ApControl(level) => Some(&self.apple.apctl[level] as *const u64 as u64),
             _ => None,
         }
     }
