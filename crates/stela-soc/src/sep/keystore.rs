@@ -374,7 +374,9 @@ impl KeyStore {
         result
     }
 
-    /// [`Self::begin`], then any derivation to its end.
+    /// [`Self::begin`], then any derivation to its end, for tests: sepOS
+    /// runs one bounded slice per DMA step instead.
+    #[cfg(test)]
     pub fn request(
         &mut self,
         frame: Frame,
