@@ -88,6 +88,11 @@ pub(super) enum Kind {
 
 impl Kind {
     pub(super) fn of(function: &Function) -> Option<Self> {
+        Self::of_identity(&function.identity())
+    }
+
+    /// [`Self::of`] from a function's copied header fields.
+    pub(super) fn of_identity(function: &crate::bus::pci::Identity) -> Option<Self> {
         if vmd::Profile::identify(function.vendor, function.device).is_ok() {
             Some(Self::Vmd)
         } else if tg3::candidate(function.vendor, function.device, function.class) {
@@ -116,7 +121,7 @@ impl Kind {
             && bcm4377::Chip::of_device(function.device).is_some()
         {
             Some(Self::Bcm4377)
-        } else if crate::audio::hda::pci::identify(function).is_ok() {
+        } else if crate::audio::hda::pci::identify_identity(function).is_ok() {
             Some(Self::Hda)
         } else if crate::bus::thunderbolt::controller::Profile::identify(
             function.vendor,
@@ -128,6 +133,24 @@ impl Kind {
             Some(Self::Usb4)
         } else {
             None
+        }
+    }
+
+    /// The driver this kind attaches with, as the boot log names it.
+    pub(super) fn driver(self) -> &'static str {
+        match self {
+            Self::Tg3 => "tg3 Ethernet",
+            Self::Aqtion => "atlantic Ethernet",
+            Self::Vmd => "Intel VMD storage",
+            Self::Sfh => "AMD sensor hub",
+            Self::Ish => "Intel sensor hub",
+            Self::IntelWifi => "iwlwifi Wi-Fi (with --wifi)",
+            Self::MediatekWifi => "mt7925 Wi-Fi (with --wifi)",
+            Self::RealtekWifi => "rtw88 Wi-Fi (with --wifi)",
+            Self::IntelBluetooth => "Intel PCIe Bluetooth",
+            Self::Bcm4377 => "bcm4377 Bluetooth",
+            Self::Hda => "HD Audio",
+            Self::Usb4 => "USB4/Thunderbolt NHI",
         }
     }
 }

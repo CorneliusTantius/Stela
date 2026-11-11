@@ -116,6 +116,11 @@ impl Bus for Host {
 
 /// Whether `function` is an i801 SMBus host.
 pub(super) fn matches(function: &crate::bus::pci::Function) -> bool {
+    matches_identity(&function.identity())
+}
+
+/// [`matches`] from a function's copied header fields.
+pub(super) fn matches_identity(function: &crate::bus::pci::Identity) -> bool {
     function.class[..2] == [0x0c, 0x05]
         && ControllerInfo::from_pci_id(function.vendor, function.device).is_some()
 }

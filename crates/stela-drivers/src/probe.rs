@@ -457,6 +457,82 @@ pub fn claims_identity(function: &crate::bus::pci::Identity) -> bool {
         || usb::handoff::Kind::of(function.class).is_some()
 }
 
+/// What [`probe_with_provider`] will do with `function`, for a boot log
+/// line written before boot services end: the driver that attaches it, or
+/// why none does. `displays` are the slots whose function 0 is a display
+/// controller. Options decided after the census (a Wi-Fi network, the
+/// mount's native services) are named where they apply.
+pub fn plan(
+    function: &crate::bus::pci::Identity,
+    displays: &[Address],
+) -> alloc::borrow::Cow<'static, str> {
+    use alloc::borrow::Cow;
+    let class = function.class;
+    if class[..2] == [2, 0x80]
+        && let Some(why) = crate::net::wifi::unsupported::reason(function.vendor, function.device)
+    {
+        return Cow::Owned(alloc::format!("unsupported: {why}"));
+    }
+    if class[0] == 0x03 {
+        return Cow::Borrowed("GPU");
+    }
+    #[cfg(feature = "native-acpi")]
+    if smbus::matches_identity(function) {
+        return Cow::Borrowed("i801 SMBus");
+    }
+    let handoff = match usb::handoff::Kind::of(class) {
+        Some(usb::handoff::Kind::Ehci) => return Cow::Borrowed("EHCI USB"),
+        Some(_) if class != xhci::CLASS => {
+            return Cow::Borrowed(
+                "taken from firmware, not driven: UHCI or OHCI USB host controller",
+            );
+        }
+        Some(_) => true,
+        None => false,
+    };
+    if let Some(kind) = native::Kind::of_identity(function) {
+        return Cow::Borrowed(kind.driver());
+    }
+    let driver = if virtio::matches_identity(function) {
+        "virtio-blk"
+    } else if class == nvme::CLASS {
+        "NVMe"
+    } else if handoff {
+        "xHCI USB"
+    } else if net::virtio::matches_identity(function) {
+        "virtio-net"
+    } else if net::igc::matches_identity(function) {
+        "igc Ethernet"
+    } else if net::e1000e::matches_identity(function) {
+        "e1000e Ethernet"
+    } else if pch::matches_identity(function) {
+        "Intel PCH Ethernet"
+    } else if net::igb::matches_identity(function) {
+        "igb Ethernet"
+    } else if net::alx::matches_identity(function) {
+        "alx Ethernet"
+    } else if net::atl1c::matches_identity(function) {
+        "atl1c Ethernet"
+    } else if realtek::matches_identity(function) {
+        "r8169 Ethernet"
+    } else if input::virtio::matches_identity(function) {
+        "virtio-input"
+    } else if rtsx::matches_identity(function) {
+        "Realtek card reader"
+    } else if sdhci::matches_identity(function) {
+        "SDHCI card reader"
+    } else if ahci::matches_identity(function) {
+        "AHCI SATA"
+    } else if class[..2] == [6, 4] {
+        "PCI bridge"
+    } else if let Some(why) = unclaimed(class, function.address, displays) {
+        return Cow::Owned(alloc::format!("unsupported: {why}"));
+    } else {
+        "not driven"
+    };
+    Cow::Borrowed(driver)
+}
+
 /// An HD Audio function beside a display controller's function 0 is that
 /// GPU's HDMI/DP audio, as Linux `get_bound_vga` finds it. No HDMI/DP codec
 /// profile here serves one outside the admitted identities.
@@ -1987,6 +2063,83 @@ mod tests {
     };
     use alloc::format;
     use sha2::{Digest, Sha256};
+
+    fn identity(
+        bus: u8,
+        function: u8,
+        vendor: u16,
+        device: u16,
+        class: u32,
+    ) -> crate::bus::pci::Identity {
+        crate::bus::pci::Identity {
+            address: Address {
+                segment: 0,
+                bus,
+                device: 0,
+                function,
+            },
+            vendor,
+            device,
+            class: [(class >> 16) as u8, (class >> 8) as u8, class as u8],
+        }
+    }
+
+    #[test]
+    fn plan_names_the_driver_of_common_desktop_functions() {
+        let gpu = identity(1, 0, 0x10de, 0x2882, 0x03_00_00);
+        let displays = [gpu.address];
+        for (function, expected) in [
+            (identity(0x0b, 0, 0x1022, 0x149c, 0x0c_03_30), "xHCI USB"),
+            (identity(0x0c, 0, 0x1022, 0x7901, 0x01_06_01), "AHCI SATA"),
+            (identity(0x04, 0, 0x144d, 0xa808, 0x01_08_02), "NVMe"),
+            (gpu, "GPU"),
+            (identity(0x00, 1, 0x1022, 0x1483, 0x06_04_00), "PCI bridge"),
+            (identity(0x00, 0, 0x1022, 0x1480, 0x06_00_00), "not driven"),
+            (
+                identity(0x05, 0, 0x1106, 0x0571, 0x01_01_80),
+                "unsupported: IDE storage controller",
+            ),
+        ] {
+            assert_eq!(
+                plan(&function, &displays),
+                expected,
+                "{:?}",
+                function.address
+            );
+        }
+        // The GPU's own HDMI audio function, beside its function 0.
+        let hdmi = identity(1, 1, 0x1234, 0x0001, 0x04_03_00);
+        assert!(plan(&hdmi, &displays).starts_with("unsupported: HDMI/DP audio"));
+        assert!(plan(&hdmi, &[]).starts_with("unsupported: HD Audio controller"));
+    }
+
+    #[test]
+    fn plan_names_a_driver_exactly_for_the_functions_claimed() {
+        let functions = [
+            identity(0x0b, 0, 0x1022, 0x149c, 0x0c_03_30),
+            identity(0x0b, 1, 0x1022, 0x43d5, 0x0c_03_30),
+            identity(0x0c, 0, 0x1022, 0x7901, 0x01_06_01),
+            identity(0x04, 0, 0x144d, 0xa808, 0x01_08_02),
+            identity(0x0d, 0, 0x10ec, 0x8168, 0x02_00_00),
+            identity(0x0e, 0, 0x8086, 0x15f3, 0x02_00_00),
+            identity(0x0f, 0, 0x1022, 0x1487, 0x04_03_00),
+            identity(0x10, 0, 0x1af4, 0x1042, 0x01_00_00),
+            identity(0x11, 0, 0x8086, 0x1e2d, 0x0c_03_20),
+            identity(0x00, 0, 0x1022, 0x1480, 0x06_00_00),
+            identity(0x12, 0, 0x1234, 0x5678, 0x0c_03_10),
+        ];
+        for function in functions {
+            let named = plan(&function, &[]);
+            // A USB host taken from firmware has its registers mapped too.
+            let driven = !named.starts_with("unsupported") && named != "not driven";
+            assert_eq!(
+                driven,
+                claims_identity(&function),
+                "{:?} {named}",
+                function.address
+            );
+        }
+    }
 
     #[test]
     fn ehci_uses_native_preparation_only_after_companion_handoff() {
