@@ -736,8 +736,7 @@ pub const fn dispatch_slot(pc: u64) -> usize {
 /// could make a table probe of the target find another block or none. It
 /// grows when the block table forgets an entry or puts another in its place
 /// for the same PC and key ([`LookupTable`] holds each PE's cache), when
-/// the ITLB is cleared, and when the PE's owner changes its tables or
-/// acknowledged interruption. Another context gives the same key again
+/// the ITLB is cleared, and when the PE's owner changes its tables. Another context gives the same key again
 /// while no page of its half dropped or changed. A page of the ITLB dropping or
 /// changing grows only its half's drop epoch, which only the PE's owner
 /// changes, never while its native code runs. A capacity eviction from either table is

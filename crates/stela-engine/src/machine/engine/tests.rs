@@ -9093,7 +9093,7 @@ fn host_work_holds_the_shared_count_only_for_a_pe_stopped_in_the_kernel() {
 
 /// A PE's dispatch cache goes stale at every change its probes do not
 /// check: the board's block table and the PE's ITLB hold it, and the
-/// owner's table and acknowledgement changes grow its generation.
+/// owner's table changes grow its generation.
 #[test]
 fn dispatch_caches_follow_their_tables_and_owner() {
     const RET: u32 = 0xd65f_03c0;
@@ -9114,7 +9114,7 @@ fn dispatch_caches_follow_their_tables_and_owner() {
     machine.chain.set_contexts([contexts[1], contexts[0]]);
     assert_eq!(cache.generation(), held, "contexts");
     machine.chain.acknowledge_interrupt(0);
-    grew("acknowledgement");
+    assert_eq!(cache.generation(), held, "acknowledgement");
     machine.chain.set_table(
         machine.code.table.address(),
         machine.itlb.address(),

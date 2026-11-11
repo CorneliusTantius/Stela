@@ -146,9 +146,10 @@ impl Owner {
             core::ptr::addr_of_mut!((*self.storage.control.get()).observed_interrupt_epoch)
                 .write(epoch.min(u64::MAX - 1));
         }
-        // A dispatch cache slot is good only while the epoch is what it was
-        // when a table probe, which needs it acknowledged, filled it.
-        self.storage.dispatch.invalidate();
+        // No dispatch cache change: a slot's tag adds the epoch it was
+        // filled at, when the table probe saw it acknowledged; generation
+        // and epoch only grow and the acknowledged epoch never passes the
+        // epoch, so a slot matches only while that epoch is acknowledged.
     }
     /// The epoch the owner last acknowledged: every notification up to it
     /// has been drained ([`Self::acknowledge_interrupt`]).

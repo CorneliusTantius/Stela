@@ -304,9 +304,8 @@ fn dispatch_caches_complete_transfers_as_table_probes() {
                 }
                 12 => epoch += 1,
                 13..=20 if observed != epoch => {
-                    // An acknowledgement, which makes the cache stale.
+                    // An acknowledgement, which the slots' tags follow.
                     observed = epoch;
-                    cache.invalidate();
                 }
                 _ => {}
             }
