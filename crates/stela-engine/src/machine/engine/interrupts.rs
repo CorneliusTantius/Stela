@@ -519,3 +519,81 @@ impl<H: Host, D: Devices> Machine<H, D> {
         interrupt_pending(&self.cpu, lines)
     }
 }
+
+#[cfg(test)]
+mod core_count_tests {
+    use super::super::tests::{FakeHost, board};
+    use super::super::*;
+    use crate::machine::aon::{CYCLES, CoreActivity, INSTRUCTIONS};
+    use crate::machine::impdef;
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+
+    /// A board whose PE's first two core performance counters are words
+    /// of its own, as `platform::apple::core_counters` keeps them.
+    struct Counters(Box<[AtomicU64; 2]>);
+
+    impl Devices for Counters {
+        fn read(&mut self, _: usize, _: u64, _: u8, _: u64) -> Result<u64, DeviceError> {
+            Err(DeviceError::NoDevice)
+        }
+        fn write(&mut self, _: usize, _: u64, _: u8, _: u64, _: u64) -> Result<(), DeviceError> {
+            Err(DeviceError::NoDevice)
+        }
+        fn lines(&mut self, _: usize, _: u64) -> Lines {
+            Lines::default()
+        }
+        fn register_storage(&mut self, _: usize, encoding: Encoding) -> Option<u64> {
+            let slot = impdef::AON_COUNTERS[..2]
+                .iter()
+                .position(|&counter| counter == encoding)?;
+            Some(self.0[slot].as_ptr() as u64)
+        }
+    }
+
+    fn write(machine: &mut Machine<FakeHost, Counters>, encoding: Encoding, value: u64) {
+        let entry = impdef::lookup(encoding, crate::machine::test_chip()).unwrap();
+        machine.cpu.apple.impdef.write(entry, value).unwrap();
+    }
+
+    #[test]
+    fn monitor_updates_add_core_counts_to_the_boards_counters() {
+        let counters = Counters(Box::new([AtomicU64::new(7), AtomicU64::new(0)]));
+        let mut machine = board(&[], counters, Vec::new());
+        machine.cpu.aon = CoreActivity::new(24_000_000 * 100, 24_000_000);
+        machine.sync_monitor();
+        let read = |machine: &Machine<FakeHost, Counters>| {
+            [
+                machine.devices.0[0].load(Relaxed),
+                machine.devices.0[1].load(Relaxed),
+            ]
+        };
+        assert_eq!(read(&machine), [7, 0], "nothing counts before the enable");
+        write(&mut machine, impdef::AON_SELECT_0, CYCLES);
+        write(&mut machine, impdef::AON_SELECT_1, INSTRUCTIONS);
+        write(&mut machine, impdef::AON_ENABLE, 1);
+        machine.host.now = 1000;
+        machine.cpu.retired = 50;
+        machine.sync_monitor();
+        let enabled = read(&machine);
+        machine.host.now = 2000;
+        machine.cpu.retired = 80;
+        machine.sync_monitor();
+        let later = read(&machine);
+        assert!(
+            later[0] > enabled[0],
+            "cycles grow with time: {enabled:?} {later:?}"
+        );
+        assert_eq!(later[1] - enabled[1], 30, "instructions as retired");
+        write(&mut machine, impdef::AON_ENABLE, 0);
+        machine.sync_monitor();
+        let stopped = read(&machine);
+        machine.host.now = 3000;
+        machine.cpu.retired = 90;
+        machine.sync_monitor();
+        assert_eq!(
+            read(&machine),
+            stopped,
+            "clearing the enable stops counting"
+        );
+    }
+}
