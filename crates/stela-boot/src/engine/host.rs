@@ -1013,7 +1013,8 @@ impl State {
     /// half kept for `to`, if any. Return the views the caller must flush.
     fn switch_lower(&mut self, from: (u64, u64), to: (u64, u64)) -> [bool; ROOTS] {
         self.lower_switches += 1;
-        let mut entries = Vec::new();
+        // XNU switches thousands of times a second: reuse a list's storage.
+        let mut entries = self.kept.buffer();
         let mut changed = 0;
         let lower_roots = core::mem::take(&mut self.lower_roots);
         for entry in self.lower_entries() {
@@ -1045,6 +1046,7 @@ impl State {
                 changed |= self.lower_root_bit(root);
             }
             self.extents[LOWER] = half.extents;
+            self.kept.recycle(half.entries);
         }
         if changed == 0 {
             [false; ROOTS]

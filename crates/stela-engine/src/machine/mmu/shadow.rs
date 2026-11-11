@@ -152,7 +152,14 @@ pub struct Kept {
     halves: Vec<KeptHalf>,
     /// Switches so far, which order the halves for replacement.
     switches: u64,
+    /// Emptied entry lists whose storage the next switches reuse
+    /// ([`Kept::buffer`]), at most [`SPARE_BUFFERS`]: a switch allocates
+    /// none once the halves are full.
+    spare: Vec<Vec<(u64, usize, u64)>>,
 }
+
+/// The emptied entry lists [`Kept`] keeps for reuse at most.
+const SPARE_BUFFERS: usize = 2;
 
 /// The contexts whose lower halves [`Kept`] holds at most. A replaced half
 /// frees no frames (they return only when the lower half is emptied), and
@@ -177,6 +184,21 @@ impl Kept {
         Self {
             halves: Vec::new(),
             switches: 0,
+            spare: Vec::new(),
+        }
+    }
+
+    /// An empty list for the entries a switch detaches, with the storage of
+    /// one an earlier switch gave back when there is one.
+    pub fn buffer(&mut self) -> Vec<(u64, usize, u64)> {
+        self.spare.pop().unwrap_or_default()
+    }
+
+    /// Give back the storage of an entry list a switch is done with.
+    pub fn recycle(&mut self, mut entries: Vec<(u64, usize, u64)>) {
+        if self.spare.len() < SPARE_BUFFERS && entries.capacity() != 0 {
+            entries.clear();
+            self.spare.push(entries);
         }
     }
 
@@ -200,6 +222,7 @@ impl Kept {
             .position(|half| half.key == to)
             .map(|index| self.halves.swap_remove(index));
         if entries.is_empty() {
+            self.recycle(entries);
             return found;
         }
         let outgoing = KeptHalf {
@@ -214,7 +237,8 @@ impl Kept {
         if self.halves.len() == KEPT
             && let Some(oldest) = (0..self.halves.len()).min_by_key(|&i| self.halves[i].used)
         {
-            self.halves.swap_remove(oldest);
+            let evicted = self.halves.swap_remove(oldest);
+            self.recycle(evicted.entries);
         }
         self.halves.push(outgoing);
         found
@@ -602,5 +626,41 @@ mod tests {
                 .unwrap();
             assert_eq!(half.entries, [(0x1000, 0, to + 1)]);
         }
+    }
+
+    /// Entry lists given back, empty ones a switch did not keep and the
+    /// evicted ones, are handed out again with their storage, emptied, so a
+    /// steady stream of switches stops allocating.
+    #[test]
+    fn switches_reuse_the_storage_of_entry_lists_given_back() {
+        let mut kept = Kept::new();
+        let key = |n: u64| (n << 12, 0);
+        let mut empty = kept.buffer();
+        assert_eq!(empty.capacity(), 0, "nothing to reuse yet");
+        empty.reserve(4);
+        let storage = empty.as_ptr();
+        assert_eq!(kept.switch(key(0), empty, Extents::new(), key(1)), None);
+        let reused = kept.buffer();
+        assert!(reused.is_empty());
+        assert_eq!(reused.as_ptr(), storage, "the empty list's storage");
+        kept.recycle(reused);
+
+        // Fill the halves, then one more evicts the oldest: its list
+        // comes back for the next switch.
+        for n in 0..KEPT as u64 {
+            let mut entries = kept.buffer();
+            entries.push((0x1000, 0, n + 1));
+            kept.switch(key(n), entries, Extents::new(), key(99));
+        }
+        let mut entries = kept.buffer();
+        entries.push((0x1000, 0, 100));
+        kept.switch(key(KEPT as u64), entries, Extents::new(), key(99));
+        let evicted = kept.buffer();
+        assert!(evicted.is_empty() && evicted.capacity() != 0);
+        // At most `SPARE_BUFFERS` are kept.
+        for _ in 0..4 {
+            kept.recycle(alloc::vec![(0, 0, 0)]);
+        }
+        assert_eq!(kept.spare.len(), SPARE_BUFFERS);
     }
 }
