@@ -1346,11 +1346,10 @@ impl<H: Host, D: Devices> Machine<H, D> {
             let cell = cell_place(PAN_WRITES);
             register_read::pan_thunk(GuestAddress(pc), pan, cell)
         } else if let Some(send) = event_instruction(pc, word) {
-            let (pc, cell) = (GuestAddress(pc), cell_place(EVENT_WAIT));
             if send {
-                register_read::send_event_thunk(pc, cell_place(SEND_EVENT))
+                register_read::send_event_thunk(GuestAddress(pc), EVENTS)
             } else {
-                register_read::event_wait_thunk(pc, cell)
+                register_read::event_wait_thunk(GuestAddress(pc), EVENTS)
             }
         } else if data_barrier(pc, word) {
             register_read::barrier_thunk(GuestAddress(pc), BARRIER)

@@ -638,6 +638,7 @@ pub(super) mod tests {
         machine.mirrors.enter(machine.cpu.pstate);
         machine.cpu.state.pan = u64::from(machine.cpu.pstate.pan);
         machine.enter_cycles();
+        machine.enter_events();
         machine.cpu.state.anchors = machine.anchors();
         machine.cpu.state.lower_limit = machine.lower_limit();
         let code = stela_compiler::x86_64::pinned::entered(code);

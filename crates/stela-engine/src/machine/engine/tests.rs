@@ -7287,10 +7287,11 @@ fn implementation_defined_values_complete_natively_after_the_engine_does() {
     assert_eq!(installed[installed.len() - 1], [0; chain::THUNK_BYTES]);
 }
 
-/// SEVL and a WFE that finds an event complete natively on the event
-/// register once the engine completed one; a WFE that waits opens nothing.
+/// SEVL and a WFE that finds an event set complete natively on the event
+/// register in any state and across derived state changes; a WFE that finds
+/// it clear exits for the engine to wait.
 #[test]
-fn event_instructions_complete_natively_after_the_engine_does() {
+fn event_instructions_complete_natively_on_the_event_register() {
     const ADD: u32 = 0x9100_0400; // add x0, x0, #1
     const SEVL: u32 = 0xd503_20bf;
     const WFE: u32 = 0xd503_205f;
@@ -7304,30 +7305,40 @@ fn event_instructions_complete_natively_after_the_engine_does() {
     machine.derived_changed();
     machine.host.exits = vec![fall(base + 8), fall(base + 16)];
     machine.step().unwrap();
-    let send = register_read::send_event_thunk(GuestAddress(base + 4), cell_place(SEND_EVENT));
+    let send = register_read::send_event_thunk(GuestAddress(base + 4), EVENTS);
     assert_eq!(machine.host.installed.last(), Some(&send.code));
     machine.step().unwrap();
-    let wait = register_read::event_wait_thunk(GuestAddress(base + 12), cell_place(EVENT_WAIT));
+    let wait = register_read::event_wait_thunk(GuestAddress(base + 12), EVENTS);
     // Then the thunk of the link the exit into its block took at its fetch.
     let installed = &machine.host.installed;
     assert_eq!(installed[installed.len() - 2], wait.code);
     assert_eq!(installed[installed.len() - 1], [0; chain::THUNK_BYTES]);
-    let event = register_read::Cell {
-        readable: 1,
-        value: machine.cpu.event_storage(),
+    let run = |machine: &mut Machine<FakeHost, NoDevices>, code: &[u8]| {
+        super::transitions::tests::run_native(machine, code)
     };
-    machine.cpu.pc = base + 4;
-    machine.system_instruction(SEVL).unwrap();
-    assert_eq!(machine.mirrors[SEND_EVENT], event);
+    let fallthrough = ExitKind::Fallthrough as u64;
+    // SEVL sets the register, WFE takes it.
+    machine.cpu.consume_event();
+    assert_eq!(run(&mut machine, &send.code), (base + 8, fallthrough));
     assert!(machine.cpu.event_is_set());
-    machine.cpu.pc = base + 12;
-    machine.system_instruction(WFE).unwrap();
-    assert_eq!(machine.mirrors[EVENT_WAIT], event);
+    assert_eq!(run(&mut machine, &wait.code), (base + 16, fallthrough));
     assert!(!machine.cpu.event_is_set());
+    // A clear register: the engine waits.
+    let system = ExitKind::System as u64;
+    assert_eq!(run(&mut machine, &wait.code), (base + 12, system));
+    // Derived state and the PE's state decide nothing.
     machine.derived_changed();
-    machine.cpu.pc = base + 12;
-    machine.system_instruction(WFE).unwrap();
-    assert_eq!(machine.mirrors[EVENT_WAIT].readable, 0);
+    machine.cpu.pstate.el = 0;
+    machine.cpu.signal_event();
+    assert_eq!(run(&mut machine, &wait.code), (base + 16, fallthrough));
+    assert!(!machine.cpu.event_is_set());
+    assert_eq!(
+        machine.mirrors.events,
+        register_read::Cell {
+            readable: 1,
+            value: machine.cpu.event_storage(),
+        }
+    );
 }
 
 /// MSR and MRS of PSTATE.DIT complete natively on the word PSTATE takes

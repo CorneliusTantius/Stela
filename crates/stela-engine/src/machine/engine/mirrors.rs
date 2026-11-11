@@ -95,6 +95,14 @@ pub(super) struct Mirrors {
     /// open while this PE has no maintenance outstanding, whatever its
     /// state or derived state ([`Machine::open_barrier`]).
     pub(super) barrier: register_read::Cell,
+    /// What native SEVL and WFE complete on
+    /// (`x86_64::register_read::send_event_thunk`, `event_wait_thunk`): open
+    /// on the PE's event register as native code is entered
+    /// ([`Machine::enter_events`]). Neither depends on any System register
+    /// or the PE's state: SEVL never traps, and a WFE that finds the event
+    /// register set clears it and completes before any trap check (Arm
+    /// `Hint_WFE`); one that finds it clear exits for the engine to wait.
+    pub(super) events: register_read::Cell,
     /// The records native GENTER and GEXIT complete from
     /// (`x86_64::transition`), indexed by `state`, which they move.
     pub(super) transitions: transition::Table,
@@ -137,6 +145,9 @@ pub(super) const INTERRUPT_STATUS: Place =
 /// Where native code finds [`Mirrors::barrier`].
 pub(super) const BARRIER: Place = Place::new(Anchor::Mirrors, offset_of!(Mirrors, barrier));
 
+/// Where native code finds [`Mirrors::events`].
+pub(super) const EVENTS: Place = Place::new(Anchor::Mirrors, offset_of!(Mirrors, events));
+
 /// MRS ISR_EL1 to Xt, Rt in bits 4:0.
 pub(super) const READ_INTERRUPT_STATUS: u32 = 0xd538_c100;
 
@@ -159,18 +170,12 @@ pub(super) const CODE_PAGE: usize = STACK_SELECT + 1;
 /// completed plainly in the state on a host that keeps PAN in RFLAGS.AC.
 pub(super) const PAN_WRITES: usize = CODE_PAGE + 1;
 
-/// The cells of SEVL and WFE (`x86_64::register_read::send_event_thunk`,
-/// `event_wait_thunk`), open on the event register once one completed
-/// plainly in the state; WFE completes natively only when an event is set.
-pub(super) const SEND_EVENT: usize = PAN_WRITES + 1;
-pub(super) const EVENT_WAIT: usize = SEND_EVENT + 1;
-
 /// The cell of MSR TTBR0_EL1 (`x86_64::register_read::unchanged_write_thunk`),
 /// open on the storage a plain write reached: a write of the value the
 /// register holds completes natively and changes nothing, any other exits.
 /// A kernel rewrites the same table base at most switches into a thread of
 /// the address space it already runs.
-pub(super) const TABLE_BASE_KEPT: usize = EVENT_WAIT + 1;
+pub(super) const TABLE_BASE_KEPT: usize = PAN_WRITES + 1;
 
 /// TTBR0_EL1 (TTBR0_EL2 at EL2 with E2H).
 pub(super) const TABLE_BASE: Encoding = Encoding::new(3, 0, 2, 0, 0);
@@ -367,6 +372,7 @@ impl Default for Mirrors {
             fields: [0; 3],
             interrupt_status: register_read::Cell::default(),
             barrier: register_read::Cell::default(),
+            events: register_read::Cell::default(),
             transitions: transition::Table::default(),
             lines_until: 0,
             switches: register_read::SwitchLog::default(),
