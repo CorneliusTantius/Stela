@@ -154,8 +154,12 @@ pub struct Kept {
     switches: u64,
 }
 
-/// The contexts whose lower halves [`Kept`] holds at most.
-pub const KEPT: usize = 8;
+/// The contexts whose lower halves [`Kept`] holds at most. A replaced half
+/// frees no frames (they return only when the lower half is emptied), and
+/// refilling a context that comes back allocates its tables again, so a
+/// replacement costs frames as well as fills: a desktop session rotates
+/// among dozens of processes, which eight halves missed half the time.
+pub const KEPT: usize = 32;
 
 /// One context's kept lower half.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -471,6 +475,31 @@ mod tests {
         kept.switch(key(1), alloc::vec![(0x1000, 0, 2)], Extents::new(), key(2));
         assert_eq!(kept.clear(), 1);
         assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn a_rotation_of_many_contexts_finds_every_half() {
+        // Two dozen processes taking turns, as a desktop session's do,
+        // each find their half again after the first round.
+        let mut kept = Kept::new();
+        let key = |n: u64| (n << 12, 0);
+        const CONTEXTS: u64 = 24;
+        const { assert!(CONTEXTS as usize <= KEPT) };
+        let mut found = 0;
+        for turn in 0..CONTEXTS * 4 {
+            let (from, to) = (turn % CONTEXTS, (turn + 1) % CONTEXTS);
+            let half = kept.switch(
+                key(from),
+                alloc::vec![(0x1000, 0, from + 1)],
+                Extents::new(),
+                key(to),
+            );
+            if let Some(half) = half {
+                assert_eq!(half.entries, [(0x1000, 0, to + 1)]);
+                found += 1;
+            }
+        }
+        assert_eq!(found, CONTEXTS * 4 - (CONTEXTS - 1));
     }
 
     #[test]
