@@ -1,7 +1,8 @@
 //! Half arithmetic lanes (`half::emit`) against the reference on every
 //! target the host runs: every inline completion matches the reference in
 //! its lanes and FPSR, every exit leaves the state unchanged, and normal
-//! inputs with a normal result at least twice the minimum must complete
+//! inputs with a normal result at least twice the minimum, and vector lanes
+//! with a signed zero input beside a normal or zero one, must complete
 //! inline.
 use crate::{
     GuestAddress, GuestState, Options, TargetCpu,
@@ -52,6 +53,9 @@ const FORMS: &[(u32, BinaryOperation, usize)] = &[
     (0x1ee0_1800, BinaryOperation::Divide, 1),
     (0x4e40_1400, BinaryOperation::Add, 8),
     (0x6e40_1c00, BinaryOperation::Multiply, 8),
+    (0x0e40_1400, BinaryOperation::Add, 4),
+    (0x4ec0_1400, BinaryOperation::Subtract, 8),
+    (0x2e40_1c00, BinaryOperation::Multiply, 4),
 ];
 
 fn controls() -> Vec<u32> {
@@ -71,7 +75,7 @@ fn half(random: &mut u64) -> u64 {
     *random ^= *random >> 7;
     *random ^= *random << 17;
     match *random % 16 {
-        0 => 0,
+        0 | 5 => (*random >> 40 & 1) << 15,
         1 => 0x7c00,
         2 => *random >> 20 & 0x3ff,
         // Exact quotients and products: powers of two and small integers.
@@ -136,12 +140,21 @@ fn half_arithmetic_lanes_match_the_reference() {
                                 .all(|(&(left, right), outcome)| {
                                     let outcome = outcome.as_ref().unwrap();
                                     let bits = outcome.bits;
+                                    let zero = |bits: u64| bits & 0x7fff == 0;
+                                    let finite = |bits| normal(bits) || zero(bits);
+                                    // Vector lanes with a zero input and no zero divisor.
+                                    let zero_lane = lanes > 1
+                                        && (zero(left) || zero(right))
+                                        && finite(left)
+                                        && finite(right)
+                                        && !(operation == BinaryOperation::Divide && zero(right));
                                     // Overflow and underflow take the helper.
-                                    normal(left)
-                                        && normal(right)
-                                        && normal(bits)
-                                        && bits >> 10 & 31 >= 2
-                                        && outcome.exceptions & 0b1100 == 0
+                                    zero_lane
+                                        || normal(left)
+                                            && normal(right)
+                                            && normal(bits)
+                                            && bits >> 10 & 31 >= 2
+                                            && outcome.exceptions & 0b1100 == 0
                                 });
                         if exit == PC.0 {
                             assert_eq!(actual, initial, "{word:08x} {inputs:x?} {fpcr:#x}");

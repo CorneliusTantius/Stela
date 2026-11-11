@@ -6,6 +6,7 @@ use crate::x86_64::asm::{
 };
 use alloc::{vec, vec::Vec};
 mod product;
+mod zero;
 
 use super::super::super::isa::ShiftOpcode;
 use super::super::numerical::{
@@ -202,6 +203,11 @@ pub(super) fn emit(code: &mut Code, operand: &Operand, pc: GuestAddress, target:
     test_control(code, FPCR_EXCEPTION_ENABLE_MASK);
     helper.push(branch(code, Condition::NotZero));
     prepare_inputs(code, operand);
+    let zero_lanes = zero::supported(operand);
+    if zero_lanes {
+        prepare_vector_input_range(code, Format::Half);
+        zero::substitute(code, operand, &mut helper);
+    }
     prepare_vector_input_range(code, Format::Half);
     for source in [lanes::LEFT, lanes::RIGHT] {
         vector_exponent_range(code, Format::Half, operand.shape, source);
@@ -268,6 +274,9 @@ pub(super) fn emit(code: &mut Code, operand: &Operand, pc: GuestAddress, target:
             &rollback,
             pc,
         );
+    }
+    if zero_lanes {
+        zero::merge(code, operand);
     }
     lanes::commit_inexact(code);
     if operand.shape == Shape::Scalar && !matches!(operand.inputs, Inputs::PairwiseScalar { .. }) {
