@@ -4388,3 +4388,102 @@ fn the_no_network_promise_says_the_install_checks_the_answers_first() {
         assert!(message.contains("only if they do not fit"), "{message}");
     }
 }
+
+/// Partition `identifier` of its disk, backed by an image file holding
+/// `bytes`.
+fn raw_partition(host: &mut FakeHost, dir: &Path, identifier: &str, bytes: &[u8]) {
+    let path = dir.join(format!("{identifier}.img"));
+    fs::write(&path, bytes).unwrap();
+    let info = PartitionInfo {
+        identifier: identifier.into(),
+        disk: identifier[..5].into(),
+        guid: String::new(),
+        bytes: bytes.len() as u64,
+        content: String::new(),
+        mount: None,
+        container: None,
+    };
+    host.partitions.insert(identifier.into(), (info, path));
+}
+
+#[test]
+fn boot_log_scan_reads_the_usb_raw_before_the_system_disk() {
+    use crate::boot_log::tests::{fat_volume, region};
+    use stela_runtime::pc::boot_log::{OFFSET, PARTITION_BYTES};
+    let dir = tempfile::tempdir().unwrap();
+    let mounted = dir.path().join("STELA");
+    let mut host = FakeHost::new(
+        BTreeMap::new(),
+        vec![
+            disk("disk0", &[("Apple_APFS", None)]),
+            disk("disk5", &[("EFI", None), ("Apple_HFS", Some(&mounted))]),
+        ],
+    );
+    let mut state = vec![0u8; PARTITION_BYTES as usize];
+    state[OFFSET as usize..].copy_from_slice(&region(&["NOR persistent\n"]));
+    raw_partition(&mut host, dir.path(), "disk0s1", &state);
+    let usb_log = region(&["CHOICE 3 (Install macOS)\n"]);
+    raw_partition(
+        &mut host,
+        dir.path(),
+        "disk5s1",
+        &fat_volume(Some(&usb_log)),
+    );
+    // Its EFI partition is not mounted: the log is read through the disk.
+    let logs = crate::boot_log::scan(&host).unwrap();
+    let device = |number: u32| {
+        if cfg!(windows) {
+            format!("PhysicalDrive{number}")
+        } else {
+            format!("/dev/disk{number}")
+        }
+    };
+    let usb = format!(
+        "Disk disk5 (137.4 GB, {}, {})",
+        device(5),
+        mounted.display()
+    );
+    assert_eq!(
+        logs.len(),
+        1,
+        "the system disk waits while the USB has a log"
+    );
+    assert_eq!(
+        logs[0].0,
+        format!("{usb}: partition disk5s1, EFI/stela/boot.log")
+    );
+    assert_eq!(logs[0].1.boots, 1);
+    // A USB without a log: the system disk is read too.
+    raw_partition(&mut host, dir.path(), "disk5s1", &fat_volume(None));
+    let logs = crate::boot_log::scan(&host).unwrap();
+    assert_eq!(logs.len(), 1);
+    assert_eq!(
+        logs[0].0,
+        format!("Disk disk0 (137.4 GB, {}): partition disk0s1", device(0))
+    );
+    // No log anywhere names the disks, the ones that could not be read,
+    // and what to try.
+    fs::write(host.image("disk0s1").unwrap(), vec![0u8; 4096]).unwrap();
+    host.partitions.get_mut("disk5s1").unwrap().1 = dir.path().join("gone.img");
+    let error = format!("{:#}", crate::boot_log::scan(&host).unwrap_err());
+    assert!(
+        error.starts_with("no Stela boot log on this computer's disks."),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!("Looked at:\n  {usb}\n  Disk disk0")),
+        "{error}"
+    );
+    assert!(
+        error.contains(&format!("Could not read:\n  {usb}: ")),
+        "{error}"
+    );
+    assert!(
+        error.ends_with(&format!(
+            "Plug in the USB Stela booted from and run this again {} {}.",
+            if cfg!(windows) { "from" } else { "with" },
+            host::ADMIN
+        )),
+        "{error}"
+    );
+}
