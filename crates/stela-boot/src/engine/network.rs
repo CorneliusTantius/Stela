@@ -27,7 +27,7 @@ use stela_drivers::{
     probe::Adapter,
 };
 use stela_runtime::net::{
-    HttpPost, HttpRequest, HttpTransfer, NetError, Stack, TlsUnavailable, Transfer,
+    Backoff, HttpPost, HttpRequest, HttpTransfer, NetError, Stack, TlsUnavailable, Transfer,
     stack::DOWNLOAD_BUFFER,
 };
 use stela_soc::machine::AppleDevices;
@@ -387,11 +387,16 @@ pub struct Shared(pub Rc<RefCell<HostNetwork>>);
 
 /// The restore client's way to Apple's signing service (TSS): one POST
 /// at a time, moved along by each host service without waiting, so no
-/// guest processor stalls while Apple answers.
+/// guest processor stalls while Apple answers. A transient failure is asked
+/// again after a pause ([`Backoff`]), waited out across service steps.
 pub struct Signing {
     network: Shared,
     /// The POST in flight and the body it sends.
     exchange: Option<(Vec<u8>, HttpPost)>,
+    /// The body whose last attempt failed, and when it is tried again.
+    retry: Option<(Vec<u8>, Backoff)>,
+    /// The counter origin of the retry clock.
+    origin: u64,
 }
 
 impl Signing {
@@ -399,7 +404,38 @@ impl Signing {
         Self {
             network,
             exchange: None,
+            retry: None,
+            origin: output::now(),
         }
+    }
+}
+
+/// After a failed attempt at `body`: keep it for a later attempt when the
+/// failure is transient and attempts remain, else the failure.
+fn retry_after(
+    retry: &mut Option<(Vec<u8>, Backoff)>,
+    body: &[u8],
+    error: NetError,
+    now_ms: u64,
+) -> stela_runtime::restore::Result<Option<Vec<u8>>> {
+    let mut backoff = match retry.take() {
+        Some((sent, backoff)) if sent == body => backoff,
+        _ => Backoff::new(),
+    };
+    let attempt = backoff.attempt();
+    match backoff.failed(&error, now_ms) {
+        Some(wait) => {
+            output::arguments(format_args!(
+                "TSS RETRY attempt={attempt} next_in_ms={wait}: {error}\n"
+            ));
+            *retry = Some((body.to_vec(), backoff));
+            Ok(None)
+        }
+        None => Err(stela_runtime::restore::Error::Transport(refuse!(
+            "signing request after {attempts} attempts: {error}",
+            attempts = attempt as usize,
+            %error
+        ))),
     }
 }
 
@@ -412,9 +448,7 @@ impl stela_runtime::restore::tss::Transport for Signing {
         content_type: &str,
         body: &[u8],
     ) -> stela_runtime::restore::Result<Option<Vec<u8>>> {
-        let failed = |error: NetError| {
-            stela_runtime::restore::Error::Transport(refuse!("signing request: {error}", %error))
-        };
+        let now_ms = output::millis_since(self.origin);
         let mut network = self.network.0.borrow_mut();
         if let Some((sent, _)) = &self.exchange
             && sent != body
@@ -422,14 +456,21 @@ impl stela_runtime::restore::tss::Transport for Signing {
             let (_, post) = self.exchange.take().unwrap();
             network.close_post(post);
         }
+        if let Some((sent, backoff)) = &self.retry {
+            if sent != body {
+                self.retry = None;
+            } else if !backoff.ready(now_ms) {
+                return Ok(None);
+            }
+        }
         let (_, post) = match &mut self.exchange {
             Some(exchange) => exchange,
             None => {
                 let url = format!("http://{host}{path}");
-                let post = network
-                    .open_post(&url, headers, content_type, body)
-                    .map_err(failed)?;
-                self.exchange.insert((body.to_vec(), post))
+                match network.open_post(&url, headers, content_type, body) {
+                    Ok(post) => self.exchange.insert((body.to_vec(), post)),
+                    Err(error) => return retry_after(&mut self.retry, body, error, now_ms),
+                }
             }
         };
         let result = network.read_post(post);
@@ -438,7 +479,18 @@ impl stela_runtime::restore::tss::Transport for Signing {
         }
         let (_, post) = self.exchange.take().unwrap();
         network.close_post(post);
-        result.map_err(failed)
+        match result {
+            Err(error) => retry_after(&mut self.retry, body, error, now_ms),
+            answer => {
+                self.retry = None;
+                answer.map_err(|error| {
+                    stela_runtime::restore::Error::Transport(refuse!(
+                        "signing request: {error}",
+                        %error
+                    ))
+                })
+            }
+        }
     }
 }
 
