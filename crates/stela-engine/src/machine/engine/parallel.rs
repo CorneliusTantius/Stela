@@ -384,6 +384,9 @@ pub struct Counts {
     /// Why SVC, ERET, GENTER and GEXIT took the engine path, in kind order
     /// ([`super::Statistics::transition_misses`]).
     pub transition_misses: [u64; 4 * super::transitions::miss::REASONS],
+    /// Why its runs ended at branch-kind exits, in kind order
+    /// ([`super::Statistics::branch_misses`]).
+    pub branch_misses: [[u64; super::reports::BRANCH_REASONS]; super::reports::BRANCH_KINDS],
     pub itlb_sources: [u64; 12],
     /// Its stamped transfers ([`chain::StampCount`]'s order), the exits it
     /// gave a stamped tail, how many exits had one when it last looked, then
@@ -2096,6 +2099,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 misses.copy_from_slice(statistics.transition_misses.as_flattened());
                 misses
             },
+            branch_misses: statistics.branch_misses,
             stamped: {
                 let mut stamped = [0; chain::STAMP_COUNTS + 3];
                 stamped[..chain::STAMP_COUNTS].copy_from_slice(&self.chain.stamp_counts());

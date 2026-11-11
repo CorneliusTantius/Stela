@@ -1239,6 +1239,9 @@ impl Heartbeat {
                 String::from("PES TRANSITIONS genter/engine/gexit/engine/svc/engine/eret/engine");
             // All PEs: why SVC, ERET, GENTER and GEXIT took the engine path.
             let mut transition_misses = [0u64; 32];
+            // All PEs: why runs ended at fallthrough, direct, indirect, call
+            // and return exits.
+            let mut branch_misses = [0u64; 40];
             let mut itlb_sources = String::from(concat!(
                 "PES ITLBSRC fills_lower/fills_upper/cold_seen/drop_asid/drop_every",
                 "/all_local/all_received/all_forgot/all_kept/made/mail_merged/refilled",
@@ -1375,6 +1378,17 @@ impl Heartbeat {
                 for (total, (now, before)) in transition_misses
                     .iter_mut()
                     .zip(now.transition_misses.iter().zip(&before.transition_misses))
+                {
+                    *total += now.saturating_sub(*before);
+                }
+                for (total, (now, before)) in branch_misses
+                    .iter_mut()
+                    .zip(
+                        now.branch_misses
+                            .as_flattened()
+                            .iter()
+                            .zip(before.branch_misses.as_flattened()),
+                    )
                 {
                     *total += now.saturating_sub(*before);
                 }
@@ -1521,6 +1535,16 @@ impl Heartbeat {
             });
             output::arguments(format_args!(
                 "PES TRANSITION MISSES never/forgotten/frame/deadline/epoch/check/interrupt/other svc={svc} eret={eret} genter={genter} gexit={gexit}\n"
+            ));
+            let [fallthrough, direct, indirect, call, ret] = [0, 1, 2, 3, 4].map(|kind| {
+                branch_misses[kind * 8..kind * 8 + 8]
+                    .iter()
+                    .map(|count| format!("{count}"))
+                    .collect::<Vec<_>>()
+                    .join("/")
+            });
+            output::arguments(format_args!(
+                "PES BRANCH MISSES spent/interrupt/unlinked/itlb/table/btype/found/transitioned fallthrough={fallthrough} direct={direct} indirect={indirect} call={call} return={ret}\n"
             ));
             output::arguments(format_args!("{store}\n"));
             stamped.push_str(&format!(" in_use={stamped_in_use}"));

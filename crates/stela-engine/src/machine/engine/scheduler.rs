@@ -431,7 +431,15 @@ impl<H: Host, D: Devices> Machine<H, D> {
                     // (`step_timing::numerical_key`).
                     self.timed_word = Some(self.timed_system_word(last, next_pc));
                 }
+                let spent = remaining > budget;
                 let exited = self.exit(last, next_pc, kind);
+                if exited.is_ok()
+                    && let Some(miss) = self.branch_miss(last, next_pc, kind, spent)
+                {
+                    let counts = &mut self.statistics.branch_misses[kind as usize];
+                    counts[miss as usize] += 1;
+                    counts[BranchMiss::COUNT] += u64::from(transitioned);
+                }
                 if exited.is_ok() {
                     let btype = self.cpu.pstate.btype;
                     match ExitKind::try_from(kind) {
@@ -466,6 +474,49 @@ impl<H: Host, D: Devices> Machine<H, D> {
                 handled
             }
         }
+    }
+
+    /// Why the run that ended at block `index`'s branch-kind exit of `kind`
+    /// to `next_pc` took no transfer there, after the exit completed:
+    /// `spent` when the budget ran out. `None` for other kinds and single
+    /// runs.
+    pub(super) fn branch_miss(
+        &self,
+        index: usize,
+        next_pc: u64,
+        kind: u64,
+        spent: bool,
+    ) -> Option<BranchMiss> {
+        if kind as usize >= super::reports::BRANCH_KINDS
+            || self.variants[self.code.blocks[index].variant.0 as usize].single
+        {
+            return None;
+        }
+        if spent {
+            return Some(BranchMiss::Spent);
+        }
+        if self.chain.interrupt_moved() {
+            return Some(BranchMiss::Interrupt);
+        }
+        let probed = self.lookup_miss(index, next_pc, kind, false);
+        if probed == Some(0) {
+            return Some(BranchMiss::Unlinked);
+        }
+        let Some(key) = self.current_key(next_pc) else {
+            return Some(BranchMiss::Itlb);
+        };
+        let table = &self.code.table;
+        let entry = table.find(table.slot(next_pc, key), next_pc, key);
+        Some(if entry.pc != next_pc || entry.key != key {
+            BranchMiss::Table
+        } else if probed.is_none() {
+            // A direct exit in its page links at its target's fetch.
+            BranchMiss::Unlinked
+        } else if entry.targets & (1 << self.cpu.pstate.btype) == 0 {
+            BranchMiss::Btype
+        } else {
+            BranchMiss::Found
+        })
     }
 
     /// Why block `index`'s exit of `kind` to `next_pc` took no lookup

@@ -3170,6 +3170,10 @@ fn returns_and_exits_out_of_the_page_go_through_lookup_dispatchers() {
     assert_eq!(machine.statistics.exit_kinds, kinds);
     // Neither exit had a thunk yet.
     assert_eq!(machine.statistics.lookup_misses, [2, 0, 0, 0, 0]);
+    let mut branch_misses = [[0; BRANCH_REASONS]; BRANCH_KINDS];
+    branch_misses[ExitKind::Direct as usize][BranchMiss::Unlinked as usize] = 1;
+    branch_misses[ExitKind::Return as usize][BranchMiss::Unlinked as usize] = 1;
+    assert_eq!(machine.statistics.branch_misses, branch_misses);
     let (first, second) = (&machine.code.blocks[0], &machine.code.blocks[1]);
     let records = [0, 1].map(|slot| machine.code.blocks.record(slot));
     assert!((0..first.successors.len()).all(|position| records[0].linked(position)));
@@ -3287,6 +3291,8 @@ fn returns_and_exits_out_of_the_page_go_through_lookup_dispatchers() {
     // The cell's probe finds no translation of `far`'s page in the new
     // context; the fetch translates it anew and finds the table's entry.
     assert_eq!(machine.statistics.lookup_misses, [2, 1, 0, 0, 0]);
+    branch_misses[ExitKind::Direct as usize][BranchMiss::Itlb as usize] = 1;
+    assert_eq!(machine.statistics.branch_misses, branch_misses);
     let translated = machine.statistics.fetches[1];
     assert!(matches!(
         machine.fetch_block(far, false),
