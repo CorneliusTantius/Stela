@@ -846,17 +846,20 @@ pub fn prepare_disk<R: ReadAt>(
     }
     let sep_firmware = preboot::sep_firmware(&mut *source)
         .within(|| refuse!("the SEP firmware"))?
-        .map(|(path, bytes)| Decoded {
-            source: Source {
-                component: "SEP firmware".into(),
-                member: path,
-                container_sha256: sha256(&bytes),
-                payload_type: "img4".into(),
-                description: "the iBootSystemContainer's SEP firmware".into(),
-                decoded_bytes: bytes.len() as u64,
-                decoded_sha256: sha256(&bytes),
-            },
-            bytes,
+        .map(|(path, bytes)| {
+            let digest = sha256(&bytes);
+            Decoded {
+                source: Source {
+                    component: "SEP firmware".into(),
+                    member: path,
+                    container_sha256: digest.clone(),
+                    payload_type: "img4".into(),
+                    description: "the iBootSystemContainer's SEP firmware".into(),
+                    decoded_bytes: bytes.len() as u64,
+                    decoded_sha256: digest,
+                },
+                bytes,
+            }
         });
     let mut found = Vec::new();
     let mut failures = Vec::new();
