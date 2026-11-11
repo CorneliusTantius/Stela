@@ -1692,6 +1692,7 @@ fn heap_report(heap: &stela_boot_core::heap::Usage) {
     ));
     output::arguments(format_args!("{line}\n"));
     owner_report(heap.live);
+    super::large_blocks::report();
 }
 
 /// `HEAP OWNERS linux=40/52M libc=900/1350M rest=600M`: the heap bytes
