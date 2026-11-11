@@ -33,6 +33,7 @@ use stela_engine::machine::engine::StoreEvent;
 use stela_engine::translations;
 use stela_engine::translations::Digest;
 use stela_engine::translations::Record;
+use stela_engine::translations::checkpoint::{Checkpoints, Decision, Policy, Waiters};
 use stela_engine::translations::pack;
 use stela_engine::translations::pack::{DecodedRecord, Pack, StagedOffer, Store};
 #[cfg(feature = "nvk")]
@@ -653,7 +654,9 @@ fn prove_some() {
             else {
                 continue;
             };
+            let blocks = batch.blocks() as u64;
             let proven = batch.prove();
+            PROVEN_BLOCKS.fetch_add(blocks, Ordering::Relaxed);
             lock.with(|store| {
                 if let Some(store) = store {
                     store.fold(proven);
@@ -962,6 +965,17 @@ fn report(counters: &pack::Counters) {
 /// At a quiescent point (the guest restarts or powers off): prove the
 /// blocks compiled anew and rewrite the pack in place.
 pub fn write() {
+    // No checkpoint starts from now on; one being written is finished, so
+    // that the pack file holds a whole pack and the store knows which.
+    while CHECKPOINTING.swap(true, Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    finish_checkpoint();
+    write_stopped();
+    CHECKPOINTING.store(false, Ordering::Release);
+}
+
+fn write_stopped() {
     let Some(boot) = BOOT.with(|boot| {
         AVAILABLE.capabilities.store(0, Ordering::SeqCst);
         AVAILABLE.shared_bound.store(0, Ordering::Release);
@@ -1087,4 +1101,274 @@ fn write_safely(
             Err(error) => return Err(format!("{error:?}")),
         }
     }
+}
+
+/// A pack file's run of bytes on its partition.
+type FileExtent = stela_formats::payload::pieces::Extent;
+type Entries = alloc::collections::BTreeMap<Digest, Record>;
+
+/// The PEs counted for checkpoint decisions, by number.
+const MAX_PES: usize = 64;
+static WAITERS: Waiters<MAX_PES> = Waiters::new();
+/// A PE counts as waiting this long after its last wait: a wait returns to
+/// its run loop several times a second (`WAIT_POLLS_PER_SECOND`).
+const WAIT_WINDOW: u64 = super::host::COUNTER_HZ / 10;
+/// Blocks proven during the run, for the checkpoint decision, and the
+/// record bytes each is counted as.
+static PROVEN_BLOCKS: AtomicU64 = AtomicU64::new(0);
+const BLOCK_RECORD_BYTES: u64 = 512;
+/// One PE at a time looks at, plans or writes a checkpoint; the stop takes
+/// it while it writes.
+static CHECKPOINTING: AtomicBool = AtomicBool::new(false);
+/// The most a checkpoint step writes; a flush is a step of its own.
+const STEP_BYTES: u64 = 256 << 10;
+
+/// A checkpoint being written.
+struct Writing {
+    layout: pack::Layout<'static>,
+    checkpoint: Checkpoint,
+    /// The pack file's extents, found once when the checkpoint starts.
+    extents: alloc::vec::Vec<FileExtent>,
+    /// The entries it saves, taken from the parts, given back if it fails.
+    proven: Entries,
+    /// The index it puts back first, given back to the boot if it fails.
+    repair: Option<&'static [u8]>,
+    started: u64,
+    steps: u64,
+    longest: u64,
+}
+
+/// The run's checkpoints: when to save, and the save being written.
+struct Saving {
+    decision: Checkpoints,
+    noted: u64,
+    writing: Option<Writing>,
+}
+
+/// Only the holder of [`CHECKPOINTING`] takes this lock.
+static SAVING: Lock<Option<Saving>> = Lock::new(None);
+
+/// A PE that waits for an interrupt, outside its guest run and holding no
+/// lock of the guest's: count its wait and, when the decision says so,
+/// start a checkpoint or write one bounded step of it. A step is one flush
+/// or at most [`STEP_BYTES`]; it is left for a later turn while another
+/// core is inside the host drivers or an interrupt came for this PE.
+pub fn checkpoint_turn(pe: usize) {
+    let now = super::host::fresh_counter();
+    WAITERS.note(pe, now);
+    if !available(WRITE_PACK) || CHECKPOINTING.swap(true, Ordering::Acquire) {
+        return;
+    }
+    SAVING.with(|saving| {
+        let saving = saving.get_or_insert_with(|| Saving {
+            decision: Checkpoints::new(Policy::for_hz(super::host::COUNTER_HZ), now),
+            noted: 0,
+            writing: None,
+        });
+        let proven = PROVEN_BLOCKS.load(Ordering::Relaxed);
+        if proven > saving.noted {
+            let blocks = proven - saving.noted;
+            saving
+                .decision
+                .note_new(now, blocks, blocks * BLOCK_RECORD_BYTES);
+            saving.noted = proven;
+        }
+        if saving.writing.is_some() {
+            if !super::host::interrupted() && !super::storage::host_drivers_taken() {
+                step_checkpoint(saving);
+            }
+            return;
+        }
+        let (waiting, pes) = WAITERS.count(now, WAIT_WINDOW);
+        let decision = saving.decision.look(now, waiting, pes);
+        if decision != Decision::Wait && !start_checkpoint(saving, decision) {
+            saving
+                .decision
+                .finished(super::host::fresh_counter(), false);
+        }
+    });
+    CHECKPOINTING.store(false, Ordering::Release);
+}
+
+/// Take every part's proven entries, lay out the next pack over the file
+/// and plan its write: whether a checkpoint now runs. The parts' locks are
+/// held only to take the entries; the layout is made outside them.
+fn start_checkpoint(saving: &mut Saving, decision: Decision) -> bool {
+    let started = super::host::fresh_counter();
+    let Some((bound, repair, path)) = BOOT.with(|boot| {
+        let boot = boot.as_mut().filter(|boot| boot.partition.is_some())?;
+        Some((boot.bound, boot.repair.take(), boot.path.clone()))
+    }) else {
+        return false;
+    };
+    let mut proven = Entries::new();
+    for lock in &STORES {
+        let taken = lock.with(|store| store.as_mut().map(Store::take_proven));
+        proven.extend(taken.unwrap_or_default());
+    }
+    let Some(base) = STORES[0].with(|store| store.as_ref().map(Store::checkpoint_base)) else {
+        give_back(proven, repair);
+        return false;
+    };
+    let layout = base.layout(&proven, checkpoint::plan_bound(bound));
+    // The file's extents and the device's block size, the partition taken
+    // out of the boot's lock while the FAT is read.
+    let found = BOOT.with(|boot| boot.as_mut().and_then(|boot| boot.partition.take()));
+    let found = found.and_then(|partition| {
+        let block = u64::from(partition.identity().block_size);
+        let mut volume = Fat32::open(Bytes::new(partition)).ok()?;
+        let extents = volume.file(&path);
+        let device = volume.into_inner().into_inner();
+        BOOT.with(|boot| {
+            if let Some(boot) = boot {
+                boot.partition = Some(device);
+            }
+        });
+        Some((extents.ok()?.extents, block))
+    });
+    let planned = match found {
+        Some((extents, block)) => {
+            let file: u64 = extents.iter().map(|extent| extent.bytes).sum();
+            Checkpoint::plan(&layout, file, block, !base.previous(), repair)
+                .map(|checkpoint| (checkpoint, extents))
+                .map_err(|refused| format!("{refused:?}"))
+        }
+        None => Err(String::from("the pack file was not found")),
+    };
+    match planned {
+        Ok((checkpoint, extents)) => {
+            output::arguments(format_args!(
+                "TRANSLATIONS checkpoint starts ({decision:?}) records={} bytes={} pages={}\n",
+                layout.records(),
+                layout.bytes(),
+                proven.len()
+            ));
+            saving.writing = Some(Writing {
+                layout,
+                checkpoint,
+                extents,
+                proven,
+                repair,
+                started,
+                steps: 0,
+                longest: 0,
+            });
+            true
+        }
+        Err(refused) => {
+            output::arguments(format_args!("TRANSLATIONS checkpoint refused: {refused}\n"));
+            drop(layout);
+            give_back(proven, repair);
+            false
+        }
+    }
+}
+
+/// Give entries a checkpoint did not write back to their parts, and the
+/// index to put back to the boot.
+fn give_back(proven: Entries, repair: Option<&'static [u8]>) {
+    let mut parts: [Entries; PARTS] = core::array::from_fn(|_| Entries::new());
+    for (key, record) in proven {
+        parts[usize::from(key.0[2]) % PARTS].insert(key, record);
+    }
+    for (lock, entries) in STORES.iter().zip(parts) {
+        if !entries.is_empty() {
+            lock.with(|store| {
+                if let Some(store) = store {
+                    store.restore_proven(entries);
+                }
+            });
+        }
+    }
+    if repair.is_some() {
+        BOOT.with(|boot| {
+            if let Some(boot) = boot {
+                boot.repair = boot.repair.or(repair);
+            }
+        });
+    }
+}
+
+/// One bounded step of the checkpoint being written; at its end the parts
+/// adopt the pack the file holds, or take back what it did not save. No
+/// lock another PE takes is held while the device writes or flushes.
+fn step_checkpoint(saving: &mut Saving) {
+    let Some(writing) = saving.writing.as_mut() else {
+        return;
+    };
+    let Some(mut device) = BOOT.with(|boot| boot.as_mut()?.partition.take()) else {
+        end_checkpoint(saving, false);
+        return;
+    };
+    let started = super::host::fresh_counter();
+    let result = {
+        let mut file = ExtentFile {
+            device: &mut *device,
+            extents: &writing.extents,
+        };
+        writing
+            .checkpoint
+            .step(&writing.layout, &mut file, STEP_BYTES)
+    };
+    let spent = super::host::fresh_counter().wrapping_sub(started);
+    writing.steps += 1;
+    writing.longest = writing.longest.max(spent);
+    BOOT.with(|boot| {
+        if let Some(boot) = boot {
+            boot.partition = Some(device);
+        }
+    });
+    match result {
+        Ok(Step::More) => {}
+        Ok(Step::Done) => end_checkpoint(saving, true),
+        Err(error) => {
+            output::arguments(format_args!(
+                "TRANSLATIONS checkpoint not written: {error:?}\n"
+            ));
+            end_checkpoint(saving, false);
+        }
+    }
+}
+
+fn end_checkpoint(saving: &mut Saving, saved: bool) {
+    let Some(writing) = saving.writing.take() else {
+        return;
+    };
+    let now = super::host::fresh_counter();
+    let micros = |ticks: u64| ticks / (super::host::COUNTER_HZ / 1_000_000);
+    if saved {
+        output::arguments(format_args!(
+            "TRANSLATIONS checkpoint written records={} bytes={} steps={} longest_step_us={} \
+             ms={}\n",
+            writing.layout.records(),
+            writing.layout.bytes(),
+            writing.steps,
+            micros(writing.longest),
+            micros(now.wrapping_sub(writing.started)) / 1000
+        ));
+        let file = alloc::sync::Arc::new(pack::written(writing.layout));
+        for lock in &STORES {
+            lock.with(|store| {
+                if let Some(store) = store {
+                    store.adopt(alloc::sync::Arc::clone(&file));
+                }
+            });
+        }
+    } else {
+        give_back(writing.proven, writing.repair);
+    }
+    saving.decision.finished(now, saved);
+}
+
+/// Write the rest of a running checkpoint at the stop: the caller holds
+/// [`CHECKPOINTING`].
+fn finish_checkpoint() {
+    SAVING.with(|saving| {
+        let Some(saving) = saving.as_mut() else {
+            return;
+        };
+        while saving.writing.is_some() {
+            step_checkpoint(saving);
+        }
+    });
 }

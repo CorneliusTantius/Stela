@@ -243,6 +243,9 @@ impl Pe {
                         super::service::serve(false, false);
                         super::display::flush(super::display::Turn::Idle);
                         super::storage::serve_staged(true);
+                        // The translation store's checkpoint, a bounded
+                        // step at a time, from a PE with nothing to run.
+                        super::translations::checkpoint_turn(pe);
                         // A GPU compilation a guest call deferred.
                         #[cfg(feature = "nvk")]
                         super::gpu::gate::run_job(false);
