@@ -427,6 +427,9 @@ fn dispatch_caches_complete_transfers_as_table_probes() {
             totals[0] > 8_000 && totals[1] > 25_000 && totals[2] > 15_000 && totals[3] > 100,
             "{target:?} {totals:?}"
         );
+        // The cache counted its hits and fills for reports.
+        let counts = cache.counts();
+        assert!(counts[0] > 0 && counts[1] > 0, "{target:?} {counts:?}");
     }
 }
 

@@ -1206,6 +1206,9 @@ impl Heartbeat {
             let mut stamped = String::from(
                 "PES STAMPED hits/miss_epoch/miss_context/miss_interrupt/restamped/changed/promoted",
             );
+            // Per PE: dispatch cache hits, fills (misses the table probe
+            // found) and generation bumps.
+            let mut dispatch = String::from("PES DISPATCH hits/fills/bumps");
             let mut stamped_in_use = 0;
             let mut predicted = 0;
             let deltas = |line: &mut String, pe: usize, now: &[u64], before: &[u64]| {
@@ -1333,6 +1336,12 @@ impl Heartbeat {
                 );
                 stamped_in_use = stamped_in_use.max(now.stamped[promoted]);
                 predicted += now.stamped[promoted + 1].saturating_sub(before.stamped[promoted + 1]);
+                deltas(
+                    &mut dispatch,
+                    pe,
+                    &now.stamped[promoted + 2..],
+                    &before.stamped[promoted + 2..],
+                );
                 deltas(
                     &mut store,
                     pe,
@@ -1462,6 +1471,7 @@ impl Heartbeat {
                 "PES TRANSITION MISSES never/forgotten/frame/deadline/epoch/check/interrupt/other genter={genter} gexit={gexit}\n"
             ));
             output::arguments(format_args!("{store}\n"));
+            output::arguments(format_args!("{dispatch}\n"));
             stamped.push_str(&format!(" in_use={stamped_in_use}"));
             stamped_line = Some((stamped, predicted));
             if machine.step_timing().is_some() {

@@ -716,6 +716,11 @@ pub const DISPATCH_SLOT_BYTES: usize = 64;
 pub const DISPATCH_PART_BYTES: usize = DISPATCH_SLOTS * DISPATCH_SLOT_BYTES;
 /// Byte offset from a [`DispatchCache`]'s address of its generation.
 pub const DISPATCH_GENERATION: i32 = -8;
+/// Byte offset from a [`DispatchCache`]'s address of its count of hits,
+/// which only its PE's dispatchers write.
+const DISPATCH_HITS: i32 = -64;
+/// Byte offset from a [`DispatchCache`]'s address of its count of fills.
+const DISPATCH_FILLS: i32 = -56;
 /// Words before a [`DispatchCache`]'s first slot: one cache line.
 const DISPATCH_HEADER_WORDS: usize = 8;
 
@@ -766,6 +771,15 @@ impl DispatchCache {
     /// Its host address, for `ChainControl::dispatch`.
     pub fn address(&self) -> u64 {
         self.words[DISPATCH_HEADER_WORDS..].as_ptr() as u64
+    }
+
+    /// Its hits, fills and generation, for reports.
+    pub fn counts(&self) -> [u64; 3] {
+        [
+            self.words[0].load(Ordering::Relaxed),
+            self.words[1].load(Ordering::Relaxed),
+            self.generation(),
+        ]
     }
 
     /// Its dispatch generation.
@@ -2498,6 +2512,7 @@ fn dispatcher_with(
         asm.shift_imm(ShiftOp::Shr, Dword, Rdx, ExitWord::RAN_SHIFT as u8);
         asm.alu(Alu::Add, Qword, Mem::base(Rcx, RETIRED), Rdx);
         asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, HITS), 1);
+        asm.alu_imm8(Alu::Add, Qword, Mem::base(R10, DISPATCH_HITS), 1);
         asm.mov_load(Qword, R8, dispatch_word(R9, btype, 2));
         asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
         asm.jmp_rm(dispatch_word(R9, btype, 3));
@@ -2582,6 +2597,7 @@ fn dispatcher_with(
         // Only the owner changes contexts, between native runs too.
         dispatch_context(&mut asm, Rdx);
         asm.mov_store(Qword, dispatch_word(R11, btype, 5), Rdx);
+        asm.alu_imm8(Alu::Add, Qword, Mem::base(R10, DISPATCH_FILLS), 1);
     }
     found(&mut asm);
     for miss in misses {
