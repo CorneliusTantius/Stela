@@ -177,7 +177,7 @@ pub(super) const MASK_WRITES: usize = MIRRORED.len() + STORED_CELLS;
 /// together (`Machine::open_pointers`). TPIDR_EL1's also update its open
 /// read cells in every state and log the thread switch for the engine's
 /// diagnostics ([`THREAD_SWITCH`]).
-pub(super) const WRITTEN: [(Encoding, SystemRegister); 17] = [
+pub(super) const WRITTEN: [(Encoding, SystemRegister); 18] = [
     (Encoding::new(3, 0, 4, 0, 1), SystemRegister::ELR_EL1),
     (Encoding::new(3, 0, 4, 0, 0), SystemRegister::SPSR_EL1),
     (STACK_ZERO, SystemRegister::SP_EL0),
@@ -197,6 +197,7 @@ pub(super) const WRITTEN: [(Encoding, SystemRegister); 17] = [
     (Encoding::new(3, 0, 2, 2, 3), SystemRegister::APDBKeyHi_EL1),
     (Encoding::new(3, 0, 2, 3, 0), SystemRegister::APGAKeyLo_EL1),
     (Encoding::new(3, 0, 2, 3, 1), SystemRegister::APGAKeyHi_EL1),
+    (CONTEXT_ID, SystemRegister::CONTEXTIDR_EL1),
     (registers::encodings::TPIDR_EL1, SystemRegister::TPIDR_EL1),
 ];
 
@@ -221,6 +222,12 @@ pub(super) const THREAD_SWITCH: register_read::ThreadSwitch = register_read::Thr
     banks: MIRROR_STATES,
     log: Place::new(Anchor::Mirrors, offset_of!(Mirrors, switches)),
 };
+
+/// CONTEXTIDR_EL1 (CONTEXTIDR_EL2 at EL2 with E2H), which a kernel writes
+/// at each thread or address space switch: only debug and trace read it,
+/// context-aware breakpoints live from its storage, and it is not part of
+/// the prediction context (`PredictionContext`).
+pub(super) const CONTEXT_ID: Encoding = Encoding::new(3, 0, 13, 0, 1);
 
 /// SP_EL0, plain only with SP_ELx selected.
 pub(super) const STACK_ZERO: Encoding = Encoding::new(3, 0, 4, 1, 0);
