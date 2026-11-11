@@ -497,6 +497,8 @@ const SWAP_DWORD_PAIRS: u8 = 0xb1;
 /// MOVMSKPS lanes that are active: the low dword of each D lane holds its
 /// classification.
 const DOUBLE_LOW_DWORDS: u8 = 0b0101;
+/// MOVMSKPS lanes of the high dword of each D lane, which holds its exponent.
+const DOUBLE_HIGH_DWORDS: u8 = 0b1010;
 
 /// Out of line after a sticky-inexact product (`sticky_inexact`): return
 /// to `resume` when every active lane the classification rejected is a
@@ -755,6 +757,114 @@ pub(super) fn capture_environment_status(code: &mut Code) {
 /// Discard private scratch-operation status before the next arithmetic stage.
 pub(super) fn clear_environment_status(code: &mut Code) {
     code.asm().ldmxcsr(frame(MXCSR_CONTROL_OFFSET));
+}
+
+/// MXCSR underflow status: with underflow masked, raised for an inexact
+/// result that was tiny before rounding, as Arm's FPSR.UFC with FPCR.AH
+/// zero.
+pub(super) const MXCSR_UNDERFLOW: u32 = 1 << 4;
+/// FPSR.UFC.
+pub(super) const FPSR_UNDERFLOW: u8 = 1 << 3;
+
+/// Branch taken when FPSR has every flag of `flags`.
+pub(super) fn fpsr_has(code: &mut Code, flags: u8) -> usize {
+    let mut asm = code.asm();
+    asm.movzx(
+        Size::Dword,
+        Rax,
+        Size::Byte,
+        state(core::mem::offset_of!(GuestState, fpsr)),
+    );
+    asm.alu_imm8(Alu::And, Size::Dword, Rax, flags as i8);
+    asm.alu_imm8(Alu::Cmp, Size::Dword, Rax, flags as i8);
+    branch(code, Condition::Zero)
+}
+
+/// Branch taken when some lane of the S/D `source` (`shape`) is a NaN or
+/// an infinity. Clobbers EAX and `scratch`.
+pub(super) fn nonfinite_lane(
+    code: &mut Code,
+    format: Format,
+    shape: Shape,
+    source: u8,
+    scratch: u8,
+) -> usize {
+    if shape == Shape::Scalar {
+        let size = Size::of(format == Format::Double);
+        let mut asm = code.asm();
+        if format == Format::Double {
+            asm.movq_from_xmm(Rax, source);
+        } else {
+            asm.movd_from_xmm(Rax, source);
+        }
+        // Exponent all ones: the shifted-out sign leaves the exponent on top,
+        // and adding the lowest exponent bit carries out of all ones.
+        asm.alu(Alu::Add, size, Rax, Rax);
+        asm.shift_imm(ShiftOp::Shr, size, Rax, format.fraction_bits() as u8 + 1);
+        asm.alu_imm32(
+            Alu::Cmp,
+            size,
+            Rax,
+            (format.exponent_mask() >> format.fraction_bits()) as i32,
+        );
+        return branch(code, Condition::Zero);
+    }
+    // The high dword of a Double lane holds its exponent: test those.
+    packed(code, Host::MoveAligned, scratch, source);
+    ShiftOpcode::LeftDword.emit(code, scratch, SIGN_BITS);
+    let exponent_shift = match format {
+        Format::Double => (Format::Double.fraction_bits() - 32) as u8 + 1,
+        _ => format.fraction_bits() as u8 + 1,
+    };
+    ShiftOpcode::RightDword.emit(code, scratch, exponent_shift);
+    let all_ones = match format {
+        Format::Double => 0x7ff,
+        _ => 0xff,
+    };
+    let mut asm = code.asm();
+    asm.mov_imm32(Rax, all_ones);
+    asm.movd_to_xmm(ZERO_VECTOR, Rax);
+    packed_imm(code, Host::ShuffleDword, ZERO_VECTOR, ZERO_VECTOR, 0);
+    packed(code, Host::EqualDword, scratch, ZERO_VECTOR);
+    Host::DwordSignMask.register(code, 0, scratch, crate::TargetCpu::Baseline);
+    let mask = match (shape, format) {
+        (Shape::Vector64, Format::Single) => SINGLE_LOW_VECTOR_MASK,
+        (Shape::Vector128, Format::Single) => SINGLE_VECTOR_MASK,
+        (Shape::Vector128, Format::Double) => DOUBLE_HIGH_DWORDS,
+        _ => unreachable!("allocated S/D vector shape"),
+    };
+    eax_imm8(code, Alu::And, mask);
+    branch(code, Condition::NotZero)
+}
+
+/// Accumulate IXC and UFC from ECX's MXCSR status (`commit_inexact` with
+/// underflow), leaving ECX with only those fresh FPSR flags.
+pub(super) fn commit_inexact_underflow(code: &mut Code) {
+    let mut asm = code.asm();
+    asm.alu_imm32(
+        Alu::And,
+        Size::Dword,
+        Rcx,
+        (MXCSR_INEXACT | MXCSR_UNDERFLOW) as i32,
+    );
+    asm.shift_imm(ShiftOp::Shr, Size::Dword, Rcx, MXCSR_TO_FPSR_INEXACT_SHIFT);
+    asm.alu(
+        Alu::Or,
+        Size::Dword,
+        state(core::mem::offset_of!(GuestState, fpsr)),
+        Rcx,
+    );
+}
+
+/// The status a guest-visible result rejects ([`reject_other_status`])
+/// except underflow.
+pub(super) fn reject_other_status_but_underflow(code: &mut Code) -> usize {
+    code.asm().test_imm(
+        Size::Dword,
+        Rcx,
+        (MXCSR_OTHER_STATUS & !MXCSR_UNDERFLOW) as i32,
+    );
+    branch(code, Condition::NotZero)
 }
 
 /// Accumulate status and leave ECX holding only fresh guest IXC (zero or INEXACT).

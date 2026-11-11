@@ -4,21 +4,31 @@ use crate::x86_64::asm::{Alu, Code, Gpr, Rm, Size};
 use alloc::vec;
 use alloc::vec::Vec;
 mod half;
+#[cfg(all(
+    test,
+    target_arch = "x86_64",
+    any(target_os = "macos", target_os = "linux")
+))]
+mod tiny_tests;
 use super::super::isa::ShiftOpcode;
 use super::numerical::{
-    ArithmeticOpcode, ColdSplit, Condition, EXPONENT_VECTOR, Entry, INPUT_MINIMUM_EXPONENT, Input,
-    LEFT_VECTOR, RESULT_MINIMUM_EXPONENT, RIGHT_VECTOR, SINGLE_EXPONENT_BIAS_BITS, ZeroProduct,
-    branch, clear_high_qword, clear_scalar, commit_inexact, emit_opcode, environment,
-    exponent_range, jump, prepare_vector_input_range, prepare_vector_result_range, read_inputs,
-    read_numerical_right, read_numerical_vector, reject_other_status, resolve, restore_environment,
-    scalar_range_or_zero, sticky_inexact, sticky_result_check, test_control, vector_exponent_range,
+    ArithmeticOpcode, ColdSplit, Condition, EXPONENT_VECTOR, Entry, FPSR_UNDERFLOW,
+    INPUT_MINIMUM_EXPONENT, Input, LEFT_VECTOR, RESULT_MINIMUM_EXPONENT, RIGHT_VECTOR,
+    SINGLE_EXPONENT_BIAS_BITS, ZeroProduct, branch, clear_high_qword, clear_scalar, commit_inexact,
+    commit_inexact_underflow, emit_opcode, environment, exponent_range, fpsr_has, jump,
+    nonfinite_lane, prepare_vector_input_range, prepare_vector_result_range, read_inputs,
+    read_numerical_right, read_numerical_vector, reject_other_status,
+    reject_other_status_but_underflow, resolve, restore_environment, scalar_range_or_zero,
+    sticky_inexact, sticky_result_check, test_control, vector_exponent_range,
     vector_normal_or_zero_range, zero_product_check,
 };
 use super::{Host, commit, packed, read_vector, shuffle};
 use crate::{
     GuestAddress, TargetCpu,
     aarch64::{
-        floating::{BinaryOperation, FPCR_EXCEPTION_ENABLE_MASK, FPCR_NEP, Format},
+        floating::{
+            BinaryOperation, FPCR_AH, FPCR_EXCEPTION_ENABLE_MASK, FPCR_FZ, FPCR_NEP, Format,
+        },
         simd::arithmetic::{Inputs, Operand, Shape},
     },
     block::ExitKind,
@@ -339,7 +349,30 @@ fn sticky_path(code: &mut Code, operand: &Operand, entry: Entry, target: TargetC
     }
     let check = code.len();
     resolve(code, rejected, check);
-    let helper = zero_product_check(
+    // With FPSR.UFC set too, a tiny or zero product adds no status, and its
+    // value is the host's: the entry MXCSR flushes nothing. Only a NaN or
+    // infinite lane needs more.
+    let known = fpsr_has(code, FPSR_UNDERFLOW);
+    let unknown = jump(code);
+    let finite_check = code.len();
+    resolve(code, known, finite_check);
+    let nonfinite = nonfinite_lane(
+        code,
+        operand.format,
+        operand.shape,
+        LEFT_VECTOR,
+        EXPONENT_VECTOR,
+    );
+    let finite = jump(code);
+    resolve(code, finite, resume);
+    crossing.push(finite);
+    let zero_check = code.len();
+    resolve(code, nonfinite, zero_check);
+    resolve(code, unknown, zero_check);
+    // Other rejected products take the full path, which completes tiny
+    // results ([`tiny_product_status`]).
+    let mut full = full;
+    full.extend(zero_product_check(
         code,
         &ZeroProduct {
             format: operand.format,
@@ -350,15 +383,38 @@ fn sticky_path(code: &mut Code, operand: &Operand, entry: Entry, target: TargetC
         },
         resume,
         &mut crossing,
-    );
+    ));
     StickyPath {
         full,
-        helper,
+        helper: vec![],
         done,
         cold,
         inline_end,
         crossing,
     }
+}
+
+/// The full path's status of a product ([`zero_product`]) under FPCR.FZ and
+/// AH zero, when it is not `None`: results below the minimum normal
+/// complete as the host computed them (no FTZ in the environment), with
+/// MXCSR underflow as FPSR.UFC: SSE, like Arm with AH zero, detects
+/// tininess before rounding and, with underflow masked, reports it for an
+/// inexact tiny result (measured: the minimum normal times 1 - 2^-24 rounds
+/// to the minimum normal with PE and UE). Returns the branches to the
+/// success path; `helper` receives the others. With FZ or AH set (AH
+/// detects tininess after rounding), the caller's checks follow.
+fn tiny_product_status(
+    code: &mut Code,
+    operand: &Operand,
+    helper: &mut Vec<usize>,
+) -> Option<(Vec<usize>, usize)> {
+    if !zero_product(operand.operation) {
+        return None;
+    }
+    test_control(code, FPCR_FZ | FPCR_AH);
+    let strict = branch(code, Condition::NotZero);
+    helper.push(reject_other_status_but_underflow(code));
+    Some((vec![jump(code)], strict))
 }
 
 /// A sticky path's open branches ([`sticky_path`]).
@@ -417,6 +473,11 @@ fn emit_scalar(
     );
     restore_environment(code);
     // Caller environment and stack are restored before every branch from here.
+    let tiny = tiny_product_status(code, operand, &mut helper);
+    if let Some((_, strict)) = &tiny {
+        let strict_start = code.len();
+        resolve(code, *strict, strict_start);
+    }
     helper.push(reject_other_status(code));
     let success = if accepts_zero(operand.operation) || zero_quotient(operand) {
         helper.push(scalar_range_or_zero(
@@ -437,8 +498,7 @@ fn emit_scalar(
         resolve(code, patch, helper_start);
     }
     resolve(code, success, success_start);
-
-    commit_inexact(code);
+    commit_status(code, success_start, tiny);
     result_sign(code, operand);
     if matches!(operand.inputs, Inputs::PairwiseScalar { .. }) {
         clear_scalar(code, operand.format, LEFT_VECTOR);
@@ -451,6 +511,20 @@ fn emit_scalar(
     }
     commit(code, operand.destination, LEFT_VECTOR);
     finish(code, sticky, full, operand)
+}
+
+/// Resolve the tiny-product successes ([`tiny_product_status`]) to
+/// `success_start`, and commit the status of the full path.
+fn commit_status(code: &mut Code, success_start: usize, tiny: Option<(Vec<usize>, usize)>) {
+    match tiny {
+        Some((successes, _)) => {
+            for patch in successes {
+                resolve(code, patch, success_start);
+            }
+            commit_inexact_underflow(code);
+        }
+        None => commit_inexact(code),
+    }
 }
 
 /// Resolve the jump past the full path, which ends here.
@@ -515,6 +589,11 @@ fn emit_vector(
         right,
     );
     restore_environment(code);
+    let tiny = tiny_product_status(code, operand, &mut helper);
+    if let Some((_, strict)) = &tiny {
+        let strict_start = code.len();
+        resolve(code, *strict, strict_start);
+    }
     helper.push(reject_other_status(code));
     prepare_vector_result_range(code);
     if accepts_zero(operand.operation) {
@@ -536,7 +615,7 @@ fn emit_vector(
         resolve(code, patch, helper_start);
     }
     resolve(code, success, success_start);
-    commit_inexact(code);
+    commit_status(code, success_start, tiny);
     result_sign(code, operand);
     if operand.shape == Shape::Vector64 {
         clear_high_qword(code, 0);
