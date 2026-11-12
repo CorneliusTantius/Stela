@@ -189,6 +189,10 @@ pub trait Device {
     fn limitation(&mut self) -> Option<&'static str> {
         None
     }
+    /// The device was quarantined for good: no call reaches it again.
+    fn lost(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug)]
@@ -1923,7 +1927,9 @@ impl<D: Device> Radio for Rtl8822c<D> {
     }
 
     fn stage(&self) -> Stage {
-        if self.left {
+        if self.device.lost() {
+            Stage::Lost
+        } else if self.left {
             Stage::NeedsDrain
         } else if self.scanned.is_some() {
             Stage::Scanned
