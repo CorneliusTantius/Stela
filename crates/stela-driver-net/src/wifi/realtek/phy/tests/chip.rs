@@ -10,7 +10,7 @@ use crate::{
             bootstrap::{self, Booted, Rings},
             download::tests::catalog_for,
             firmware::tests::legacy_fixture,
-            phy::PhyInitialized,
+            phy::Initialized,
         },
         stepped::Stepped,
     },
@@ -36,7 +36,7 @@ impl Rings<Bus> for Unbound {
     unsafe fn inform(
         &mut self,
         _: crate::wifi::realtek::fifo::Geometry,
-        _: &PhyInitialized,
+        _: &Initialized,
         _: &Report,
     ) -> Result<(), bootstrap::Error> {
         Ok(())
@@ -274,4 +274,139 @@ fn a_lost_radio_comes_back_through_a_stepped_chip_reset() {
         m.get(0x610, 4),
         u32::from_le_bytes([address.0[0], address.0[1], address.0[2], address.0[3]])
     );
+}
+
+/// A powered-off cut B RTL8821C on `rfe`, its OTP holding the board of the
+/// RTL8821C PHY tests in extended-header blocks.
+fn chip_8821c(rfe: u8) -> (Arc<Mutex<Model>>, Profile) {
+    let profile = crate::wifi::realtek::chip::rtl8821c::tests::profile(1);
+    let mut logical = [0xff_u8; 512];
+    logical[0xb8] = 0x7f;
+    logical[0xb9] = 0x25;
+    logical[0xca] = rfe;
+    logical[0xd0..0xd6].copy_from_slice(&[2, 3, 4, 5, 6, 7]);
+    logical[0x10..0xb8].fill(0);
+    logical[0x10..0x16].fill(40);
+    logical[0x16..0x1b].fill(42);
+    logical[0x22..0x30].fill(38);
+    let mut physical = [0xff; 512];
+    let mut at = 0;
+    for (block, bytes) in logical.chunks(8).enumerate() {
+        let words: Vec<bool> = bytes.chunks(2).map(|word| word != [0xff, 0xff]).collect();
+        if !words.contains(&true) {
+            continue;
+        }
+        let enable = (0..4)
+            .filter(|&word| words[word])
+            .fold(0xf, |mask, word| mask & !(1 << word));
+        physical[at] = ((block as u8 & 7) << 5) | 0x0f;
+        physical[at + 1] = (((block >> 3) as u8) << 4) | enable;
+        at += 2;
+        for (word, _) in bytes.chunks(2).zip(&words).filter(|(_, on)| **on) {
+            physical[at..at + 2].copy_from_slice(word);
+            at += 2;
+        }
+    }
+    assert!(at < 512 - 96, "the OTP outside its protected end");
+    let mut m = Model {
+        profile,
+        bytes: vec![0; 0x10000],
+        physical,
+        pending: false,
+        calls: 0,
+        fail: None,
+        mutate: None,
+        record: false,
+        events: Vec::new(),
+        quarantined: 0,
+        dac: None,
+        fifo_ready: true,
+        chip: true,
+        beacons: 0,
+    };
+    m.initial(0);
+    m.set(4, 1, 0);
+    m.set(5, 1, 0);
+    m.set(6, 1, 2);
+    m.set(0x100, 1, 0xea);
+    m.set(0x80, 4, 0);
+    m.set(0x1208, 4, 0);
+    m.set(0x1700, 4, 1 << 29);
+    m.set(0x1cc, 1, 0);
+    m.set(0x10d0, 4, 0);
+    m.set(0x10d4, 4, 0);
+    (Arc::new(Mutex::new(m)), profile)
+}
+
+#[test]
+fn an_rtl8821c_reset_runs_the_whole_bring_up_within_the_recovery_step() {
+    core::mem::forget(crate::test_clock::virtualize());
+    let (model, profile) = chip_8821c(2);
+    let firmware = catalog_for(profile, legacy_fixture());
+    let staged = profile.stage(&firmware).unwrap();
+    let mut rings = Unbound;
+    let started = MODEL.now_us();
+    // SAFETY: the model chip belongs to this test alone, with no rings.
+    let mut work = Stepped::new(unsafe {
+        bootstrap::boot(bus(&model), &mut rings, profile, &staged, &firmware, 0)
+    });
+    let (booted, longest, steps) = run(&mut work);
+    let elapsed = MODEL.now_us() - started;
+    drop(work);
+    let Booted {
+        mac, control, phy, ..
+    } = booted.unwrap();
+    assert_eq!(mac, crate::Mac([2, 3, 4, 5, 6, 7]));
+    assert!(!control.quarantined());
+    let Initialized::Rtl8821C(phy) = phy else {
+        panic!("an RTL8821C came up on the RTL8822C's PHY");
+    };
+    assert_eq!((phy.profile(), phy.rfe()), (profile, 2));
+    assert!(longest <= RECOVERY_STEP_US, "a step took {longest} us");
+    assert!(
+        steps > 100 && elapsed > 50_000,
+        "{steps} steps over {elapsed} us"
+    );
+    let m = model.lock().unwrap();
+    assert!(m.beacons > 1);
+    assert_eq!(m.quarantined, 0);
+    // The radio's tables went through SIPI to path A's RF registers, and
+    // PCIe's gen 1 parameter through MDIO.
+    assert_ne!(m.get(0x2800 + 0x18 * 4, 4) & 0xfffff, 0);
+    assert_eq!(m.get(0x3f4, 2), 0x6380);
+}
+
+#[test]
+fn a_dropped_rtl8821c_attempt_is_reset_by_the_next() {
+    core::mem::forget(crate::test_clock::virtualize());
+    let (model, profile) = chip_8821c(0);
+    let firmware = catalog_for(profile, legacy_fixture());
+    let staged = profile.stage(&firmware).unwrap();
+    let mut rings = Unbound;
+    // SAFETY: as above.
+    let mut work = Stepped::new(unsafe {
+        bootstrap::boot(bus(&model), &mut rings, profile, &staged, &firmware, 0)
+    });
+    while model.lock().unwrap().beacons < 2 {
+        assert!(work.step().is_pending());
+        crate::test_clock::advance(MODEL, POLL_US);
+    }
+    drop(work);
+    let quarantined = model.lock().unwrap().quarantined;
+    assert!(quarantined >= 1);
+    // SAFETY: as above, with the dropped attempt's owner gone.
+    let mut work = Stepped::new(unsafe {
+        bootstrap::boot(bus(&model), &mut rings, profile, &staged, &firmware, 0)
+    });
+    let (booted, longest, _) = run(&mut work);
+    drop(work);
+    assert!(matches!(
+        booted,
+        Ok(Booted {
+            phy: Initialized::Rtl8821C(_),
+            ..
+        })
+    ));
+    assert!(longest <= RECOVERY_STEP_US, "a step took {longest} us");
+    assert_eq!(model.lock().unwrap().quarantined, quarantined);
 }

@@ -13,6 +13,28 @@ pub use board_power::Error as BoardPowerError;
 pub use board_power::{FactoryBand, FactoryPower, FactorySheet, GainDelta, QuarterDbmReference};
 mod data;
 pub mod rtl8821c;
+
+/// A booted chip's PHY: the RTL8822C's typestate's end, or the RTL8821C's.
+pub enum Initialized {
+    Rtl8822C(alloc::boxed::Box<PhyInitialized>),
+    Rtl8821C(alloc::boxed::Box<rtl8821c::Phy>),
+}
+
+impl Initialized {
+    pub fn profile(&self) -> Profile {
+        match self {
+            Self::Rtl8822C(phy) => phy.factory_power().profile(),
+            Self::Rtl8821C(phy) => phy.profile(),
+        }
+    }
+    /// `efuse->rfe_option`.
+    pub fn rfe(&self) -> u8 {
+        match self {
+            Self::Rtl8822C(phy) => phy.factory_power().rfe(),
+            Self::Rtl8821C(phy) => phy.rfe(),
+        }
+    }
+}
 use super::{
     efuse::Board,
     features::Report,

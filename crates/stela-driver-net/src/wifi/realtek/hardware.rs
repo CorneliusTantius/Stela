@@ -20,7 +20,7 @@ use super::{
     io::{Bar, Io},
     link::Link,
     phy::{
-        FactorySheet, PhyInitialized,
+        FactorySheet, Initialized, PhyInitialized,
         channel_power::{Geometry, Limits, Width as ChannelWidth},
     },
     receive::{self, Ring},
@@ -270,6 +270,12 @@ impl Hardware {
             claim,
             ..
         } = up;
+        let phy = match phy {
+            Initialized::Rtl8822C(phy) => *phy,
+            Initialized::Rtl8821C(_) => {
+                return Err("the RTL8821C's station runtime is not ported".into());
+            }
+        };
         let initial = phy.factory().calibration().initial();
         let cck_bounds = initial.cck_bounds();
         let calibration = Calibration::new(board.raw().power_track_raw);

@@ -314,8 +314,13 @@ unsafe impl Io for Bus {
         if r == 0x30 {
             m.pending = true;
         }
-        for (path, sipi, base) in [(0, 0x1808, 0x3c00), (1, 0x4108, 0x4c00)] {
-            let _ = path;
+        // Each chip's SIPI ports and the RF registers behind them.
+        let ports = if m.profile.chip() == super::super::identity::Chip::Rtl8821C {
+            [(0xc90, 0x2800), (0xe90, 0x2c00)]
+        } else {
+            [(0x1808, 0x3c00), (0x4108, 0x4c00)]
+        };
+        for (sipi, base) in ports {
             if r == sipi {
                 let a = base + (((v >> 20) & 255) * 4);
                 let old = m.get(a, 4);

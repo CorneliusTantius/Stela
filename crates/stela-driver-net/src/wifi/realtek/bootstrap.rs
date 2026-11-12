@@ -20,11 +20,11 @@ use super::{
     firmware::Layout,
     firmware_control::Control,
     hci,
-    identity::{Observed, Profile, Staged},
+    identity::{Chip, Observed, Profile, Staged},
     interrupt::Controller,
     io::{Bar, Io, NativeIo},
     link::Link,
-    phy::{self, PhyInitialized, source_mac},
+    phy::{self, Initialized, source_mac},
     power,
     quirks::Disabled,
     receive, transmit,
@@ -99,14 +99,14 @@ fn at<E: Debug>(step: &'static str) -> impl FnOnce(E) -> Error {
     }
 }
 
-/// An RTL8822C with firmware running, its MAC configured and its PHY loaded.
+/// A chip with firmware running, its MAC configured and its PHY loaded.
 pub struct Up {
     pub profile: Profile,
     pub control: Control<Native>,
     pub interrupts: Controller<Bar>,
     pub receive: receive::Ring<Bar>,
     pub transmit: transmit::Rings<Bar>,
-    pub phy: PhyInitialized,
+    pub phy: Initialized,
     pub coex: Coex,
     pub report: Report,
     /// `fw->feature`.
@@ -142,7 +142,7 @@ pub(super) trait Rings<I> {
     unsafe fn inform(
         &mut self,
         geometry: Geometry,
-        phy: &PhyInitialized,
+        phy: &Initialized,
         report: &Report,
     ) -> Result<(), Error>;
 }
@@ -182,7 +182,7 @@ impl Rings<Native> for Claimed<'_> {
     unsafe fn inform(
         &mut self,
         geometry: Geometry,
-        phy: &PhyInitialized,
+        phy: &Initialized,
         report: &Report,
     ) -> Result<(), Error> {
         self.interrupts = Some(Controller::new((self.bar)()?).map_err(at("interrupts"))?);
@@ -201,7 +201,7 @@ impl Rings<Native> for Claimed<'_> {
 /// What [`boot`] leaves running on the registers.
 pub(super) struct Booted<I: Io> {
     pub control: Control<I>,
-    pub phy: PhyInitialized,
+    pub phy: Initialized,
     pub coex: Coex,
     pub report: Report,
     pub board: Board,
@@ -216,7 +216,7 @@ pub(super) struct Booted<I: Io> {
 /// completion.
 ///
 /// # Safety
-/// `claim.window` is the exclusive uncached BAR of the RTL8822C `claim.observed`
+/// `claim.window` is the exclusive uncached BAR of the chip `claim.observed`
 /// describes, with its DMA and interrupts quiet and its indices zero;
 /// `claim.domain` isolates that requester, and `claim.pages` is coherent
 /// write-back RAM. The caller keeps the claim for as long as the device runs.
@@ -318,7 +318,7 @@ pub async unsafe fn start(claim: Claim) -> Result<Up, Error> {
 /// arbiter's first commands, with `rings` bound and told where rtw88 does.
 ///
 /// # Safety
-/// `io` is the exclusive register interface of the RTL8822C `profile` names,
+/// `io` is the exclusive register interface of the chip `profile` names,
 /// with MAC power in any state, and `rings` are its only queues, fresh and
 /// idle. `staged` is that profile's firmware from `firmware`.
 pub(super) async unsafe fn boot<I: Io, R: Rings<I>>(
@@ -353,38 +353,55 @@ pub(super) async unsafe fn boot<I: Io, R: Rings<I>>(
     let board = physical.logical().map_err(at("efuse map"))?.board();
     let mac = Mac(board.valid_mac().map_err(at("mac address"))?);
     // SAFETY: the MAC, tables, paths and calibrations of one uninterrupted
-    // boot, in `rtw_mac_init` and `rtw8822c_phy_set_param`'s order, each on
+    // boot, in `rtw_mac_init` and the chip's `phy_set_param` order, each on
     // the state the one before it left.
     let (mac_state, phy) = unsafe {
         let mac_state = source_mac::initialize(&mut io, &report).map_err(at("mac init"))?;
         yield_now().await;
-        let loaded = phy::initialize(&mut io, &board, &report)
-            .await
-            .map_err(at("phy tables"))?;
-        let paths = loaded
-            .configure_paths(&mut io, &report)
-            .map_err(at("phy paths"))?;
-        yield_now().await;
-        let initial = paths
-            .initialize_dynamic(&mut io, &report)
-            .map_err(at("phy dynamics"))?;
-        yield_now().await;
-        let phy = initial
-            .calibrate_dac(&mut io, &report)
-            .await
-            .map_err(at("dac calibration"))?
-            .initialize_factory(&mut io, &report, &physical)
-            .await
-            .map_err(at("factory trim"))?
-            .finish_initial_phy(&mut io, &report)
-            .map_err(at("phy tail"))?;
-        (mac_state, phy)
+        if profile.chip() == Chip::Rtl8821C {
+            let phy = phy::rtl8821c::phy_set_param(&mut io, &board, &report)
+                .await
+                .map_err(at("phy tables"))?;
+            (
+                mac_state,
+                Initialized::Rtl8821C(alloc::boxed::Box::new(phy)),
+            )
+        } else {
+            let loaded = phy::initialize(&mut io, &board, &report)
+                .await
+                .map_err(at("phy tables"))?;
+            let paths = loaded
+                .configure_paths(&mut io, &report)
+                .map_err(at("phy paths"))?;
+            yield_now().await;
+            let initial = paths
+                .initialize_dynamic(&mut io, &report)
+                .map_err(at("phy dynamics"))?;
+            yield_now().await;
+            let phy = initial
+                .calibrate_dac(&mut io, &report)
+                .await
+                .map_err(at("dac calibration"))?
+                .initialize_factory(&mut io, &report, &physical)
+                .await
+                .map_err(at("factory trim"))?
+                .finish_initial_phy(&mut io, &report)
+                .map_err(at("phy tail"))?;
+            (
+                mac_state,
+                Initialized::Rtl8822C(alloc::boxed::Box::new(phy)),
+            )
+        }
     };
     yield_now().await;
     let geometry = mac_state.fifo();
     let disabled = Disabled::load(firmware);
+    let spec = profile
+        .rtw88()
+        .ok_or_else(|| at("pcie link")("no rtw88 chip"))?;
     let link = Link::configure(
         &mut io,
+        spec,
         profile.cut(),
         board.raw().rfe_raw,
         link_control,

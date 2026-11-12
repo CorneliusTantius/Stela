@@ -49,6 +49,10 @@ pub struct Rtw88 {
     /// `rtw_pci_interface_cfg`: the cut from which `REG_HCI_MIX_CFG` takes
     /// `BIT_PCIE_EMAC_PDN_AUX_TO_FAST_CLK`, on a chip that sets it.
     pub pcie_aux_clock_cut: Option<u8>,
+    /// `pcie_gen1_param`'s PHY (MDIO) writes for every cut: address, value.
+    pub pcie_gen1_mdio: &'static [(u8, u16)],
+    /// The RFE `rtw_pci_phy_cfg` raises the switcher's current for.
+    pub switcher_current_rfe: Option<u8>,
     /// The radios `rf_tbl` loads: two on the RTL8822C, path A alone on the
     /// RTL8821C.
     pub rf_paths: u8,
@@ -162,6 +166,8 @@ pub static RTL8822C: Spec = Spec {
         power_on: super::power::tables::ON_8822C,
         power_off: super::power::tables::OFF_8822C,
         pcie_aux_clock_cut: Some(3),
+        pcie_gen1_mdio: &[],
+        switcher_current_rfe: Some(5),
         rf_paths: 2,
         rfe_options: &[0, 1, 2, 3, 4, 5, 6],
         rf_base: [0x3c00, 0x4c00],
@@ -207,6 +213,8 @@ pub static RTL8821C: Spec = Spec {
         power_on: super::power::tables::ON_8821C,
         power_off: super::power::tables::OFF_8821C,
         pcie_aux_clock_cut: None,
+        pcie_gen1_mdio: &[(0x09, 0x6380)],
+        switcher_current_rfe: None,
         rf_paths: 1,
         rfe_options: &[0, 2, 4, 6],
         rf_base: [0x2800, 0x2c00],

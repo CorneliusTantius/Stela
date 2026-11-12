@@ -343,25 +343,28 @@ impl<R: Registers> Rings<R> {
     pub unsafe fn phydm_info(
         &mut self,
         source: &dyn PageSource,
-        phy: &super::phy::PhyInitialized,
+        phy: &super::phy::Initialized,
         report: &super::features::Report,
     ) -> Result<(), Error> {
         if self.poisoned || !self.configured {
             return Err(Error::Quarantined);
         }
         let profile = self.io.as_ref().ok_or(Error::Quarantined)?.profile();
-        if phy.factory_power().profile() != profile || report.profile() != profile {
+        if phy.profile() != profile || report.profile() != profile {
             return Err(Error::IdentityChanged);
         }
         let cap = report.capabilities();
-        if cap.rf_paths != 2 || cap.rf_phys != 2 || cap.antenna_tx != 3 || cap.antenna_rx != 3 {
-            return Err(Error::UnsupportedLayout);
-        }
+        let rf_type = match (cap.rf_paths, cap.rf_phys, cap.antenna_tx, cap.antenna_rx) {
+            (2, 2, 3, 3) => FW_RF_2T2R,
+            (1, 1, 1, 1) => FW_RF_1T1R,
+            _ => return Err(Error::UnsupportedLayout),
+        };
         if self.pending() == H2C_COUNT - 1 {
             return Err(Error::Full);
         }
         let payload = phydm_info(
-            phy.factory_power().rfe(),
+            phy.rfe(),
+            rf_type,
             profile.cut(),
             cap.antenna_tx,
             cap.antenna_rx,
@@ -713,12 +716,22 @@ fn general_info(geometry: Geometry, sequence: u16) -> [u8; 32] {
     p[10] = (geometry.firmware_tx_page() - geometry.boundary()) as u8;
     p
 }
-fn phydm_info(rfe: u8, cut: u8, antenna_tx: u8, antenna_rx: u8, sequence: u16) -> [u8; 32] {
+/// `FW_RF_2T2R` and `FW_RF_1T1R`.
+const FW_RF_2T2R: u8 = 2;
+const FW_RF_1T1R: u8 = 4;
+fn phydm_info(
+    rfe: u8,
+    rf_type: u8,
+    cut: u8,
+    antenna_tx: u8,
+    antenna_rx: u8,
+    sequence: u16,
+) -> [u8; 32] {
     let mut p = [0; 32];
     p[..4].copy_from_slice(&0x0011ff01u32.to_le_bytes());
     p[4..8].copy_from_slice(&(16u32 | (u32::from(sequence) << 16)).to_le_bytes());
     p[8] = rfe;
-    p[9] = 2;
+    p[9] = rf_type;
     p[10] = cut;
     p[11] = (antenna_tx & 15) | ((antenna_rx & 15) << 4);
     p

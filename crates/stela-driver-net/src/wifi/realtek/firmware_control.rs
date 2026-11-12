@@ -157,11 +157,12 @@ impl<I: Io> Control<I> {
             iqk_active: false,
             clock_last: 0,
         };
-        if profile.rtw88().is_none() || report.profile() != profile {
+        let Some(spec) = profile.rtw88().filter(|_| report.profile() == profile) else {
             return Err(Error::WrongProfile);
-        }
+        };
+        // The chip's own paths, all of them reported.
         let cap = report.capabilities();
-        if cap.rf_phys != 2 || cap.rf_paths != 2 {
+        if cap.rf_phys != spec.rf_paths || cap.rf_paths != spec.rf_paths {
             return Err(Error::UnsupportedLayout);
         }
         c.verify()?;

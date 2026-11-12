@@ -6,6 +6,7 @@
 //! if turned on where the host does not support it, so it follows what the
 //! host enabled, and L1 only runs under leisure power save.
 use super::{
+    chip::Rtw88,
     dynamic::set_mask,
     io::{Error, Io},
 };
@@ -35,11 +36,19 @@ const HOST_CLOCK_REQUEST: u16 = 1 << 8;
 /// `REG_HCI_MIX_CFG`'s `BIT_PCIE_EMAC_PDN_AUX_TO_FAST_CLK`, from cut D.
 const REG_HCI_MIX_CFG: u32 = 0x3fc;
 const AUX_TO_FAST_CLOCK: u32 = 1 << 26;
+#[cfg(test)]
 const CUT_D: u8 = 3;
 /// `REG_ANAPARSW_MAC_0`'s `BIT_CF_L_V2`, which `rfe_option` 5 sets to 1.
 const REG_ANAPARSW_MAC_0: u32 = 0x1010;
 const SWITCHER_CURRENT: u32 = 3 << 28;
+#[cfg(test)]
 const CURRENT_RFE: u8 = 5;
+/// `REG_MDIO_V1`, `REG_PCIE_MIX_CFG` and its `BIT_MDIO_WFLAG_V1`.
+const REG_MDIO: u32 = 0x3f4;
+const REG_PCIE_MIX_CFG: u32 = 0x3f8;
+const MDIO_WRITING: u32 = 1 << 5;
+/// `RTW_PCI_MDIO_PG_SZ`.
+const MDIO_PAGE: u8 = 32;
 
 fn await_dbi<I: Io>(io: &mut I) -> Result<bool, Error> {
     for _ in 0..DBI_TRIES {
@@ -74,6 +83,22 @@ fn dbi_write8<I: Io>(io: &mut I, address: u16, data: u8) -> Result<bool, Error> 
 }
 
 /// Set or clear `bits` of the link configuration.
+/// `rtw_mdio_write` to a gen 1 page; false when the write never finished,
+/// which rtw88 warns of and passes.
+fn mdio_write_gen1<I: Io>(io: &mut I, address: u8, data: u16) -> Result<bool, Error> {
+    io.write16(REG_MDIO, data)?;
+    io.write8(REG_PCIE_MIX_CFG, address & (MDIO_PAGE - 1))?;
+    io.write8(REG_PCIE_MIX_CFG + 3, u8::from(address >= MDIO_PAGE))?;
+    set_mask(io, REG_PCIE_MIX_CFG, MDIO_WRITING, 1)?;
+    for _ in 0..DBI_TRIES {
+        if io.read32(REG_PCIE_MIX_CFG)? & MDIO_WRITING == 0 {
+            return Ok(true);
+        }
+        io.delay_us(DBI_WAIT_US);
+    }
+    Ok(false)
+}
+
 fn set_link_bits<I: Io>(io: &mut I, bits: u8, on: bool) -> Result<bool, Error> {
     let Some(value) = dbi_read8(io, LINK_CONFIG)? else {
         return Ok(false);
@@ -95,20 +120,26 @@ impl Link {
     /// whose PCIe PHY tables are empty, on a link under `host_control`.
     pub fn configure<I: Io>(
         io: &mut I,
+        spec: &Rtw88,
         cut: u8,
         rfe: u8,
         host_control: u16,
         aspm: bool,
     ) -> Result<Self, Error> {
-        if cut >= CUT_D {
+        // rtw_pci_phy_cfg's gen 1 parameters come before its link's.
+        let mut answered = true;
+        for &(address, data) in spec.pcie_gen1_mdio {
+            answered &= mdio_write_gen1(io, address, data)?;
+        }
+        if spec.pcie_aux_clock_cut.is_some_and(|first| cut >= first) {
             set_mask(io, REG_HCI_MIX_CFG, AUX_TO_FAST_CLOCK, 1)?;
         }
-        let mut answered = dbi_write8(io, CLOCK_DELAY, 0)?;
+        answered &= dbi_write8(io, CLOCK_DELAY, 0)?;
         // `rtw_pci_disable_aspm` leaves both modules as they are.
         if aspm && host_control & HOST_CLOCK_REQUEST != 0 {
             answered &= set_link_bits(io, CLOCK_REQUEST, true)?;
         }
-        if rfe == CURRENT_RFE {
+        if spec.switcher_current_rfe == Some(rfe) {
             set_mask(io, REG_ANAPARSW_MAC_0, SWITCHER_CURRENT, 1)?;
         }
         Ok(Self {
@@ -195,6 +226,10 @@ mod tests {
             Ok(0)
         }
         fn read32(&mut self, register: u32) -> Result<u32, io::Error> {
+            // The MDIO bridge finishes a write at once, unless silent.
+            if register == REG_PCIE_MIX_CFG && !self.silent {
+                return Ok(self.word(register) & !MDIO_WRITING);
+            }
             Ok(self.word(register))
         }
         fn write8(&mut self, register: u32, value: u8) -> Result<(), io::Error> {
@@ -227,14 +262,31 @@ mod tests {
         fn quarantine(&mut self) {}
     }
 
+    fn spec() -> &'static Rtw88 {
+        crate::wifi::realtek::chip::RTL8822C.rtw88.as_ref().unwrap()
+    }
+
+    #[test]
+    fn an_rtl8821c_writes_its_gen1_phy_parameter_and_no_rtl8822c_extra() {
+        let mut bus = Bus::default();
+        let spec = crate::wifi::realtek::chip::RTL8821C.rtw88.as_ref().unwrap();
+        let link = Link::configure(&mut bus, spec, CUT_D, CURRENT_RFE, 0, true).unwrap();
+        assert!(link.answered());
+        assert_eq!(bus.word(REG_MDIO) as u16, 0x6380);
+        assert_eq!(bus.get(REG_PCIE_MIX_CFG) & 0x1f, 0x09);
+        assert_eq!(bus.get(REG_PCIE_MIX_CFG + 3), 0, "gen 1, first page");
+        assert_eq!(bus.word(REG_HCI_MIX_CFG), 0);
+        assert_eq!(bus.word(REG_ANAPARSW_MAC_0), 0);
+    }
+
     #[test]
     fn the_chip_follows_only_what_the_host_enabled() {
         let mut bus = Bus::default();
         bus.config.insert(CLOCK_DELAY, 0x55);
-        Link::configure(&mut bus, 0, 0, 0, true).unwrap();
+        Link::configure(&mut bus, spec(), 0, 0, 0, true).unwrap();
         assert_eq!(bus.link(), 0, "the host enabled neither");
         assert_eq!(bus.config[&CLOCK_DELAY], 0, "REFCLK calibrates itself");
-        Link::configure(&mut bus, 0, 0, HOST_CLOCK_REQUEST, true).unwrap();
+        Link::configure(&mut bus, spec(), 0, 0, HOST_CLOCK_REQUEST, true).unwrap();
         assert_eq!(bus.link(), CLOCK_REQUEST);
     }
 
@@ -242,7 +294,7 @@ mod tests {
     fn l1_runs_only_under_power_save_on_a_link_that_allows_it() {
         let mut bus = Bus::default();
         bus.config.insert(LINK_CONFIG, 0x81);
-        let mut link = Link::configure(&mut bus, 0, 0, HOST_L1, true).unwrap();
+        let mut link = Link::configure(&mut bus, spec(), 0, 0, HOST_L1, true).unwrap();
         assert_eq!(bus.link(), 0x81, "off until power save begins");
         link.set_l1(&mut bus, true).unwrap();
         assert_eq!(bus.link(), 0x81 | L1);
@@ -250,7 +302,7 @@ mod tests {
         assert_eq!(bus.link(), 0x81);
 
         let mut bus = Bus::default();
-        let mut link = Link::configure(&mut bus, 0, 0, 0, true).unwrap();
+        let mut link = Link::configure(&mut bus, spec(), 0, 0, 0, true).unwrap();
         link.set_l1(&mut bus, true).unwrap();
         assert_eq!(bus.link(), 0, "the host never enabled L1");
     }
@@ -260,7 +312,7 @@ mod tests {
         let mut bus = Bus::default();
         bus.config.insert(CLOCK_DELAY, 0x55);
         let mut link =
-            Link::configure(&mut bus, 0, 0, HOST_CLOCK_REQUEST | HOST_L1, false).unwrap();
+            Link::configure(&mut bus, spec(), 0, 0, HOST_CLOCK_REQUEST | HOST_L1, false).unwrap();
         assert_eq!(bus.link(), 0, "no CLKREQ though the host enabled it");
         assert_eq!(bus.config[&CLOCK_DELAY], 0, "the clock delay is not ASPM");
         link.set_l1(&mut bus, true).unwrap();
@@ -271,10 +323,10 @@ mod tests {
     #[test]
     fn a_later_cut_and_one_board_take_their_own_settings() {
         let mut bus = Bus::default();
-        Link::configure(&mut bus, 2, 4, 0, true).unwrap();
+        Link::configure(&mut bus, spec(), 2, 4, 0, true).unwrap();
         assert_eq!(bus.word(REG_HCI_MIX_CFG), 0);
         assert_eq!(bus.word(REG_ANAPARSW_MAC_0), 0);
-        Link::configure(&mut bus, CUT_D, CURRENT_RFE, 0, true).unwrap();
+        Link::configure(&mut bus, spec(), CUT_D, CURRENT_RFE, 0, true).unwrap();
         assert_eq!(bus.word(REG_HCI_MIX_CFG), AUX_TO_FAST_CLOCK);
         assert_eq!(bus.word(REG_ANAPARSW_MAC_0), 1 << 28);
     }
@@ -282,7 +334,7 @@ mod tests {
     #[test]
     fn a_silent_bridge_leaves_l1_off_and_says_so() {
         let mut bus = Bus::default();
-        let mut link = Link::configure(&mut bus, 0, 0, HOST_L1, true).unwrap();
+        let mut link = Link::configure(&mut bus, spec(), 0, 0, HOST_L1, true).unwrap();
         assert!(link.answered());
         bus.silent = true;
         link.set_l1(&mut bus, true).unwrap();
