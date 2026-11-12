@@ -61,11 +61,8 @@ mod system;
 mod tables;
 mod ui;
 #[global_allocator]
-pub(crate) static ALLOCATOR: heap::Heap = heap::Heap::new().reporting_failures(|report| {
-    use core::fmt::Write;
-    // Serial is bounded, lock-free port I/O: no allocation or queue.
-    let _ = serial::Serial.write_fmt(report);
-});
+pub(crate) static ALLOCATOR: heap::Heap =
+    heap::Heap::new().reporting_failures(output::heap_refused);
 /// The live firmware keeps its boot-service pages. Budget the first heap from
 /// the conventional pages still available after the pristine image copy.
 /// Before the heap exists, so its refusals are an [`EarlyText`].

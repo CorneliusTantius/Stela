@@ -1,5 +1,6 @@
 //! The boot's header block: which `stela.efi` ran on which PC and when, so
 //! a log a user sends can be matched to a build and to hardware.
+use crate::log_style::{RULE, THIN_RULE};
 use alloc::{format, string::String};
 
 /// What the line names.
@@ -96,10 +97,6 @@ pub fn smbios_string(table: &[u8], kind: u8, offset: usize) -> Option<&[u8]> {
     None
 }
 
-/// The rule above and below the header block.
-pub const RULE: &str =
-    "================================================================================";
-
 /// The header block, each line labelled in an 8-character column:
 ///
 /// ```text
@@ -129,7 +126,7 @@ pub fn header(identity: &Identity<'_>) -> String {
         crate::log_style::size(identity.ram_bytes),
         identity.firmware_vendor,
         identity.firmware_revision,
-        RULE.replace('=', "-"),
+        THIN_RULE,
     )
 }
 
@@ -171,7 +168,7 @@ mod tests {
                 "{RULE}\nSTELA   0.1.0, build db45c012c4f1, started 2026-11-11 18:44:05 \
                  (firmware clock)\nPC      Intel(R) Core(TM) i7-12700K, family 0x6 model 0x97 \
                  stepping 2\n        16.0 GiB RAM, firmware \"EDK II\" revision 0x10000\n{}\n",
-                RULE.replace('=', "-")
+                THIN_RULE
             )
         );
         // Every line keeps to 80 columns but the CPU's, and is laid out

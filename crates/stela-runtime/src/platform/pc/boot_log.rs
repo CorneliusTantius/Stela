@@ -59,6 +59,14 @@ pub const RING_BYTES: u64 = LOG_BYTES - HEADER_BYTES;
 pub const PENDING_BYTES: usize = 1 << 20;
 pub const MAGIC: &[u8; 8] = b"STELALOG";
 pub const VERSION: u32 = 1;
+/// The rule that opens a boot's header block and closes its outcome block.
+pub const RULE: &str =
+    "================================================================================";
+/// The rule that closes the header block and opens the outcome block.
+pub const THIN_RULE: &str =
+    "--------------------------------------------------------------------------------";
+/// The line of a boot's outcome block that says how it ended.
+pub const OUTCOME: &str = "OUTCOME ";
 /// The header fields the checksum covers.
 const FIELDS: usize = 40;
 const RECORD: usize = FIELDS + 32;

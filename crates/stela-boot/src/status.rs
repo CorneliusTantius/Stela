@@ -483,18 +483,21 @@ pub fn take_screen(screen: Option<console::Framebuffer>) {
 }
 
 /// The running step's title, else the last finished step's, for the
-/// outcome of a boot that stops.
-pub fn current() -> Option<String> {
-    let state = STATE.0.try_borrow().ok()?;
+/// outcome of a boot that stops, given to `f` without the heap, which a
+/// panic's report may not reach.
+pub fn current<R>(f: impl FnOnce(Option<&str>) -> R) -> R {
+    let Ok(state) = STATE.0.try_borrow() else {
+        return f(None);
+    };
     if let Some(running) = &state.running {
-        return Some(running.title.clone());
+        return f(Some(&running.title));
     }
-    state
+    f(state
         .history
         .lines()
         .rev()
         .find(|line| !line.starts_with('i'))
-        .map(|line| String::from(line.get(1..).unwrap_or_default()))
+        .map(|line| line.get(1..).unwrap_or_default()))
 }
 
 /// The finished lines so far.

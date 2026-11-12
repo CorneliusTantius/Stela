@@ -58,6 +58,10 @@ pub const WARN: &str = "WARN  ";
 pub const FAIL: &str = "FAIL  ";
 pub const NOTE: &str = "NOTE  ";
 
+/// The rules around a boot's header and outcome blocks, and the line that
+/// says how it ended.
+pub use stela_runtime::pc::boot_log::{OUTCOME, RULE, THIN_RULE};
+
 /// Lines that keep their own form: test scripts read them as they are.
 const RAW: &[&str] = &[
     "STELA",
@@ -68,7 +72,7 @@ const RAW: &[&str] = &[
     "maintenance overrun",
     "MMU fault",
     "RESET ",
-    "OUTCOME ",
+    OUTCOME,
 ];
 
 /// How [`layout`] places the start of a line.

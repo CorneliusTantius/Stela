@@ -364,7 +364,7 @@ fn cpu() -> Cpu {
 
 /// This CPU's local APIC ID: its x2APIC ID from leaf 0xB when the CPU
 /// has that leaf, else the initial xAPIC ID.
-fn apic_id() -> u32 {
+pub(crate) fn apic_id() -> u32 {
     if __cpuid(0).eax >= 0xb {
         let topology = __cpuid_count(0xb, 0);
         if topology.ebx != 0 {

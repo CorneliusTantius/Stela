@@ -457,12 +457,13 @@ struct Sink {
 
 impl Sink {
     /// Move the store in progress on: collect the running request's result
-    /// and start the next; with `wait`, until the store is done.
-    fn advance(&mut self, wait: bool) -> Result<(), BlockError> {
+    /// and start the next; with `until`, until the store is done or the
+    /// deadline passes, which leaves the rest for a later call.
+    fn advance(&mut self, until: Option<&Deadline>) -> Result<(), BlockError> {
         loop {
             if let Some(request) = self.request.as_mut() {
                 let Some(finished) = request.poll(&mut *self.device) else {
-                    if !wait {
+                    if until.is_none_or(Deadline::passed) {
                         return Ok(());
                     }
                     core::hint::spin_loop();
@@ -495,6 +496,28 @@ impl Sink {
 const MACHINE_FLUSH_SECONDS: u64 = 5;
 /// Seconds between the USB log's stores while the engine runs.
 const USB_FLUSH_SECONDS: u64 = 10;
+/// The most seconds [`flush_log`] waits for the stores: a device that takes
+/// longer keeps the rest for a later store, and a stop halts without it.
+const STORE_WAIT_SECONDS: u64 = 10;
+
+/// A point in time a wait gives up at.
+struct Deadline(u64);
+
+impl Deadline {
+    /// `seconds` from now; before the counter's rate is known, at least as
+    /// long, assuming the fastest counter a PC has.
+    fn after(seconds: u64) -> Self {
+        let hz = match TSC_HZ.load(Ordering::Relaxed) {
+            0 => 6_000_000_000,
+            hz => hz,
+        };
+        Self(rdtsc().wrapping_add(seconds * hz))
+    }
+
+    fn passed(&self) -> bool {
+        rdtsc() >= self.0
+    }
+}
 
 fn rdtsc() -> u64 {
     // SAFETY: RDTSC has no memory effects.
@@ -583,6 +606,11 @@ impl<const N: usize> Default for Text<N> {
 impl<const N: usize> Text<N> {
     fn as_bytes(&self) -> &[u8] {
         &self.bytes[..self.length]
+    }
+
+    /// The text: only whole strings are written ([`Write::write_str`]).
+    fn as_str(&self) -> &str {
+        core::str::from_utf8(self.as_bytes()).unwrap_or_default()
     }
 }
 
@@ -1013,11 +1041,27 @@ pub fn close_logs() {
 }
 
 /// Store in every open log the output it does not hold yet, waiting for
-/// the stores. A USB log that fails is reported and closed; a failed
-/// machine-state store stops the machine. Output printed during the flush
-/// is not recorded.
+/// the stores at most [`STORE_WAIT_SECONDS`]. A USB log that fails is
+/// reported and closed; a failed machine-state store stops the machine,
+/// unless a panic is being reported. Output printed during the flush is not
+/// recorded.
 pub fn flush_log() {
     flush_where(|_| true, true);
+}
+
+/// What [`flush_where`] did.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stored {
+    /// Every due log holds the record, or no log is open.
+    All,
+    /// Another processor, or this one below, holds the logs.
+    Busy,
+    /// This processor stopped inside the host drivers, which hold the disks.
+    InsideDrivers,
+    /// A device refused a store; that log is closed.
+    Refused,
+    /// A store had not finished when the wait ran out.
+    Unfinished,
 }
 
 /// Begin storing the logs whose store is due, the machine state's every
@@ -1049,7 +1093,7 @@ pub fn advance_logs() {
 /// A log store is in progress ([`advance_logs`]).
 static STORING: AtomicBool = AtomicBool::new(false);
 
-fn flush_where(due: impl Fn(&Sink) -> bool, wait: bool) {
+fn flush_where(due: impl Fn(&Sink) -> bool, wait: bool) -> Stored {
     // The interrupted driver call holds the disks' lock and may be partway
     // through a request of its own.
     if crate::engine::inside_host_drivers() {
@@ -1059,10 +1103,12 @@ fn flush_where(due: impl Fn(&Sink) -> bool, wait: bool) {
                 "LOG not stored: this processor stopped inside the host drivers\n"
             ));
         }
-        return;
+        return Stored::InsideDrivers;
     }
     let mut failed = Vec::new();
-    with_sinks(false, |sinks| {
+    let until = wait.then(|| Deadline::after(STORE_WAIT_SECONDS));
+    let mut unfinished = false;
+    let held = with_sinks(false, |sinks| {
         // A log whose store is in progress takes new bytes at its next one.
         let is_due = |sink: &Sink| !sink.writer.storing() && due(sink);
         // Take the record's new bytes while no processor adds to it, then
@@ -1088,21 +1134,33 @@ fn flush_where(due: impl Fn(&Sink) -> bool, wait: bool) {
             if is_due(sink) && sink.writer.begin_store() {
                 sink.began = Some(rdtsc());
             }
-            match sink.advance(wait) {
+            match sink.advance(until.as_ref()) {
                 Ok(()) => index += 1,
                 Err(error) => failed.push((sinks.remove(index).kind, error)),
             }
         }
-        STORING.store(
-            sinks.iter().any(|sink| sink.writer.storing()),
-            Ordering::Release,
-        );
+        let storing = sinks.iter().any(|sink| sink.writer.storing());
+        STORING.store(storing, Ordering::Release);
+        unfinished = wait && storing;
     });
+    if unfinished {
+        arguments(format_args!(
+            "LOG store not finished after {STORE_WAIT_SECONDS} s; the rest is stored later, \
+             and a stop now leaves it out\n"
+        ));
+    }
+    let refused = !failed.is_empty();
     for (kind, error) in failed {
         arguments(format_args!("LOG refused: {error}\n"));
-        if kind == Log::Machine {
+        if kind == Log::Machine && !PANICKING.load(Ordering::Relaxed) {
             fatal("the boot log could not be stored");
         }
+    }
+    match (held, refused, unfinished) {
+        (None, ..) => Stored::Busy,
+        (_, true, _) => Stored::Refused,
+        (_, _, true) => Stored::Unfinished,
+        _ => Stored::All,
     }
 }
 
@@ -1180,23 +1238,114 @@ static REASON: Global<Option<alloc::string::String>> = Global(RefCell::new(None)
 
 /// End the boot's block in the log: where it stopped, when, and why.
 fn outcome(code: u32) {
+    let reason = REASON.0.try_borrow().ok();
+    outcome_lines(
+        code,
+        reason.as_ref().and_then(|reason| reason.as_deref()),
+        |line| arguments(format_args!("{line}")),
+    );
+}
+
+/// The outcome block's lines, given to `each` in pieces that end each line
+/// with its line feed, built without the heap for a panic's report.
+fn outcome_lines(code: u32, reason: Option<&str>, mut each: impl FnMut(&str)) {
+    use stela_boot_core::log_style::{OUTCOME, RULE, THIN_RULE};
     let millis = match TSC_HZ.load(Ordering::Relaxed) {
         0 => 0,
         hz => rdtsc() / (hz / 1000).max(1),
     };
-    let step = crate::status::current();
-    let reason = REASON.0.try_borrow().ok().and_then(|reason| reason.clone());
-    let rule = "--------------------------------------------------------------------------------";
-    arguments(format_args!("{rule}\n"));
-    arguments(format_args!(
-        "OUTCOME stopped in \"{}\" at {}.{} s, code {code:#x}{}{}\n",
-        step.as_deref().unwrap_or("the start"),
-        millis / 1000,
-        millis % 1000 / 100,
-        if reason.is_some() { ": " } else { "" },
-        reason.as_deref().unwrap_or(""),
-    ));
-    arguments(format_args!("{}\n", rule.replace('-', "=")));
+    let mut line = Text::<512>::default();
+    crate::status::current(|step| {
+        let _ = write!(
+            line,
+            "{OUTCOME}stopped in \"{}\" at {}.{} s, code {code:#x}",
+            step.unwrap_or("the start"),
+            millis / 1000,
+            millis % 1000 / 100,
+        );
+    });
+    if let Some(reason) = reason
+        && write!(line, ": {reason}").is_err()
+    {
+        let _ = line.write_str(": (reason longer than the line)");
+    }
+    let _ = line.write_str("\n");
+    each(THIN_RULE);
+    each("\n");
+    each(line.as_str());
+    each(RULE);
+    each("\n");
+}
+
+/// A panic is being reported ([`at_panic`]): a refused store must not stop
+/// the machine a second way.
+static PANICKING: AtomicBool = AtomicBool::new(false);
+
+/// Keep `report`, a panic's lines the serial port already has, in the
+/// record with the held-back detail and the outcome block, which the port
+/// gets too, then store the logs, waiting at most [`STORE_WAIT_SECONDS`].
+/// Allocates nothing before the store; the store itself needs the heap, and
+/// a panic inside it is reported by the panic handler. `Err` says why the
+/// logs do not hold the panic.
+pub(crate) fn at_panic(report: &str, reason: &str) -> Result<(), &'static str> {
+    PANICKING.store(true, Ordering::Relaxed);
+    let kept = record_only(report);
+    release_held();
+    outcome_lines(0x11, Some(reason), |line| {
+        let _ = Serial.write_str(line);
+        record_only(line);
+    });
+    // The port gets this line last, after what the store did.
+    record_only("STELA STOPPED code=0x11; power off to continue\n");
+    if !kept {
+        return Err("the panic came while this processor wrote the log, which does not hold it");
+    }
+    match with_sinks(false, |sinks| !sinks.is_empty()) {
+        None => return Err("the panic came while a log was being stored"),
+        Some(false) => return Err("no log is open yet at this point of the boot"),
+        Some(true) => {}
+    }
+    match flush_where(|_| true, true) {
+        Stored::All => Ok(()),
+        Stored::Busy => Err("another processor holds the logs"),
+        Stored::InsideDrivers => {
+            Err("the panic came inside the host drivers, which hold the disks")
+        }
+        Stored::Refused => Err("the USB refused the store"),
+        Stored::Unfinished => Err("the store did not finish in time"),
+    }
+}
+
+/// Add `text` to the record only, for lines the serial port has already:
+/// `false` when another processor held the record past the wait, or this
+/// one holds it below.
+fn record_only(text: &str) -> bool {
+    exclusive(|| {
+        let Ok(mut record) = RECORD.0.try_borrow_mut() else {
+            return false;
+        };
+        for line in text.split_inclusive('\n') {
+            if LINE_START.load(Ordering::Relaxed) {
+                stamp(&mut record);
+            }
+            record.push(line.as_bytes());
+            LINE_START.store(line.ends_with('\n'), Ordering::Relaxed);
+        }
+        true
+    })
+    .unwrap_or(false)
+}
+
+/// Report the heap's first refused allocation, `report`: to the serial port
+/// at once, then to the record, so the logs keep why a boot ran out of
+/// memory. No queue, heap or log store runs here.
+pub fn heap_refused(report: fmt::Arguments<'_>) {
+    let _ = Serial.write_fmt(report);
+    let mut text = Text::<2048>::default();
+    if text.write_fmt(report).is_err() {
+        let _ = text.write_str("\n[heap report longer than its buffer]\n");
+    }
+    record_only(text.as_str());
 }
 
 /// Stop before allocator initialization. UART/record formatting and UEFI's
