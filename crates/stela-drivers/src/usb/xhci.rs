@@ -1027,6 +1027,22 @@ impl Controller {
         let result = self.minimum.wait_us(microseconds);
         self.minimum_status(result)
     }
+    /// A minimum interval looked at without waiting, when the provider
+    /// keeps one; `None` when it can only wait in full.
+    pub(in crate::usb) fn begin_minimum(
+        &mut self,
+        microseconds: u64,
+    ) -> Result<Option<Box<dyn crate::bus::pci::power::Interval>>, BlockError> {
+        let result = self.minimum.begin_interval(microseconds);
+        self.minimum_status(result)
+    }
+    pub(in crate::usb) fn minimum_elapsed(
+        &mut self,
+        interval: &dyn crate::bus::pci::power::Interval,
+    ) -> Result<bool, BlockError> {
+        let result = self.minimum.interval_elapsed(interval);
+        self.minimum_status(result)
+    }
 
     /// Before any new command-dependent DMA mutation or doorbell. A late
     /// completion cannot establish a new command generation or undo poison.
