@@ -116,6 +116,10 @@ const ANTENNA_AND_COMBINING_MBM: i32 = 600 + 301;
 
 /// What the station goes without when config space stops answering the chip.
 const LINK_SILENT: &str = "PCIe link power save, for a config space bridge that did not finish";
+/// What rtw88 also only skips or warns of on the receive ring.
+const RECEIVE_DROPPED: &str = "received descriptors the chip filled in wrongly, which are dropped";
+const RECEIVE_TAG_SLIPPED: &str =
+    "received buffers whose DMA tag was out of step (PCIe bus timeouts), which are still taken";
 
 fn failed<E: Debug>(step: &'static str) -> impl FnOnce(E) -> String {
     move |error| format!("{step}: {error:?}")
@@ -201,6 +205,8 @@ pub struct Hardware {
     /// The MSI reaches the core that looks for frames.
     vector: bool,
     limitations: Vec<&'static str>,
+    /// Limitations already told once, which a repeat does not tell again.
+    reported: Vec<&'static str>,
 }
 
 impl Hardware {
@@ -291,7 +297,16 @@ impl Hardware {
             keys: 0,
             vector,
             limitations,
+            reported: Vec::new(),
         })
+    }
+
+    /// Tell the station of `limitation` the first time it happens.
+    fn limit_once(&mut self, limitation: &'static str) {
+        if !self.reported.contains(&limitation) {
+            self.reported.push(limitation);
+            self.limitations.push(limitation);
+        }
     }
 
     /// `rtw_hci_link_ps`.
@@ -714,6 +729,14 @@ impl Device for Hardware {
                 sink(item);
             })
             .map_err(failed("receive"))?;
+        for (seen, limitation) in [
+            (self.receive.dropped(), RECEIVE_DROPPED),
+            (self.receive.tag_slips(), RECEIVE_TAG_SLIPPED),
+        ] {
+            if seen != 0 {
+                self.limit_once(limitation);
+            }
+        }
         self.transmit
             .reclaim_frames()
             .map_err(failed("transmit reclaim"))?;
