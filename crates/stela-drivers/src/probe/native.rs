@@ -869,6 +869,23 @@ impl wifi::intel::boot::FunctionOwner for IntelOwner {
         }
         Ok(reset)
     }
+    /// [`Self::reset`] a step at a time, for a recovery once the guest runs.
+    #[expect(
+        clippy::await_holding_refcell_ref,
+        reason = "the reset holds the function through every step; nothing else may reach it meanwhile"
+    )]
+    fn reset_in_steps(self: Rc<Self>) -> Option<wifi::intel::boot::ResetSteps> {
+        Some(Box::pin(async move {
+            let mut function = self.function.borrow_mut();
+            let reset = function
+                .function_level_reset_in_steps(self.minimum.as_ref())
+                .await?;
+            if reset && let Some(vector) = &self.vector {
+                vector.enable(&mut function)?;
+            }
+            Ok(reset)
+        }))
+    }
 }
 
 /// The ACPI companion of the function at `address`, as Linux's
