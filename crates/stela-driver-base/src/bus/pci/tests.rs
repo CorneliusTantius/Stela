@@ -1035,6 +1035,32 @@ fn a_function_reset_waits_for_requests_and_the_function_and_puts_its_setup_back(
     assert_eq!(config.words[0x70 / 4], 3);
 }
 
+/// The 60 s wait for a function to come back from its reset ends with the
+/// device's start budget.
+#[test]
+fn a_function_silent_after_its_reset_ends_with_the_start_budget() {
+    const CLOCK: crate::Clock = crate::Clock {
+        ticks_per_microsecond: 1,
+    };
+    let _virtual = crate::test_clock::virtualize();
+    let budget = crate::budget::Budget::start(CLOCK, 2_000_000).unwrap();
+    let mut function = resettable(1 << 28, u32::MAX);
+    let mut waited = 0;
+    let reset = function.function_level_reset_with(|microseconds| {
+        waited += microseconds;
+        crate::test_clock::advance(CLOCK, microseconds);
+        Ok(())
+    });
+    assert_eq!(
+        reset,
+        Err(BlockError::Unsupported(
+            "PCI function did not return from its reset"
+        ))
+    );
+    assert!(waited < 4_000_000, "{waited}");
+    assert!(budget.expired().is_some());
+}
+
 #[test]
 fn a_function_without_a_reset_is_left_alone_and_one_that_stays_silent_is_an_error() {
     let mut function = resettable(0, 0);

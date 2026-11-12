@@ -200,6 +200,13 @@ impl Drop for Budget {
     }
 }
 
+/// Whether this processor holds an armed device start budget: the probe
+/// is starting a device here, before the guest runs. A driver serviced
+/// from guest exits finds none, and must then keep each pass short.
+pub fn armed() -> bool {
+    state::armed() && state::get().owner == state::processor()
+}
+
 /// Whether this processor's armed budget has passed at `counter`. The
 /// first wait to see it passed is kept as the step the device stopped at.
 #[inline]
@@ -376,12 +383,16 @@ mod tests {
     #[test]
     fn dropping_a_budget_restores_the_one_it_replaced() {
         let _virtual = test_clock::virtualize();
+        assert!(!armed());
         let outer = Budget::start(CLOCK, 10_000_000).unwrap();
+        assert!(armed());
         {
             let _inner = Budget::start(CLOCK, 1).unwrap();
             assert!(CLOCK.deadline(5_000_000).passed());
         }
         assert!(!CLOCK.deadline(5_000_000).passed());
         assert!(outer.expired().is_none());
+        drop(outer);
+        assert!(!armed());
     }
 }

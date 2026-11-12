@@ -703,7 +703,11 @@ impl<C: ConfigSpace> Function<C> {
         let mut poll = FLR_READY_POLL_US;
         let mut waited = 0;
         while matches!(config.read16(regs::VENDOR_ID)?, 0xffff | VENDOR_NOT_READY) {
-            if waited >= FLR_READY_US {
+            // The device's start budget bounds the wait as well: a function
+            // that never comes back ends its start, not the boot.
+            if waited >= FLR_READY_US
+                || crate::budget::passed_at(crate::Clock::ticks(), core::panic::Location::caller())
+            {
                 return Err(BlockError::Unsupported(
                     "PCI function did not return from its reset",
                 ));
