@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // Copyright(c) 2018-2019 Realtek Corporation
-//! An RTL8822C's Bluetooth arbiter: `rtw_coex_power_on_setting`,
+//! A Realtek chip's Bluetooth arbiter: `rtw_coex_power_on_setting`,
 //! `rtw_coex_init_hw_config`, and the notifiers, timers and
 //! `rtw_coex_run_coex` that share the air and antennas with the Bluetooth half
 //! as firmware reports it. rtw88's `wl_rx_rate` never moves, so its CCK lock
 //! and the 5 ms slot extension it alone asks for never happen here either.
 //! Each of rtw88's delayed works is a deadline in [`Timers`], and what it
 //! waits for from firmware in a sleep is a [`Request`] answered by a later
-//! report.
+//! report. The chip's own `coex_set_*` operations and tables follow its
+//! `rtw_chip_info`.
 mod actions;
 mod bluetooth;
 mod tables;
@@ -18,8 +19,9 @@ use self::{
     tables::*,
 };
 use super::{
-    efuse::BoardData,
+    efuse::Board,
     features::Report,
+    identity::Chip,
     io::{self, Io},
     registers::*,
     rf::{self, Path, Registers},
@@ -85,6 +87,30 @@ const RF_MASK: u32 = 0xfffff;
 /// `RF_RCKD` and `RF_RCK`.
 const RF_RCKD: u8 = 0xde;
 const RF_RCK: u8 = 0x1d;
+
+/// The RTL8821C's antenna switch and debug pins, of `reg.h` and
+/// `rtw8821c.h`.
+const REG_LED_CFG: u32 = 0x4c;
+const DPDT_SEL_EN: u32 = 1 << 23;
+const DPDT_WL_SEL: u32 = 1 << 24;
+const REG_RFE_CTRL8: u32 = 0xcb4;
+/// `BIT_MASK_R_RFE_SEL_15`'s shift.
+const RFE_SEL_15_SHIFT: u32 = 28;
+const DPDT_CTRL_PIN: u8 = 0x77;
+const PTA_CTRL_PIN: u8 = 0x66;
+const REG_CTRL_TYPE: u32 = 0x67;
+/// `BIT_CTRL_TYPE1 | BIT_CTRL_TYPE2`.
+const CTRL_TYPES: u8 = (1 << 5) | (1 << 4);
+/// `BIT_BCN_QUEUE` of `REG_BT_COEX_TABLE_H + 3`.
+const BCN_QUEUE_PRIORITY: u8 = 1 << 3;
+/// `BIT_BTGP_SPI_EN`, `BIT_BTGP_JTAG_EN`, `BIT_LED1DIS`, `BIT_FSPI_EN`,
+/// `BIT_SDIO_INT` and `BIT_DBG_GNT_WL_BT`.
+const BTGP_SPI_EN: u32 = 1 << 20;
+const BTGP_JTAG_EN: u32 = 1 << 24;
+const LED1_DISABLE: u32 = 1 << 15;
+const FSPI_EN: u32 = 1 << 19;
+const SDIO_INTERRUPT: u32 = 1 << 18;
+const DEBUG_GRANTS: u32 = 1 << 27;
 
 /// `COEX_SCBD_*`.
 const SCORE_ACTIVE: u16 = 1 << 0;
@@ -387,6 +413,61 @@ fn query_hid(kind: u8, data: u8) -> (u32, u32) {
     )
 }
 
+/// `COEX_SWITCH_CTRL_*` as far as a run reaches them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Control {
+    /// `COEX_SWITCH_CTRL_BY_BBSW`.
+    Baseband,
+    /// `COEX_SWITCH_CTRL_BY_PTA`.
+    Pta,
+}
+
+/// `COEX_SWITCH_TO_*` as far as a run reaches them.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Position {
+    Bluetooth,
+    /// `COEX_SWITCH_TO_WLA`: Wi-Fi's 5 GHz port.
+    WifiA,
+    NoCare,
+    /// `COEX_SWITCH_TO_WLG_BT`: both on the 2.4 GHz port.
+    WifiGBluetooth,
+}
+
+/// `coex_dm->cur_switch_status` of a cleared `coex_dm`: control 0, position 0.
+const SWITCH_CLEARED: (Control, Position) = (Control::Baseband, Position::Bluetooth);
+
+/// `coex_rfe` of `rtw8821c_coex_cfg_rfe_type`; rtw88 never sets its
+/// `ant_switch_diversity`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Switch {
+    /// `rfe_module_type`.
+    module: u8,
+    /// `ant_switch_polarity`.
+    inverse: bool,
+    /// `ant_switch_exist`.
+    exists: bool,
+    /// `wlg_at_btg`: Wi-Fi's 2.4 GHz shares Bluetooth's port.
+    wifi_g_at_bluetooth: bool,
+}
+
+impl Switch {
+    fn of(rfe: u8) -> Self {
+        let (inverse, exists, wifi_g_at_bluetooth) = match rfe {
+            2 | 10 | 7 | 15 => (false, true, true),
+            3 | 11 => (true, true, false),
+            4 | 12 => (true, true, true),
+            5 | 13 | 6 | 14 => (false, false, false),
+            _ => (false, true, false),
+        };
+        Self {
+            module: rfe,
+            inverse,
+            exists,
+            wifi_g_at_bluetooth,
+        }
+    }
+}
+
 /// An arbiter's state.
 #[derive(Debug)]
 pub struct Coex {
@@ -394,6 +475,13 @@ pub struct Coex {
     combined: bool,
     /// `efuse->share_ant`.
     shared: bool,
+    /// The chip's tables and what of its `rtw_chip_info` the arbiter reads.
+    params: &'static Params,
+    chip: Chip,
+    /// `coex_rfe` of a chip that steers an antenna switch itself.
+    switch: Option<Switch>,
+    /// `coex_dm->cur_switch_status`.
+    switch_status: (Control, Position),
     /// `coex_stat->kt_ver`.
     version: u8,
     /// `coex_stat->score_board`, what this side last told Bluetooth.
@@ -490,14 +578,30 @@ struct Limited {
 
 impl Coex {
     /// `rtw_chip_efuse_info_setup`'s reading of `board`.
-    pub fn new(board: &BoardData) -> Self {
-        Self::of(board.rf_board_raw, board.bt_raw)
+    pub fn new(board: &Board) -> Self {
+        let raw = board.raw();
+        Self::of_chip(
+            board.profile().chip(),
+            raw.rfe_raw,
+            raw.rf_board_raw,
+            raw.bt_raw,
+        )
     }
 
+    #[cfg(test)]
     fn of(option: u8, bluetooth: u8) -> Self {
+        Self::of_chip(Chip::Rtl8822C, 0, option, bluetooth)
+    }
+
+    fn of_chip(chip: Chip, rfe: u8, option: u8, bluetooth: u8) -> Self {
+        let params = params(chip);
         Self {
             combined: option != 0xff && option & 0xe0 == 0x20,
             shared: bluetooth & 1 != 0,
+            params,
+            chip,
+            switch: (chip == Chip::Rtl8821C).then(|| Switch::of(rfe)),
+            switch_status: SWITCH_CLEARED,
             version: 0,
             score: 0,
             stopped: true,
@@ -525,7 +629,7 @@ impl Coex {
             calibration_tries: CALIBRATION_TRIES,
             calibration_waited: 0,
             calibration_cut: false,
-            bluetooth: Bluetooth::default(),
+            bluetooth: Bluetooth::of(params.bluetooth),
             hid: HidDevices::default(),
             counters: Counters::default(),
             timers: Timers::default(),
@@ -600,6 +704,16 @@ impl Coex {
         Ok(io.write8(register, value & !bits)?)
     }
 
+    fn write32_set<I: Io>(io: &mut I, register: u32, bits: u32) -> Result<(), Error> {
+        let value = io.read32(register)?;
+        Ok(io.write32(register, value | bits)?)
+    }
+
+    fn write32_clear<I: Io>(io: &mut I, register: u32, bits: u32) -> Result<(), Error> {
+        let value = io.read32(register)?;
+        Ok(io.write32(register, value & !bits)?)
+    }
+
     fn write8_bit<I: Io>(io: &mut I, register: u32, bit: u8, set: bool) -> Result<(), Error> {
         if set {
             Self::write8_set(io, register, bit)
@@ -659,20 +773,81 @@ impl Coex {
         Self::write8_bit(io, REG_SYS_SDIO_CTRL + 3, MUX_CONTROL_PATH, wifi)
     }
 
-    /// `rtw8822c_coex_cfg_rfe_type`: this side keeps LTE coexistence off.
-    fn rfe<I: Io>(io: &mut I) -> Result<(), Error> {
+    /// `coex_set_rfe_type`. `rtw8822c_coex_cfg_rfe_type` keeps LTE
+    /// coexistence off; `rtw8821c_coex_cfg_rfe_type` only reads the board,
+    /// which [`Switch::of`] did.
+    fn rfe<I: Io>(&self, io: &mut I) -> Result<(), Error> {
+        if self.chip == Chip::Rtl8821C {
+            return Ok(());
+        }
         Self::arbiter_write(io, LTE_COEX_CTRL, LTE_COEX_ENABLE, 0)?;
         Self::arbiter_write(io, LTE_WL_TRX_CTRL, 0xffff, 0xffff)?;
         Self::arbiter_write(io, LTE_BT_TRX_CTRL, 0xffff, 0xffff)
     }
 
-    /// `rtw8822c_coex_cfg_gnt_debug`.
-    fn debug_pins<I: Io>(io: &mut I) -> Result<(), Error> {
+    /// `rtw8822c_coex_cfg_gnt_debug` and `rtw8821c_coex_cfg_gnt_debug`.
+    fn debug_pins<I: Io>(&self, io: &mut I) -> Result<(), Error> {
+        if self.chip == Chip::Rtl8821C {
+            Self::write32_clear(io, REG_PAD_CTRL1, BTGP_SPI_EN)?;
+            Self::write32_clear(io, REG_PAD_CTRL1, BTGP_JTAG_EN)?;
+            Self::write32_clear(io, REG_GPIO_MUXCFG, FSPI_EN)?;
+            Self::write32_clear(io, REG_PAD_CTRL1, LED1_DISABLE)?;
+            Self::write32_clear(io, REG_SYS_SDIO_CTRL, SDIO_INTERRUPT)?;
+            return Self::write32_clear(io, REG_SYS_SDIO_CTRL, DEBUG_GRANTS);
+        }
         Self::write8_clear(io, REG_PAD_CTRL1 + 2, 1 << 4)?;
         Self::write8_clear(io, REG_PAD_CTRL1 + 3, 1 << 0)?;
         Self::write8_clear(io, REG_GPIO_MUXCFG + 2, 1 << 3)?;
         Self::write8_clear(io, REG_PAD_CTRL1 + 1, 1 << 7)?;
         Self::write8_clear(io, REG_SYS_SDIO_CTRL + 3, 1 << 3)
+    }
+
+    /// `rtw_coex_set_ant_switch`: `rtw8821c_coex_cfg_ant_switch` on a board
+    /// with a switch; the RTL8822C has none to steer.
+    fn ant_switch<I: Io>(
+        &mut self,
+        io: &mut I,
+        (control, position): (Control, Position),
+    ) -> Result<(), Error> {
+        let Some(switch) = self.switch.filter(|switch| switch.exists) else {
+            return Ok(());
+        };
+        if self.switch_status == (control, position) {
+            return Ok(());
+        }
+        self.switch_status = (control, position);
+        let (control, position) = if switch.wifi_g_at_bluetooth {
+            let position = if switch.inverse {
+                Position::WifiA
+            } else {
+                Position::WifiGBluetooth
+            };
+            (Control::Baseband, position)
+        } else {
+            (control, position)
+        };
+        // Wi-Fi's own pins (not BT's), either polarity's select.
+        let (straight, crossed) = if switch.inverse { (1, 2) } else { (2, 1) };
+        Self::write32_clear(io, REG_LED_CFG, DPDT_SEL_EN)?;
+        Self::write32_set(io, REG_LED_CFG, DPDT_WL_SEL)?;
+        let (pins, select) = match control {
+            Control::Baseband => {
+                let select = match position {
+                    Position::WifiGBluetooth if !matches!(switch.module, 2 | 4) => 3,
+                    Position::WifiGBluetooth => straight,
+                    Position::Bluetooth | Position::WifiA | Position::NoCare => crossed,
+                };
+                (DPDT_CTRL_PIN, select)
+            }
+            Control::Pta => (PTA_CTRL_PIN, straight),
+        };
+        io.write8(REG_RFE_CTRL8, pins)?;
+        let value = io.read32(REG_RFE_CTRL8)?;
+        io.write32(
+            REG_RFE_CTRL8,
+            (value & !(0xf << RFE_SEL_15_SHIFT)) | (select << RFE_SEL_15_SHIFT),
+        )?;
+        Self::write8_set(io, REG_CTRL_TYPE, CTRL_TYPES)
     }
 
     /// `rtw_coex_set_table`.
@@ -692,9 +867,10 @@ impl Coex {
     /// from 100, so that case 1 is none.
     fn table_entry(&self, case: u8) -> Option<Table> {
         if self.shared {
-            SHARED_TABLES.get(usize::from(case)).copied()
+            self.params.shared_tables.get(usize::from(case)).copied()
         } else {
-            SEPARATE_TABLES
+            self.params
+                .separate_tables
                 .get(usize::from(case.wrapping_sub(100)))
                 .copied()
         }
@@ -730,10 +906,18 @@ impl Coex {
 
     /// `rtw_coex_write_scbd`, whose bit 1 stays set while this side runs.
     fn scoreboard<I: Io>(&mut self, io: &mut I, bits: u16, set: bool) -> Result<(), Error> {
-        let value = if set {
-            (self.score | 2) | bits
+        let base = self.score | 2;
+        let value = if !self.params.new_scoreboard_10 && bits & SCORE_FIX_2M != 0 {
+            // The older bit 10 asks for a fixed 2 Mb/s, the other bits kept.
+            if set {
+                base & !SCORE_FIX_2M
+            } else {
+                base | SCORE_FIX_2M
+            }
+        } else if set {
+            base | bits
         } else {
-            (self.score | 2) & !bits
+            base & !bits
         };
         if value != self.score {
             self.score = value;
@@ -758,18 +942,19 @@ impl Coex {
         Self::write8_set(io, REG_SYS_FUNC_EN, BASEBAND_ENABLE)?;
         let bluetooth_off = Self::bluetooth_off(io)?;
         self.bluetooth_disabled = bluetooth_off;
-        Self::rfe(io)?;
+        self.rfe(io)?;
         Self::owner(io, bluetooth_off)?;
+        self.ant_switch(io, (Control::Baseband, Position::Bluetooth))?;
         if let Some(table) = self.table_entry(1) {
             Self::write_table(io, true, table)?;
         }
         // The "red x" workaround.
         io.write8(0xff1a, 0)?;
-        Self::debug_pins(io)
+        self.debug_pins(io)
     }
 
-    /// `rtw8822c_coex_cfg_init`.
-    fn hardware<I: Io>(io: &mut I, report: &Report) -> Result<(), Error> {
+    /// `rtw8822c_coex_cfg_init` and `rtw8821c_coex_cfg_init`.
+    fn hardware<I: Io>(&self, io: &mut I, report: &Report) -> Result<(), Error> {
         Self::write8_set(io, REG_BCN_CTRL, BCN_FUNCTION_ENABLE)?;
         let time = io.read8(REG_BT_TDMA_TIME)?;
         io.write8(REG_BT_TDMA_TIME, (time & !0x3f) | 5)?;
@@ -780,6 +965,10 @@ impl Coex {
         Self::write8_clear(io, REG_QUEUE_CTRL, PTA_EDCCA_ENABLE)?;
         let polarity = io.read16(REG_BT_COEX_V2)?;
         io.write16(REG_BT_COEX_V2, polarity | GNT_BT_POLARITY)?;
+        if self.chip == Chip::Rtl8821C {
+            // The beacon queue always high priority.
+            return Self::write8_set(io, REG_BT_COEX_TABLE_H + 3, BCN_QUEUE_PRIORITY);
+        }
         Self::write8_clear(io, REG_DUMMY_PAGE4_V1, BTCCA_CONTROL)?;
         // SAFETY: `init`'s caller holds this epoch's report and quiet RF.
         let mut rf = unsafe { Registers::new(io, report) }?;
@@ -792,6 +981,8 @@ impl Coex {
     /// # Safety
     /// As [`Self::power_on`], with firmware running.
     pub unsafe fn init<I: Io>(&mut self, io: &mut I, report: &Report) -> Result<Run, Error> {
+        // rtw_coex_init_coex_var's cleared `coex_dm`.
+        self.switch_status = SWITCH_CLEARED;
         self.version = io.read8(0xf1)? >> 4;
         let bluetooth_off = Self::bluetooth_off(io)?;
         self.bluetooth_disabled = bluetooth_off;
@@ -806,8 +997,8 @@ impl Coex {
         // rtw_coex_wl_slot_extend of its first `false`.
         step.command(control(CONTROL_LEAK_AP, [LEAK_DISABLE_5MS, 0, 0, 0, 0]));
         Self::write8_set(step.io, REG_BCN_CTRL, BCN_FUNCTION_ENABLE)?;
-        Self::rfe(step.io)?;
-        Self::hardware(step.io, report)?;
+        self.rfe(step.io)?;
+        self.hardware(step.io, report)?;
         Self::priority(step.io, PRIORITY_TX_RESPONSE, true)?;
         Self::priority(step.io, PRIORITY_TX_BEACON, true)?;
         Self::priority(step.io, PRIORITY_TX_BEACON_QUEUE, true)?;
@@ -817,6 +1008,7 @@ impl Coex {
             Self::grants(step.io, GRANT_LOW, GRANT_HIGH)?;
         }
         Self::owner(step.io, true)?;
+        self.ant_switch(step.io, (Control::Baseband, Position::Bluetooth))?;
         self.stopped = !self.combined;
         self.freeze = self.combined;
         self.scoreboard(step.io, SCORE_ACTIVE | SCORE_ON, true)?;
@@ -835,7 +1027,8 @@ impl Coex {
 
     /// `rtw8822c_coex_cfg_gnt_fix`.
     fn gnt_fix<I: Io>(&mut self, step: &mut Step<'_, I>) -> Result<(), Error> {
-        if self.workaround == self.mode {
+        // rtw8821c_coex_cfg_gnt_fix is empty.
+        if self.chip == Chip::Rtl8821C || self.workaround == self.mode {
             return Ok(());
         }
         self.workaround = self.mode;
@@ -920,7 +1113,25 @@ impl Coex {
             Phase::FiveGhz | Phase::Freerun => GRANT_HIGH,
         };
         Self::grants(io, GRANT_PTA, wifi)?;
-        Self::owner(io, true)
+        Self::owner(io, true)?;
+        let switch = match phase {
+            Phase::TwoGhz => (Control::Pta, Position::NoCare),
+            Phase::FiveGhz => (Control::Baseband, Position::WifiA),
+            Phase::Freerun => (Control::Baseband, Position::WifiGBluetooth),
+        };
+        self.ant_switch(io, switch)
+    }
+
+    /// `wl_rf_para_tx[level]` or `wl_rf_para_rx[level]`. A level past the
+    /// chip's table, which only a game controller asks for and only a chip
+    /// with HID reports finds, takes its last.
+    fn rf_level(&self, transmitting: bool, level: usize) -> RfLevels {
+        let table = if transmitting {
+            self.params.transmit_rf
+        } else {
+            self.params.receive_rf
+        };
+        table[level.min(table.len() - 1)]
     }
 
     /// `rtw_coex_set_rf_para`.
@@ -940,12 +1151,15 @@ impl Coex {
         }
     }
 
-    /// `rtw8822c_coex_cfg_wl_rx_gain`.
+    /// `rtw8822c_coex_cfg_wl_rx_gain`; the RTL8821C's is empty.
     fn set_low_gain<I: Io>(&mut self, step: &mut Step<'_, I>, low: bool) -> Result<(), Error> {
         if low == self.low_gain {
             return Ok(());
         }
         self.low_gain = low;
+        if self.chip == Chip::Rtl8821C {
+            return Ok(());
+        }
         let (rckd, rck) = if low { (0x22, 0x36) } else { (0x20, 0) };
         // SAFETY: `notify`'s caller holds this epoch's report and quiet RF.
         let mut rf = unsafe { Registers::new(&mut *step.io, step.report) }?;
@@ -1063,9 +1277,11 @@ impl Coex {
         self.tdma_on = on;
         self.tdma_case = case;
         let para = if self.shared {
-            SHARED_TDMA.get(usize::from(case))
+            self.params.shared_tdma.get(usize::from(case))
         } else {
-            SEPARATE_TDMA.get(usize::from(case.wrapping_sub(100)))
+            self.params
+                .separate_tdma
+                .get(usize::from(case.wrapping_sub(100)))
         };
         if let Some(&para) = para {
             self.set_tdma(step, para);
@@ -1140,7 +1356,7 @@ impl Coex {
                 Reason::Scanning | Reason::Connecting | Reason::TwoGhz
             );
         self.detect_noise(wifi.cck_frames);
-        for (high, step_level) in self.rssi_high.iter_mut().zip(WIFI_RSSI_STEPS) {
+        for (high, step_level) in self.rssi_high.iter_mut().zip(self.params.wifi_rssi_steps) {
             *high = rssi_high(*high, wifi.rssi, step_level);
         }
         let scanning = self.linkscan || self.connecting_task || self.scanning_task || self.busy;
@@ -1242,7 +1458,7 @@ impl Coex {
                 Mode::FiveGhz
             });
             self.set_path(step.io, true, Phase::FiveGhz)?;
-            self.set_rf(step, RECEIVE_RF[0])?;
+            self.set_rf(step, self.params.receive_rf[0])?;
             self.scoreboard(step.io, SCORE_FIX_2M, false)?;
             let case = if self.shared { 0 } else { 100 };
             self.table(step, false, case)?;
@@ -1252,7 +1468,9 @@ impl Coex {
             self.enact(step, self.plan())?;
         }
         let free = self.mode == Some(Mode::Free);
-        self.set_single_stream(step, free && reason == Reason::Media, free);
+        if self.params.mimo_ps {
+            self.set_single_stream(step, free && reason == Reason::Media, free);
+        }
         self.gnt_fix(step)?;
         let idle = self.bluetooth.status == Status::NotConnectedIdle;
         self.limit_transmissions(step.io, !self.five_ghz && !idle)
@@ -1269,6 +1487,10 @@ impl Coex {
 
     /// `rtw_coex_bt_hid_info_notify`.
     fn hid_report<I: Io>(&mut self, step: &mut Step<'_, I>, bytes: [u8; 8]) -> Result<(), Error> {
+        // A chip without MIMO power save ignores the lists and devices.
+        if !self.params.mimo_ps {
+            return Ok(());
+        }
         let Some(game) = self.hid.report(bytes) else {
             return Ok(());
         };
@@ -1281,6 +1503,9 @@ impl Coex {
 
     /// `rtw_coex_query_bt_hid_list`.
     fn query_hid_devices<I>(&self, step: &mut Step<'_, I>) {
+        if !self.params.mimo_ps {
+            return;
+        }
         let high_priority = self.counters.high_tx + self.counters.high_rx;
         if !self.bluetooth.may_hold_a_controller(high_priority) {
             return;
@@ -1337,7 +1562,8 @@ impl Coex {
                 .reenable
                 .get_or_insert(step.now + 15 * SECOND_US);
         }
-        let Some(changes) = self.bluetooth.report(bytes) else {
+        let high_priority = (self.counters.high_tx, self.counters.high_rx);
+        let Some(changes) = self.bluetooth.report(bytes, high_priority) else {
             return Ok(());
         };
         self.follow_report(step, changes);
@@ -1768,6 +1994,81 @@ mod tests {
     }
 
     #[test]
+    fn an_rtl8821c_reads_its_own_tables_and_older_scoreboard() {
+        let coex = Coex::of_chip(Chip::Rtl8821C, 0, 0x20, 1);
+        assert_eq!(coex.table_entry(0).unwrap().wifi, 0x5555_5555);
+        assert_eq!(coex.table_entry(13).unwrap().wifi, 0x6aaa_6aaa);
+        assert!(coex.table_entry(38).is_none());
+        assert_eq!(coex.rf_level(true, 1).bluetooth_power, 20);
+        assert_eq!(coex.rf_level(true, 6), TRANSMIT_RF_8821C[5], "its last");
+        let mut coex = Coex::of_chip(Chip::Rtl8821C, 0, 0x20, 0);
+        assert_eq!(coex.table_entry(123).unwrap().wifi, 0x55ff_55ff);
+        assert_eq!(coex.bluetooth.facts, RTL8821C.bluetooth);
+        let mut bus = Bus::default();
+        // Bit 10 set asks for the fixed 2 Mb/s that a clear call ends.
+        coex.scoreboard(&mut bus, SCORE_FIX_2M, false).unwrap();
+        assert_eq!(
+            bus.word(REG_WIFI_BT_INFO) as u16 & SCORE_FIX_2M,
+            SCORE_FIX_2M
+        );
+        coex.scoreboard(&mut bus, SCORE_FIX_2M, true).unwrap();
+        assert_eq!(bus.word(REG_WIFI_BT_INFO) as u16 & SCORE_FIX_2M, 0);
+    }
+
+    #[test]
+    fn an_rtl8821c_steers_its_antenna_switch_by_phase() {
+        let select = |bus: &Bus| (bus.get(REG_RFE_CTRL8), bus.word(REG_RFE_CTRL8) >> 28);
+        let mut bus = Bus::default();
+        bus.write32(REG_LED_CFG, DPDT_SEL_EN).unwrap();
+        let mut coex = Coex::of_chip(Chip::Rtl8821C, 0, 0x20, 1);
+        // Power-on's (BBSW, BT) is the cleared status: rtw88 writes nothing.
+        coex.power_on(&mut bus).unwrap();
+        assert_eq!(bus.get(REG_CTRL_TYPE), 0);
+        assert!(bus.arbiter.is_empty(), "no LTE coexistence writes");
+        coex.set_path(&mut bus, true, Phase::TwoGhz).unwrap();
+        assert_eq!(select(&bus), (PTA_CTRL_PIN, 2));
+        assert_eq!(bus.word(REG_LED_CFG), DPDT_WL_SEL);
+        assert_eq!(bus.get(REG_CTRL_TYPE), CTRL_TYPES);
+        coex.set_path(&mut bus, true, Phase::FiveGhz).unwrap();
+        assert_eq!(select(&bus), (DPDT_CTRL_PIN, 1));
+        coex.set_path(&mut bus, true, Phase::Freerun).unwrap();
+        assert_eq!(select(&bus), (DPDT_CTRL_PIN, 3));
+        // RFE 4: Wi-Fi's 2.4 GHz on Bluetooth's port, polarity inverse.
+        let (mut bus, mut coex) = (Bus::default(), Coex::of_chip(Chip::Rtl8821C, 4, 0x20, 1));
+        coex.set_path(&mut bus, true, Phase::TwoGhz).unwrap();
+        assert_eq!(select(&bus), (DPDT_CTRL_PIN, 2), "to WLA, crossed");
+        // RFE 2, polarity straight: to WLG_BT on a BTG module.
+        let (mut bus, mut coex) = (Bus::default(), Coex::of_chip(Chip::Rtl8821C, 2, 0x20, 1));
+        coex.set_path(&mut bus, true, Phase::FiveGhz).unwrap();
+        assert_eq!(select(&bus), (DPDT_CTRL_PIN, 2));
+        // RFE 6 has no switch.
+        let (mut bus, mut coex) = (Bus::default(), Coex::of_chip(Chip::Rtl8821C, 6, 0x20, 1));
+        coex.set_path(&mut bus, true, Phase::FiveGhz).unwrap();
+        assert_eq!(select(&bus), (0, 0));
+        assert_eq!(bus.get(REG_CTRL_TYPE), 0);
+    }
+
+    #[test]
+    fn an_rtl8821c_sets_up_its_pta_without_the_rtl8822c_extras() {
+        let mut bus = Bus::default();
+        bus.write32(REG_PAD_CTRL1, BTGP_SPI_EN | BTGP_JTAG_EN | LED1_DISABLE | 1)
+            .unwrap();
+        bus.write32(REG_SYS_SDIO_CTRL, SDIO_INTERRUPT | DEBUG_GRANTS)
+            .unwrap();
+        bus.write8(REG_DUMMY_PAGE4_V1, BTCCA_CONTROL).unwrap();
+        let coex = Coex::of_chip(Chip::Rtl8821C, 0, 0x20, 1);
+        coex.debug_pins(&mut bus).unwrap();
+        assert_eq!(bus.word(REG_PAD_CTRL1), 1);
+        assert_eq!(bus.word(REG_SYS_SDIO_CTRL), 0);
+        // No RF write: the report would refuse this map's 8822C profile.
+        let report = Report::of_two_paths(profile());
+        coex.hardware(&mut bus, &report).unwrap();
+        assert_eq!(bus.get(REG_BT_COEX_TABLE_H + 3), BCN_QUEUE_PRIORITY);
+        assert_eq!(bus.get(REG_DUMMY_PAGE4_V1), BTCCA_CONTROL, "untouched");
+        assert_eq!(bus.word(REG_GPIO_MUXCFG), PTA_PINS);
+    }
+
+    #[test]
     fn the_scoreboard_and_priorities_land_on_their_bits() {
         let mut bus = Bus::default();
         let mut coex = Coex::of(0x20, 0);
@@ -2050,7 +2351,9 @@ mod tests {
             let mut rig = Rig::new(true);
             rig.coex.busy = busy;
             rig.coex.connected = true;
-            rig.coex.bluetooth.report(&[1, low2, 0, 0, 0, high2, 0]);
+            rig.coex
+                .bluetooth
+                .report(&[1, low2, 0, 0, 0, high2, 0], (0, 0));
             rig.coex.bluetooth.update_links();
             let plan = rig.coex.plan();
             (plan.table, plan.tdma, plan.four_slot)

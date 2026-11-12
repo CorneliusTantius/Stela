@@ -394,7 +394,7 @@ pub(super) async unsafe fn boot<I: Io, R: Rings<I>>(
     // SAFETY: the same boot's PHY and report, with HCI started.
     unsafe { rings.inform(geometry, &phy, &report) }?;
     yield_now().await;
-    let mut coex = Coex::new(board.raw());
+    let mut coex = Coex::new(&board);
     coex.power_on(&mut io).map_err(at("coex power on"))?;
     yield_now().await;
     // SAFETY: firmware runs, the PHY is loaded and nothing transmits yet.

@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // Copyright(c) 2018-2019 Realtek Corporation
-//! An RTL8822C's coexistence parameters from `rtw8822c.c`.
+//! Each chip's coexistence parameters, from `rtw8822c.c` and `rtw8821c.c`.
+use crate::wifi::realtek::identity::Chip;
 
 /// A `coex_table_para`: what Bluetooth's and Wi-Fi's slots each allow.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct Table {
     pub bluetooth: u32,
     pub wifi: u32,
@@ -191,3 +192,244 @@ pub(super) const RECEIVE_RF: [RfLevels; 7] = [
     rf(28, true, 5),
     rf(28, true, 5),
 ];
+
+/// `table_sant_8821c`.
+pub(super) const SHARED_TABLES_8821C: [Table; 38] = [
+    table(0x5555_5555, 0x5555_5555),
+    table(0x5555_5555, 0x5555_5555),
+    table(0x6655_5555, 0x6655_5555),
+    table(0xaaaa_aaaa, 0xaaaa_aaaa),
+    table(0x5a5a_5a5a, 0x5a5a_5a5a),
+    table(0xfafa_fafa, 0xfafa_fafa),
+    table(0x6a5a_5555, 0xaaaa_aaaa),
+    table(0x6a5a_56aa, 0x6a5a_56aa),
+    table(0x6a5a_5a5a, 0x6a5a_5a5a),
+    table(0x6655_5555, 0x5a5a_5a5a),
+    table(0x6655_5555, 0x6a5a_5a5a),
+    table(0x6655_5555, 0xaaaa_aaaa),
+    table(0x6655_5555, 0x6a5a_5aaa),
+    table(0x6655_5555, 0x6aaa_6aaa),
+    table(0x6655_5555, 0x6a5a_5aaa),
+    table(0x6655_5555, 0xaaaa_aaaa),
+    table(0xffff_55ff, 0xfafa_fafa),
+    table(0xffff_55ff, 0x6afa_5afa),
+    table(0xaaff_ffaa, 0xfafa_fafa),
+    table(0xaa55_55aa, 0x5a5a_5a5a),
+    table(0xaa55_55aa, 0x6a5a_5a5a),
+    table(0xaa55_55aa, 0xaaaa_aaaa),
+    table(0xffff_ffff, 0x5555_5555),
+    table(0xffff_ffff, 0x5a5a_5a5a),
+    table(0xffff_ffff, 0x5a5a_5a5a),
+    table(0xffff_ffff, 0x5a5a_5aaa),
+    table(0x5555_5555, 0x5a5a_5a5a),
+    table(0x5555_5555, 0xaaaa_aaaa),
+    table(0x6655_5555, 0x6a5a_6a5a),
+    table(0x6655_6655, 0x6655_6655),
+    table(0x6655_6aaa, 0x6a5a_6aaa),
+    table(0xffff_ffff, 0x5aaa_5aaa),
+    table(0x5655_5555, 0x5a5a_5aaa),
+    table(0xdaff_daff, 0xdaff_daff),
+    table(0xddff_ddff, 0xddff_ddff),
+    table(0xe555_5555, 0xe555_5555),
+    table(0xea5a_5a5a, 0xea5a_5a5a),
+    table(0xea6a_6a6a, 0xea6a_6a6a),
+];
+
+/// `table_nsant_8821c`.
+pub(super) const SEPARATE_TABLES_8821C: [Table; 24] = [
+    table(0xffff_ffff, 0xffff_ffff),
+    table(0xffff_55ff, 0xfafa_fafa),
+    table(0x6655_5555, 0x6655_5555),
+    table(0xaaaa_aaaa, 0xaaaa_aaaa),
+    table(0x5a5a_5a5a, 0x5a5a_5a5a),
+    table(0xffff_ffff, 0xffff_ffff),
+    table(0x5afa_5afa, 0x5afa_5afa),
+    table(0x5555_5555, 0xfafa_fafa),
+    table(0x6655_5555, 0xfafa_fafa),
+    table(0x6655_5555, 0x5a5a_5a5a),
+    table(0x6655_5555, 0x6a5a_5a5a),
+    table(0x6655_5555, 0xaaaa_aaaa),
+    table(0xffff_55ff, 0xfafa_fafa),
+    table(0xffff_55ff, 0x5afa_5afa),
+    table(0xffff_55ff, 0xaaaa_aaaa),
+    table(0xffff_55ff, 0xffff_55ff),
+    table(0xaaff_ffaa, 0x5afa_5afa),
+    table(0xaaff_ffaa, 0xaaaa_aaaa),
+    table(0xffff_ffff, 0xfafa_fafa),
+    table(0xffff_55ff, 0xfafa_fafa),
+    table(0xffff_ffff, 0xaaaa_aaaa),
+    table(0xffff_55ff, 0x5afa_5afa),
+    table(0xffff_55ff, 0x5afa_5afa),
+    table(0x55ff_55ff, 0x55ff_55ff),
+];
+
+/// `tdma_sant_8821c`.
+pub(super) const SHARED_TDMA_8821C: [[u8; 5]; 28] = [
+    [0x00, 0x00, 0x00, 0x00, 0x00],
+    [0x61, 0x45, 0x03, 0x11, 0x11],
+    [0x61, 0x3a, 0x03, 0x11, 0x11],
+    [0x61, 0x35, 0x03, 0x11, 0x11],
+    [0x61, 0x20, 0x03, 0x11, 0x11],
+    [0x61, 0x3a, 0x03, 0x11, 0x11],
+    [0x61, 0x45, 0x03, 0x11, 0x10],
+    [0x61, 0x35, 0x03, 0x11, 0x10],
+    [0x61, 0x30, 0x03, 0x11, 0x10],
+    [0x61, 0x20, 0x03, 0x11, 0x10],
+    [0x61, 0x10, 0x03, 0x11, 0x10],
+    [0x61, 0x08, 0x03, 0x11, 0x15],
+    [0x61, 0x08, 0x03, 0x10, 0x14],
+    [0x51, 0x08, 0x03, 0x10, 0x54],
+    [0x51, 0x08, 0x03, 0x10, 0x55],
+    [0x51, 0x08, 0x07, 0x10, 0x54],
+    [0x51, 0x45, 0x03, 0x10, 0x50],
+    [0x51, 0x3a, 0x03, 0x11, 0x50],
+    [0x51, 0x30, 0x03, 0x10, 0x50],
+    [0x51, 0x21, 0x03, 0x10, 0x50],
+    [0x51, 0x10, 0x03, 0x10, 0x50],
+    [0x51, 0x4a, 0x03, 0x10, 0x50],
+    [0x51, 0x08, 0x03, 0x30, 0x54],
+    [0x55, 0x08, 0x03, 0x10, 0x54],
+    [0x65, 0x10, 0x03, 0x11, 0x10],
+    [0x51, 0x10, 0x03, 0x10, 0x51],
+    [0x51, 0x21, 0x03, 0x10, 0x50],
+    [0x61, 0x08, 0x03, 0x11, 0x11],
+];
+
+/// `tdma_nsant_8821c`.
+pub(super) const SEPARATE_TDMA_8821C: [[u8; 5]; 22] = [
+    [0x00, 0x00, 0x00, 0x40, 0x00],
+    [0x61, 0x45, 0x03, 0x11, 0x11],
+    [0x61, 0x25, 0x03, 0x11, 0x11],
+    [0x61, 0x35, 0x03, 0x11, 0x11],
+    [0x61, 0x20, 0x03, 0x11, 0x11],
+    [0x61, 0x10, 0x03, 0x11, 0x11],
+    [0x61, 0x45, 0x03, 0x11, 0x10],
+    [0x61, 0x30, 0x03, 0x11, 0x10],
+    [0x61, 0x30, 0x03, 0x11, 0x10],
+    [0x61, 0x20, 0x03, 0x11, 0x10],
+    [0x61, 0x10, 0x03, 0x11, 0x10],
+    [0x61, 0x10, 0x03, 0x11, 0x11],
+    [0x61, 0x08, 0x03, 0x10, 0x14],
+    [0x51, 0x08, 0x03, 0x10, 0x54],
+    [0x51, 0x08, 0x03, 0x10, 0x55],
+    [0x51, 0x08, 0x07, 0x10, 0x54],
+    [0x51, 0x45, 0x03, 0x10, 0x50],
+    [0x51, 0x3a, 0x03, 0x10, 0x50],
+    [0x51, 0x30, 0x03, 0x10, 0x50],
+    [0x51, 0x21, 0x03, 0x10, 0x50],
+    [0x51, 0x21, 0x03, 0x10, 0x50],
+    [0x51, 0x10, 0x03, 0x10, 0x50],
+];
+
+/// `rf_para_tx_8821c`, likewise without `wl_pwr_dec_lvl`.
+pub(super) const TRANSMIT_RF_8821C: [RfLevels; 6] = [
+    rf(0, false, 7),
+    rf(20, false, 7),
+    rf(17, true, 4),
+    rf(18, true, 4),
+    rf(19, true, 4),
+    rf(20, true, 4),
+];
+
+/// `rf_para_rx_8821c`, likewise without `wl_pwr_dec_lvl`.
+pub(super) const RECEIVE_RF_8821C: [RfLevels; 6] = [
+    rf(0, false, 7),
+    rf(20, false, 7),
+    rf(24, true, 5),
+    rf(26, true, 5),
+    rf(27, true, 5),
+    rf(28, true, 5),
+];
+
+/// `wl_rssi_step_8821c` and `bt_rssi_step_8821c`, in percent: 101 is a
+/// step no RSSI reaches.
+const WIFI_RSSI_STEPS_8821C: [u8; 4] = [101, 45, 101, 40];
+const BLUETOOTH_RSSI_STEPS_8821C: [u8; 4] = [101; 4];
+
+// Every chip's normal levels are the same, which a plan starts from.
+const _: () = assert!(
+    RECEIVE_RF_8821C[0].bluetooth_power == RECEIVE_RF[0].bluetooth_power
+        && RECEIVE_RF_8821C[0].low_gain == RECEIVE_RF[0].low_gain
+        && RECEIVE_RF_8821C[0].bluetooth_lna == RECEIVE_RF[0].bluetooth_lna
+);
+
+/// What of a chip's `rtw_chip_info` the Bluetooth reports are read with.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct BluetoothFacts {
+    /// `bt_rssi_step`.
+    pub rssi_steps: [u8; 4],
+    /// `ble_hid_profile_support`: firmware itself tells a remote control
+    /// from a keyboard over Bluetooth Low Energy.
+    pub low_energy_hid: bool,
+    /// `bt_rssi_type` of `COEX_BTRSSI_RATIO`, rather than dBm.
+    pub rssi_ratio: bool,
+}
+
+impl Default for BluetoothFacts {
+    fn default() -> Self {
+        RTL8822C.bluetooth
+    }
+}
+
+/// A chip's coexistence facts of its `rtw_chip_info`.
+#[derive(Debug)]
+pub(super) struct Params {
+    pub shared_tables: &'static [Table],
+    pub separate_tables: &'static [Table],
+    pub shared_tdma: &'static [[u8; 5]],
+    pub separate_tdma: &'static [[u8; 5]],
+    pub transmit_rf: &'static [RfLevels],
+    pub receive_rf: &'static [RfLevels],
+    /// `wl_rssi_step`.
+    pub wifi_rssi_steps: [u8; 4],
+    /// `new_scbd10_def`: scoreboard bit 10 set means no fixed 2 Mb/s, where
+    /// the older meaning is its clear.
+    pub new_scoreboard_10: bool,
+    /// `wl_mimo_ps_support`: HID reports, game controllers and MIMO power
+    /// save for them.
+    pub mimo_ps: bool,
+    pub bluetooth: BluetoothFacts,
+}
+
+pub(super) const RTL8822C: Params = Params {
+    shared_tables: &SHARED_TABLES,
+    separate_tables: &SEPARATE_TABLES,
+    shared_tdma: &SHARED_TDMA,
+    separate_tdma: &SEPARATE_TDMA,
+    transmit_rf: &TRANSMIT_RF,
+    receive_rf: &RECEIVE_RF,
+    wifi_rssi_steps: WIFI_RSSI_STEPS,
+    new_scoreboard_10: true,
+    mimo_ps: true,
+    bluetooth: BluetoothFacts {
+        rssi_steps: BLUETOOTH_RSSI_STEPS,
+        low_energy_hid: true,
+        rssi_ratio: false,
+    },
+};
+
+pub(super) const RTL8821C: Params = Params {
+    shared_tables: &SHARED_TABLES_8821C,
+    separate_tables: &SEPARATE_TABLES_8821C,
+    shared_tdma: &SHARED_TDMA_8821C,
+    separate_tdma: &SEPARATE_TDMA_8821C,
+    transmit_rf: &TRANSMIT_RF_8821C,
+    receive_rf: &RECEIVE_RF_8821C,
+    wifi_rssi_steps: WIFI_RSSI_STEPS_8821C,
+    new_scoreboard_10: false,
+    mimo_ps: false,
+    bluetooth: BluetoothFacts {
+        rssi_steps: BLUETOOTH_RSSI_STEPS_8821C,
+        low_energy_hid: false,
+        rssi_ratio: true,
+    },
+};
+
+/// `chip`'s parameters; a chip without its own takes the RTL8822C's, whose
+/// arbiter this is.
+pub(super) fn params(chip: Chip) -> &'static Params {
+    match chip {
+        Chip::Rtl8821C => &RTL8821C,
+        _ => &RTL8822C,
+    }
+}

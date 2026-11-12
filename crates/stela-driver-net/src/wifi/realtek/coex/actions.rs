@@ -6,7 +6,7 @@
 use super::{
     Coex,
     bluetooth::Status,
-    tables::{RECEIVE_RF, RfLevels, TRANSMIT_RF},
+    tables::{RECEIVE_RF, RfLevels},
 };
 
 /// `coex_set_ant_phase` of a run.
@@ -152,9 +152,9 @@ impl Coex {
     /// `wl_rf_para_tx[6]` or `wl_rf_para_rx[5]`, for a controller's sake.
     fn free_rf(&self) -> RfLevels {
         if self.transmitting {
-            TRANSMIT_RF[6]
+            self.rf_level(true, 6)
         } else {
-            RECEIVE_RF[5]
+            self.rf_level(false, 5)
         }
     }
 
@@ -411,11 +411,7 @@ impl Coex {
         };
         Plan {
             phase: Phase::Freerun,
-            rf: if self.transmitting {
-                TRANSMIT_RF[level]
-            } else {
-                RECEIVE_RF[level]
-            },
+            rf: self.rf_level(self.transmitting, level),
             freerun: true,
             ..Plan::new(100, 100)
         }
