@@ -64,6 +64,9 @@ impl<L: Link> Link for Located<L> {
     fn receive_reusing(&mut self, frame: &mut Vec<u8>) -> Result<bool, LinkError> {
         self.link.receive_reusing(frame)
     }
+    fn progress(&mut self) -> Option<String> {
+        self.link.progress()
+    }
 }
 
 /// The drivers here that attach through [`NativeServices`].

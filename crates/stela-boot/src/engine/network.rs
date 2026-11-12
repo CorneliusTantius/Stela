@@ -95,6 +95,22 @@ impl Drop for RootLink {
     }
 }
 
+impl RootLink {
+    /// Write the adapter's progress lines to the boot log.
+    fn report(&mut self) {
+        while let Some(line) = self.device.progress() {
+            output::arguments(format_args!("NETWORK {line}\n"));
+        }
+    }
+}
+
+/// Name a DHCPv4 message the adapter sent or received in the boot log.
+fn dhcp(frame: &[u8], direction: &str) {
+    if let Some(message) = stela_runtime::net::dhcp::message(frame) {
+        output::arguments(format_args!("NETWORK DHCP {message} {direction}\n"));
+    }
+}
+
 impl Link for RootLink {
     fn mac(&self) -> Mac {
         self.device.mac()
@@ -103,22 +119,38 @@ impl Link for RootLink {
         // SAFETY: the loader root `storage::open` captured maps this
         // device.
         let _root = unsafe { RestoreRoot::enter(self.root) };
-        self.device.carrier()
+        let carrier = self.device.carrier();
+        self.report();
+        carrier
     }
     fn transmit(&mut self, frame: &[u8]) -> Result<(), LinkError> {
         // SAFETY: as in `carrier`.
         let _root = unsafe { RestoreRoot::enter(self.root) };
-        self.device.transmit(frame)
+        let sent = self.device.transmit(frame);
+        if sent.is_ok() {
+            dhcp(frame, "sent");
+        }
+        sent
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
         // SAFETY: as in `carrier`.
         let _root = unsafe { RestoreRoot::enter(self.root) };
-        self.device.receive()
+        let received = self.device.receive();
+        self.report();
+        if let Ok(Some(frame)) = &received {
+            dhcp(frame, "received");
+        }
+        received
     }
     fn receive_reusing(&mut self, frame: &mut Vec<u8>) -> Result<bool, LinkError> {
         // SAFETY: as in `carrier`.
         let _root = unsafe { RestoreRoot::enter(self.root) };
-        self.device.receive_reusing(frame)
+        let received = self.device.receive_reusing(frame);
+        self.report();
+        if let Ok(true) = received {
+            dhcp(frame, "received");
+        }
+        received
     }
     fn signals(&self) -> bool {
         self.device.signals()

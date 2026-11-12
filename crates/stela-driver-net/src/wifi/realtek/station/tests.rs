@@ -1198,3 +1198,62 @@ fn a_deauthentication_clears_the_port_and_the_cam() {
     assert!(air.cleared.contains(&PAIRWISE_CAM) && air.cleared.contains(&1));
     assert!(air.commands.contains(&commands::media_status(0, false)));
 }
+
+/// Everything the keeper hands the boot log, in order.
+fn progress(wifi: &mut Wifi<Model>) -> Vec<String> {
+    core::iter::from_fn(|| wifi.progress()).collect()
+}
+
+/// The boot log follows a connection step by step, from the scan's counts
+/// to the open port, and never names the network or the AP.
+#[test]
+fn a_connection_reports_each_step_without_the_network_or_the_ap() {
+    let (mut wifi, _model) = connected();
+    let lines = progress(&mut wifi);
+    let steps = [
+        "scan found 1 access points on 2.4 GHz, 0 on 5 GHz and 0 on 6 GHz; 1 of them belong to the configured network",
+        "joining an access point on 2.4 GHz channel 1",
+        "associated; waiting for the access point's 4-way handshake",
+        "4-way handshake: pairwise key installed",
+        "group key 1 installed",
+        "port authorized: connected",
+        "carrier up",
+    ];
+    let mut at = 0;
+    for step in steps {
+        at += lines[at..]
+            .iter()
+            .position(|line| line.contains(step))
+            .unwrap_or_else(|| panic!("{step:?} after line {at} of {lines:#?}"));
+    }
+    let ssid = core::str::from_utf8(SSID).unwrap();
+    let ap = alloc::format!("{}", Mac(AP));
+    for line in &lines {
+        assert!(!line.contains(ssid) && !line.contains(&ap), "{line}");
+    }
+}
+
+/// A scan that misses the network says so without its name.
+#[test]
+fn a_network_the_scan_missed_is_reported_without_its_name() {
+    let (mut wifi, model) = wifi(&OPEN, 1);
+    model.0.borrow_mut().hidden = true;
+    let mut failures = Vec::new();
+    for _ in 0..4000 {
+        model.0.borrow_mut().serve();
+        if let Err(LinkError::Adapter(failure)) = wifi.receive() {
+            failures.push(failure);
+            break;
+        }
+        crate::test_clock::advance(CLOCK, 5_000);
+    }
+    assert_eq!(
+        failures,
+        ["rtw88: the configured network was not found in the scan"]
+    );
+    assert!(
+        progress(&mut wifi)
+            .iter()
+            .any(|line| line.ends_with("failed: the configured network was not found in the scan"))
+    );
+}

@@ -38,8 +38,8 @@ use crate::{
         supplicant::{self, Akm, EAPOL, IntegrityKey, MultiLink, Step, Supplicant},
     },
 };
-use alloc::{boxed::Box, format, string::String, sync::Arc, vec, vec::Vec};
-use core::fmt::Display;
+use alloc::{boxed::Box, collections::VecDeque, format, string::String, sync::Arc, vec, vec::Vec};
+use core::{cell::RefCell, fmt::Display};
 use stela_driver_base::entropy::Entropy;
 use zeroize::Zeroizing;
 
@@ -467,6 +467,24 @@ pub struct Keeper<R: Radio> {
     michael_failed: Option<u64>,
     /// The last scan missed the network, so the next asks for it by name.
     directed: bool,
+    /// Progress lines for the boot log, oldest first, which
+    /// [`Link::progress`] hands out. They never name the network, an
+    /// address or a key.
+    notes: RefCell<VecDeque<String>>,
+    /// The carrier last noted.
+    carrier: bool,
+}
+
+/// How many progress lines wait for the boot log before the oldest goes.
+const NOTES: usize = 64;
+
+/// A band as the boot log names it.
+fn band_name(band: Band) -> &'static str {
+    match band {
+        Band::Ghz2 => "2.4 GHz",
+        Band::Ghz5 => "5 GHz",
+        Band::Ghz6 => "6 GHz",
+    }
 }
 
 impl<R: Radio> Keeper<R> {
@@ -486,7 +504,25 @@ impl<R: Radio> Keeper<R> {
             reported: None,
             michael_failed: None,
             directed: false,
+            notes: RefCell::new(VecDeque::new()),
+            carrier: false,
         }
+    }
+
+    /// Queue one progress line for the boot log.
+    fn note(&self, line: String) {
+        let mut notes = self.notes.borrow_mut();
+        if notes.len() == NOTES {
+            notes.pop_front();
+        }
+        notes.push_back(format!("{}: {line}", R::NAME));
+    }
+
+    /// A failure's plain sentence, with its detail kept for the boot log
+    /// alone.
+    fn detailed(&self, what: &str, detail: impl core::fmt::Debug) -> String {
+        self.note(format!("{what} ({detail:?})"));
+        format!("{}: {what}", R::NAME)
     }
 
     /// The radio, for device models.
@@ -652,7 +688,8 @@ impl<R: Radio> Keeper<R> {
         match parts {
             Ok(parts) => self.next_scan(now, parts),
             Err(error) => {
-                self.fail(format!("{} scan: {error:?}", R::NAME));
+                let message = self.detailed("the scan could not be planned", error);
+                self.fail(message);
                 self.state = State::Waiting {
                     at: now + SCAN_INTERVAL_US,
                 };
@@ -738,16 +775,40 @@ impl<R: Radio> Keeper<R> {
                     }
                 }
                 Err(reason) => {
-                    refusal = Some(format!("offers no supported security: {reason:?}"));
+                    self.note(format!(
+                        "an access point of the network offers no security this station \
+                         supports ({reason:?})"
+                    ));
+                    refusal = Some(String::from("offers no security this station supports"));
                 }
             }
         }
-        let ssid = String::from_utf8_lossy(&self.network.ssid).into_owned();
+        let mut found = [0usize; 3];
+        let mut matching = 0;
+        for (_, bss) in &observed {
+            found[match bss.channel.band {
+                Band::Ghz2 => 0,
+                Band::Ghz5 => 1,
+                Band::Ghz6 => 2,
+            }] += 1;
+            if bss.ssid.as_deref() == Some(&self.network.ssid[..]) {
+                matching += 1;
+            }
+        }
+        self.note(format!(
+            "scan found {} access points on 2.4 GHz, {} on 5 GHz and {} on 6 GHz; {matching} \
+             of them belong to the configured network",
+            found[0], found[1], found[2]
+        ));
         self.directed = best.is_none() && refusal.is_none();
         let Some((handle, bss, security)) = best else {
+            // The network's name stays out of every line.
             self.fail(match refusal {
-                Some(reason) => format!("{}: {ssid} {reason}", R::NAME),
-                None => format!("{}: {ssid} not found", R::NAME),
+                Some(reason) => format!("{}: the configured network {reason}", R::NAME),
+                None => format!(
+                    "{}: the configured network was not found in the scan",
+                    R::NAME
+                ),
             });
             self.state = State::Waiting {
                 at: now + SCAN_INTERVAL_US,
@@ -756,6 +817,15 @@ impl<R: Radio> Keeper<R> {
         };
         let bss = bss.clone();
         drop(observed);
+        self.note(format!(
+            "joining an access point on {} channel {}{} with {:?} security",
+            band_name(bss.channel.band),
+            bss.channel.number,
+            bss.signal_dbm
+                .map(|dbm| format!(" at {dbm} dBm"))
+                .unwrap_or_default(),
+            security.akm
+        ));
         let started = if security.akm == Akm::Sae {
             self.authenticate(handle, bss, security)
                 .map(State::Authenticating)
@@ -798,7 +868,7 @@ impl<R: Radio> Keeper<R> {
             let mut elements = security.element();
             elements.extend_from_slice(&sae::H2E_RSNXE);
             let selection = Selection::new(elements)
-                .map_err(|error| format!("{} 6 GHz SAE selection: {error:?}", R::NAME))?;
+                .map_err(|error| self.detailed("6 GHz SAE could not be set up", error))?;
             self.link.begin_six_ghz_external_authentication(
                 handle,
                 selection,
@@ -834,7 +904,7 @@ impl<R: Radio> Keeper<R> {
         if let Some(error) = unavailable {
             return Err(format!("{} SAE: {error}", R::NAME));
         }
-        let exchange = exchange.map_err(|error| format!("{} SAE: {error:?}", R::NAME))?;
+        let exchange = exchange.map_err(|error| self.detailed("SAE could not start", error))?;
         self.send_sae(&session, exchange.commit())?;
         Ok(Box::new(Authenticating {
             handle,
@@ -993,7 +1063,10 @@ impl<R: Radio> Keeper<R> {
                     ),
                 );
             }
-            Err(error) => return self.failed(now, format!("{} SAE: {error:?}", R::NAME)),
+            Err(error) => {
+                let message = self.detailed("SAE authentication failed", error);
+                return self.failed(now, message);
+            }
         };
         let session = authenticating.session.clone();
         if let Some(frame) = reply
@@ -1024,23 +1097,23 @@ impl<R: Radio> Keeper<R> {
             return self.failed(now, format!("{}: SAE gave no PMK", R::NAME));
         };
         let rsnxe = h2e.then_some(&sae::H2E_RSNXE[..]);
-        let started =
-            self.association(&bss, security, rsnxe)
-                .and_then(|(mut join, _)| {
-                    let mut candidate = candidate(&bss, security, pmk);
-                    if let Some(links) = &links {
-                        let (setup, keyed) = self.multi_link(links, &bss, security, rsnxe)?;
-                        join.request = join.request.with_multi_link(setup).map_err(|error| {
-                            format!("{} multi-link request: {error:?}", R::NAME)
-                        })?;
-                        candidate.bssid = links.affiliation.mld.ap;
-                        candidate.links = Some(keyed);
-                    }
-                    self.link
-                        .associate_external(&session, handle, join)
-                        .map_err(|error| format!("{error}"))?;
-                    Ok(candidate)
-                });
+        let started = self
+            .association(&bss, security, rsnxe)
+            .and_then(|(mut join, _)| {
+                let mut candidate = candidate(&bss, security, pmk);
+                if let Some(links) = &links {
+                    let (setup, keyed) = self.multi_link(links, &bss, security, rsnxe)?;
+                    join.request = join.request.with_multi_link(setup).map_err(|error| {
+                        self.detailed("the multi-link association could not be built", error)
+                    })?;
+                    candidate.bssid = links.affiliation.mld.ap;
+                    candidate.links = Some(keyed);
+                }
+                self.link
+                    .associate_external(&session, handle, join)
+                    .map_err(|error| format!("{error}"))?;
+                Ok(candidate)
+            });
         match started {
             Ok(candidate) => self.state = State::Joining(Box::new(candidate)),
             Err(message) => self.failed(now, message),
@@ -1061,10 +1134,13 @@ impl<R: Radio> Keeper<R> {
             .link
             .advertisement(band)
             .map_err(|error| format!("{error}"))?;
-        let peer = Capabilities::parse(band, Role::AccessPoint, &bss.elements)
-            .map_err(|error| format!("{} AP capabilities: {error:?}", R::NAME))?;
-        let operations = Operations::parse(&bss.elements)
-            .map_err(|error| format!("{} AP operation: {error:?}", R::NAME))?;
+        let peer =
+            Capabilities::parse(band, Role::AccessPoint, &bss.elements).map_err(|error| {
+                self.detailed("the access point's capabilities are unreadable", error)
+            })?;
+        let operations = Operations::parse(&bss.elements).map_err(|error| {
+            self.detailed("the access point's operating channel is unreadable", error)
+        })?;
         let channels = self.link.channels(band);
         let chosen = mode::determine(
             &advertisement.capabilities,
@@ -1073,7 +1149,12 @@ impl<R: Radio> Keeper<R> {
             bss.channel,
             Channels(&channels),
         )
-        .map_err(|refusal| format!("{}: {refusal:?}", R::NAME))?;
+        .map_err(|refusal| {
+            self.detailed(
+                "the access point and this station share no channel width and mode",
+                refusal,
+            )
+        })?;
         let spectrum = connection::spectrum_management(bss.capabilities).then(|| {
             let power = self.link.regulated_power_dbm(bss.channel.frequency_mhz);
             (
@@ -1094,11 +1175,13 @@ impl<R: Radio> Keeper<R> {
             &advertisement.elements,
         );
         let mut local = Capabilities::parse(band, Role::Station, &elements)
-            .map_err(|error| format!("{} request capabilities: {error:?}", R::NAME))?;
+            .map_err(|error| self.detailed("the association request could not be built", error))?;
         if local.he().is_some() {
             local = local
                 .with_local_he_source_maps(advertisement.he_source_maps)
-                .map_err(|error| format!("{} request capabilities: {error:?}", R::NAME))?;
+                .map_err(|error| {
+                    self.detailed("the association request could not be built", error)
+                })?;
         }
         let rates = local.rates().supported & peer.rates().supported;
         let capability = connection::capability(band, chosen.mode, spectrum.is_some());
@@ -1122,7 +1205,7 @@ impl<R: Radio> Keeper<R> {
                 width,
             )
         }
-        .map_err(|error| format!("{} association request: {error:?}", R::NAME))?;
+        .map_err(|error| self.detailed("the association request could not be built", error))?;
         let dtim_period = connection::find(&bss.elements, 5)
             .and_then(|tim| tim.get(1).copied())
             .filter(|&period| period != 0)
@@ -1164,6 +1247,9 @@ impl<R: Radio> Keeper<R> {
         if let Err(error) = self.link.configure() {
             return self.failed(now, format!("{error}"));
         }
+        self.note(String::from(
+            "associated; waiting for the access point's 4-way handshake",
+        ));
         let mut links = candidate.links;
         if let Some(links) = &mut links {
             // The links the AP MLD accepted, the setup link among them.
@@ -1204,7 +1290,10 @@ impl<R: Radio> Keeper<R> {
                     management: None,
                 }
             }
-            Err(error) => self.failed(now, format!("{} supplicant: {error:?}", R::NAME)),
+            Err(error) => {
+                let message = self.detailed("the WPA handshake could not be set up", error);
+                self.failed(now, message);
+            }
         }
     }
 
@@ -1298,10 +1387,14 @@ impl<R: Radio> Keeper<R> {
             })
             .transpose()
             .map_err(|error| format!("{error}"))?;
+        if pairwise.is_some() {
+            self.note(String::from("4-way handshake: pairwise key installed"));
+        }
         if let Some(key) = step.group {
             self.link
                 .install_key(false, key.index, &key.material, key.receive)
                 .map_err(|error| format!("{error}"))?;
+            self.note(format!("group key {} installed", key.index));
         }
         // Each other link's GTK goes to its AP's broadcast WCID.
         for link in step.links {
@@ -1449,6 +1542,7 @@ impl<R: Radio> Keeper<R> {
             integrity: None,
             link_integrity: Vec::new(),
         };
+        self.note(String::from("port authorized: connected"));
         self.failures = 0;
         Ok(())
     }
@@ -1483,6 +1577,11 @@ impl<R: Radio> Keeper<R> {
     fn take_failure(&mut self) -> Option<String> {
         let failure = self.failure.take()?;
         self.reported = Some(failure.clone());
+        // Each failure also reaches the boot log in order with the progress.
+        self.note(format!(
+            "failed: {}",
+            failure.trim_start_matches(R::NAME).trim_start_matches(": ")
+        ));
         Some(failure)
     }
 }
@@ -1493,13 +1592,25 @@ impl<R: Radio> Link for Keeper<R> {
     }
     fn carrier(&mut self) -> bool {
         self.poll();
-        self.link.carrier()
+        let carrier = self.link.carrier();
+        if carrier != self.carrier {
+            self.carrier = carrier;
+            self.note(String::from(if carrier {
+                "carrier up"
+            } else {
+                "carrier down"
+            }));
+        }
+        carrier
     }
     fn signals(&self) -> bool {
         self.link.signals()
     }
     fn due_us(&self) -> Option<u64> {
         self.link.due_us()
+    }
+    fn progress(&mut self) -> Option<String> {
+        self.notes.get_mut().pop_front()
     }
     fn transmit(&mut self, frame: &[u8]) -> Result<(), LinkError> {
         self.link.transmit(frame)

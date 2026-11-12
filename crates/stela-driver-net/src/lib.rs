@@ -159,6 +159,12 @@ pub trait Link {
     fn due_us(&self) -> Option<u64> {
         None
     }
+    /// The next line of the adapter's own progress for the boot log, such as
+    /// a Wi-Fi scan's counts or a handshake step, oldest first. It never
+    /// names a network, an address or a key.
+    fn progress(&mut self) -> Option<String> {
+        None
+    }
 }
 
 mod timing;
