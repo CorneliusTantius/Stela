@@ -151,13 +151,16 @@ fn sized(value: usize, low: usize, high: usize) -> usize {
 }
 
 /// The block table entries for an arena of `code_bytes`, which the host
-/// sizes from its memory ([`LookupTable::with_entries`]).
+/// sizes from its memory ([`LookupTable::with_entries`]): the power of two
+/// at least one entry per [`CODE_BYTES_PER_ENTRY`]. Rounded down, a 976 MiB
+/// window took 2 M entries for its 2.9 M blocks, and half of the entries
+/// fetches would add were put off as other inserts kept displacing them
+/// (run 20261111-025825: `targets=` deferred 513 K of 1.09 M a beat).
 pub fn lookup_entries(code_bytes: usize) -> usize {
-    sized(
-        code_bytes / CODE_BYTES_PER_ENTRY,
-        MIN_LOOKUP_ENTRIES,
-        MAX_LOOKUP_ENTRIES,
-    )
+    (code_bytes / CODE_BYTES_PER_ENTRY)
+        .max(1)
+        .next_power_of_two()
+        .clamp(MIN_LOOKUP_ENTRIES, MAX_LOOKUP_ENTRIES)
 }
 
 /// The ITLB entries for a PE whose arena holds `code_bytes`
@@ -2895,8 +2898,9 @@ mod tests {
         super::itlb_salt(context, ITLB_MASK)
     }
 
-    /// Tables grow with the arena, in powers of two within their bounds:
-    /// a 64 MiB arena keeps the defaults.
+    /// Tables grow with the arena, in powers of two within their bounds
+    /// (the block table's at least one entry per 256 bytes of it): a 64 MiB
+    /// arena keeps the defaults.
     #[test]
     fn tables_are_sized_from_the_arena() {
         const MIB: usize = 1 << 20;
@@ -2904,12 +2908,55 @@ mod tests {
         assert_eq!(itlb_entries(64 * MIB), ITLB_ENTRIES);
         assert_eq!(lookup_entries(16 * MIB), MIN_LOOKUP_ENTRIES);
         assert_eq!(itlb_entries(16 * MIB), MIN_ITLB_ENTRIES);
-        assert_eq!(lookup_entries(100 * MIB), LOOKUP_ENTRIES);
+        assert_eq!(lookup_entries(100 * MIB), 2 * LOOKUP_ENTRIES);
         assert_eq!(lookup_entries(512 * MIB), 1 << 21);
+        assert_eq!(lookup_entries(976 * MIB), 1 << 22);
         assert_eq!(lookup_entries(64 * 1024 * MIB), MAX_LOOKUP_ENTRIES);
         assert_eq!(itlb_entries(512 * MIB), MAX_ITLB_ENTRIES);
         assert_eq!(lookup_entries(0), MIN_LOOKUP_ENTRIES);
         assert_eq!(itlb_entries(0), MIN_ITLB_ENTRIES);
+    }
+
+    /// An arena full of blocks of the size a launch measured (280 bytes a
+    /// block with its exits: 2.9 M blocks in 26 of a 976 MiB window's 32
+    /// parts) keeps most of their entries in a table sized from it; the
+    /// table rounded down kept under three in four, the rest put off
+    /// (measured: 99% and 70%).
+    #[test]
+    fn a_table_sized_from_a_full_arena_keeps_most_of_its_blocks_entries() {
+        const MIB: usize = 1 << 20;
+        const ARENA: usize = 96 * MIB;
+        const BLOCK_BYTES: usize = 280;
+        let blocks = (ARENA / BLOCK_BYTES) as u64;
+        let kept = |entries: usize| {
+            let mut table = LookupTable::with_entries(entries);
+            let entry = |block: u64| {
+                let pc = 0x1_0000_0000 + 12 * block;
+                let key = block_key(0x40_0000_0000 + 12 * block, 1);
+                LookupEntry {
+                    pc,
+                    key,
+                    entry: 1,
+                    block: block as u32,
+                    targets: 1,
+                }
+            };
+            for block in 0..blocks {
+                let held = entry(block);
+                table.insert(table.slot(held.pc, held.key), held);
+            }
+            let found = (0..blocks)
+                .filter(|&block| {
+                    let held = entry(block);
+                    table.find(table.slot(held.pc, held.key), held.pc, held.key) == held
+                })
+                .count();
+            found as f64 / blocks as f64
+        };
+        let sized = kept(lookup_entries(ARENA));
+        let rounded_down = kept(1 << (ARENA / CODE_BYTES_PER_ENTRY).ilog2());
+        assert!(sized >= 0.95, "{sized:.3} kept");
+        assert!(rounded_down < 0.75, "{rounded_down:.3} kept rounded down");
     }
 
     /// A span's ITLB entries go in every context its salts reach, wherever

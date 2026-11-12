@@ -529,6 +529,74 @@ fn contexts_made_anew_walk_again_their_predecessors_pages() {
     assert_eq!(machine.statistics.itlb[0], misses);
 }
 
+/// A second address space that maps a region the first ran in (a shared
+/// library at the same VAs in every process) takes the region's pages at
+/// its first walk there, each walked in its own tables: a page it maps to
+/// another frame takes that frame's key, a page it leaves unmapped stays
+/// out, and the pages it maps as the first did need no walk of their own.
+#[test]
+fn a_new_address_space_walks_a_regions_pages_at_its_first_walk_there() {
+    const RET: u32 = 0xd65f_03c0;
+    const PAGES: u64 = 8;
+    let mut words = vec![0u32; (PAGES * 0x1000 / 4) as usize];
+    for page in 0..PAGES {
+        words[(page * 0x400) as usize] = RET;
+    }
+    let mut machine = machine(&words);
+    let frames: Vec<u64> = (0..PAGES).map(|page| BASE + page * 0x1000).collect();
+    let pc = |page: u64| BASE + page * 0x1000;
+    let fetch = |machine: &mut Machine<FakeHost, NoDevices>, page: u64| {
+        assert!(matches!(
+            machine.fetch_block(pc(page), false),
+            Ok(Fetched::Block(_))
+        ));
+    };
+    paged_space(&mut machine, 0, &frames);
+    for page in 0..PAGES {
+        fetch(&mut machine, page);
+    }
+    let keys: Vec<u64> = (0..PAGES)
+        .map(|page| machine.current_key(pc(page)).expect("held"))
+        .collect();
+    let first = machine.chain.contexts()[0];
+    // The second maps page 6 to page 2's frame and leaves page 7 out.
+    let mut second = frames.clone();
+    second[6] = frames[2];
+    second.truncate(7);
+    paged_space(&mut machine, 1, &second);
+    let refilled = machine.statistics.itlb_sources[ItlbSource::Refilled as usize];
+    let misses = machine.statistics.itlb[0];
+    fetch(&mut machine, 0);
+    assert_ne!(machine.chain.contexts()[0], first);
+    assert_eq!(machine.statistics.itlb[0], misses + 1, "the first walk");
+    // The next fetch walks the others first.
+    fetch(&mut machine, 1);
+    assert_eq!(machine.statistics.itlb[0], misses + 1);
+    assert_eq!(
+        machine.statistics.itlb_sources[ItlbSource::Refilled as usize],
+        refilled + 6
+    );
+    for page in 1..6 {
+        assert_eq!(machine.current_key(pc(page)), Some(keys[page as usize]));
+    }
+    assert_eq!(machine.current_key(pc(6)), Some(keys[2]));
+    assert_eq!(machine.current_key(pc(7)), None);
+    for page in 2..7 {
+        fetch(&mut machine, page);
+    }
+    assert_eq!(machine.statistics.itlb[0], misses + 1);
+    // Its context walks the region's hints once.
+    let before = machine.statistics.itlb_sources[ItlbSource::Refilled as usize];
+    let reach = Reach::Containing(pc(3));
+    machine.tlb_maintained(reach, Everywhere::Addresses(reach), None);
+    fetch(&mut machine, 3);
+    fetch(&mut machine, 4);
+    assert_eq!(
+        machine.statistics.itlb_sources[ItlbSource::Refilled as usize],
+        before
+    );
+}
+
 /// A TLBI by VA and ASID of a lower-half page between global pages (a
 /// process's own page inside the shared library cache's span) reaches only
 /// that ASID's contexts; one of a page fetched through a global leaf

@@ -660,6 +660,25 @@ const CONTEXT_FRAMES: usize = 64;
 /// TLBIs of everything (about 300 kernel pages, then each process's).
 const FILL_LOG: usize = 4096;
 
+/// The VA bits of a region of [`Machine::region_hints`]: 2 MiB, a few
+/// hundred pages of one library of the shared cache, which every process
+/// maps at the same address.
+const REGION_SHIFT: u32 = 21;
+/// Places for regions, a power of two, and the pages each keeps: at most
+/// 256 KiB a PE, allocated at the first hint.
+const REGION_HINTS: usize = 1 << 10;
+const REGION_PAGES: usize = 32;
+/// Places for the (context, region) pairs walked, a power of two.
+const REGIONS_WALKED: usize = 1 << 12;
+
+/// The pages lately walked in one region ([`Machine::region_hints`]).
+#[derive(Default)]
+struct RegionHint {
+    region: u64,
+    pages: Vec<u64>,
+    next: usize,
+}
+
 /// Whether the context `space` translates `asid`.
 /// ASIDs compare by the eight bits every TCR.AS gives them.
 fn same_asid(space: &contexts::Space, asid: u16) -> bool {
@@ -924,6 +943,14 @@ pub struct Machine<H: Host, D: Devices> {
     pending_refills: BTreeMap<(usize, contexts::Key), Vec<u64>>,
     /// The pages the contexts just made walk again before the fetch goes on.
     refills: Vec<u64>,
+    /// Lower-half pages fetches walked lately, by 2 MiB region of their
+    /// VA in [`REGION_HINTS`] places ([`Machine::note_region_page`]): a
+    /// new address space that walks one page of a region walks the others
+    /// at once. Hints only: each page is walked again in the new context.
+    region_hints: Vec<RegionHint>,
+    /// The (context, region) pairs whose hints were walked, a place each by
+    /// hash: a context walks a region's hints once.
+    regions_walked: Vec<(u64, u64)>,
     /// Identification registers the CPU profile has no value for.
     profile_missing: Vec<SystemRegister>,
     /// Accessors by encoding.
@@ -1364,6 +1391,8 @@ impl<H: Host, D: Devices> Machine<H, D> {
             global_leaves: Vec::new(),
             global_sizes: 0,
             refills: Vec::new(),
+            region_hints: Vec::new(),
+            regions_walked: Vec::new(),
             applying_mail: false,
             profile_missing: Vec::new(),
             lookup: super::system::Lookup::new(),

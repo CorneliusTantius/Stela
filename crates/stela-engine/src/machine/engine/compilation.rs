@@ -109,6 +109,9 @@ impl<H: Host, D: Devices> Machine<H, D> {
             let contexts = self.contexts(el, context);
             self.chain.set_contexts(contexts);
         }
+        if path == FetchPath::ItlbMiss && chain::half(pc) == 0 {
+            self.note_region_page(pc);
+        }
         let current = Variant {
             guarded_page: self.fetch_guarded(pc),
             ..context
@@ -469,6 +472,52 @@ impl<H: Host, D: Devices> Machine<H, D> {
             if let Some(id) = self.known_variant(variant) {
                 let key = self.block_key(physical, id);
                 self.take_page(pc, key, false);
+            }
+        }
+    }
+
+    /// A fetch at `pc`, in the lower half, walked a page the ITLB lacked in
+    /// the current context: the first such walk of the context in the
+    /// page's 2 MiB region queues the other pages fetches walked lately in
+    /// that region, in whatever address space ([`Self::region_hints`]), for
+    /// the next fetch to walk again ([`Self::refill_pages`]); and the page
+    /// joins them. Every process maps the shared library cache at the same
+    /// VAs, so a new process takes the hot pages of each library it enters
+    /// with one exit, not one each. Exact whatever the hints say: each page
+    /// is walked in the context that takes it, and a page that does not
+    /// translate there is left to its fetch.
+    fn note_region_page(&mut self, pc: u64) {
+        const MIX: u64 = 0x9e37_79b9_7f4a_7c15;
+        let page = pc & !(FETCH_PAGE - 1);
+        let region = page >> REGION_SHIFT;
+        let context = self.chain.contexts()[0];
+        if self.region_hints.is_empty() {
+            self.region_hints
+                .resize_with(REGION_HINTS, RegionHint::default);
+            self.regions_walked.resize(REGIONS_WALKED, (0, 0));
+        }
+        let place = |value: u64, places: usize| {
+            (value.wrapping_mul(MIX) >> (64 - places.trailing_zeros())) as usize
+        };
+        let hint = &mut self.region_hints[place(region, REGION_HINTS)];
+        if hint.region != region {
+            hint.region = region;
+            hint.pages.clear();
+            hint.next = 0;
+        }
+        let walked =
+            &mut self.regions_walked[place(context ^ region.rotate_left(32), REGIONS_WALKED)];
+        if *walked != (context, region) {
+            *walked = (context, region);
+            self.refills
+                .extend(hint.pages.iter().copied().filter(|&held| held != page));
+        }
+        if !hint.pages.contains(&page) {
+            if hint.pages.len() < REGION_PAGES {
+                hint.pages.push(page);
+            } else {
+                hint.pages[hint.next] = page;
+                hint.next = (hint.next + 1) % REGION_PAGES;
             }
         }
     }
