@@ -2602,7 +2602,16 @@ fn attach_platform(
         };
         for address in core::mem::take(&mut smbus_functions) {
             // SAFETY: the mount grants each i801's I/O window to probe.
-            match unsafe { smbus::attach(services, session, address, bridges, handoff.clock) } {
+            match unsafe {
+                smbus::attach(
+                    services,
+                    session,
+                    address,
+                    bridges,
+                    handoff.clock,
+                    &mut devices.owners,
+                )
+            } {
                 Ok(host) => devices.smbus_hosts.push(host),
                 Err(error) => devices
                     .platform_failures

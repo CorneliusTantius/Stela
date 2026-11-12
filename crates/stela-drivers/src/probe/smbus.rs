@@ -153,7 +153,9 @@ pub(super) fn matches_identity(function: &crate::bus::pci::Identity) -> bool {
         && ControllerInfo::from_pci_id(function.vendor, function.device).is_some()
 }
 
-/// Attach the i801 at `address`, as Linux `i801_probe` does.
+/// Attach the i801 at `address`, as Linux `i801_probe` does. A host that
+/// does not start leaves every owner it was handed in `owners`: the function,
+/// its DMA domain and the AML arbitration of its window outlive the boot.
 ///
 /// # Safety
 /// The mount grants port I/O to the function's I/O window, as the
@@ -164,15 +166,83 @@ pub(super) unsafe fn attach(
     address: Address,
     bridges: &[native::Bridge],
     clock: Clock,
+    owners: &mut alloc::vec::Vec<alloc::boxed::Box<dyn core::any::Any>>,
 ) -> Result<Host, PlatformError> {
     // SAFETY: forwarded from the caller.
-    let handed = unsafe { native::hand_over::hand_over(services, address, &mut Stop) }
-        .map_err(|(error, _)| error)?;
+    let handed = match unsafe { native::hand_over::hand_over(services, address, &mut Stop) } {
+        Ok(handed) => handed,
+        Err((error, owner)) => {
+            owners.extend(owner);
+            return Err(error);
+        }
+    };
     let attachment = handed.attachment;
     let mut function = handed.requester.into_function();
+    let (info, window, firmware, setup) =
+        match configure(&mut function, &handed.bars, session, address, bridges) {
+            Ok(configured) => configured,
+            Err(error) => {
+                owners.push(alloc::boxed::Box::new((function, attachment)));
+                return Err(error);
+            }
+        };
+    // SAFETY: the window is the function's decoded I/O BAR, which the mount
+    // grants; AML reaches it only through the arbitration in `configure`.
+    let host = unsafe { PortIo::claim(window.start, info) }
+        .and_then(|registers| I801::new(registers, clock, info, setup, i801::Config::default()));
+    let host = match host {
+        Ok(host) => host,
+        Err(error) => {
+            owners.push(alloc::boxed::Box::new((function, attachment, firmware)));
+            return Err(PlatformError::Smbus(error));
+        }
+    };
+    // SAFETY: the claimed function's configuration is this probe's alone.
+    let configuration = match unsafe { OwnedConfiguration::claim(function, ()) } {
+        Ok(configuration) => configuration,
+        Err((function, ())) => {
+            owners.push(alloc::boxed::Box::new((
+                function, attachment, host, firmware,
+            )));
+            return Err(PlatformError::Refused("not an i801 SMBus host"));
+        }
+    };
+    // SAFETY: as above; the host has no operation in flight.
+    let mut controller = match unsafe { Controller::claim(host, configuration) } {
+        Ok(controller) => controller,
+        Err((kind, kept)) => {
+            owners.push(alloc::boxed::Box::new((kept, attachment, firmware)));
+            return Err(PlatformError::Smbus(kind.into()));
+        }
+    };
+    let host_notify = info.has_host_notify();
+    if host_notify && let Err(error) = controller.enable_host_notify() {
+        owners.push(alloc::boxed::Box::new((controller, attachment, firmware)));
+        return Err(PlatformError::Smbus(error));
+    }
+    Ok(Host(Rc::new(RefCell::new(State {
+        location: alloc::format!("{address}"),
+        controller,
+        firmware,
+        host_notify,
+        notified: 0,
+        _attachment: attachment,
+    }))))
+}
+
+/// The handed-over i801's I/O window, its AML arbitration and its host
+/// configuration, as Linux `i801_probe` sets them up before it touches the
+/// host's registers.
+fn configure(
+    function: &mut crate::bus::pci::Function<OwnedConfig>,
+    bars: &[Option<Bar>],
+    session: &'static Session,
+    address: Address,
+    bridges: &[native::Bridge],
+) -> Result<(ControllerInfo, core::ops::Range<u16>, Option<IoWindow>, u8), PlatformError> {
     let info = ControllerInfo::from_pci_id(function.vendor, function.device)
         .ok_or(PlatformError::Refused("not an i801 SMBus host"))?;
-    let Some(Bar::Io { port, size }) = handed.bars[SMBUS_BAR] else {
+    let Some(Bar::Io { port, size }) = bars[SMBUS_BAR] else {
         return Err(PlatformError::Refused(
             "SMBus base address uninitialized, as Linux i801_probe reports it",
         ));
@@ -227,29 +297,40 @@ pub(super) unsafe fn attach(
             .write8(HOST_CONFIGURATION, setup)
             .map_err(PlatformError::Config)?;
     }
-    // SAFETY: the window is the function's decoded I/O BAR, which the mount
-    // grants; AML reaches it only through the arbitration above.
-    let registers = unsafe { PortIo::claim(window.start, info) }.map_err(PlatformError::Smbus)?;
-    let host = I801::new(registers, clock, info, setup, i801::Config::default())
-        .map_err(PlatformError::Smbus)?;
-    // SAFETY: the claimed function's configuration is this probe's alone.
-    let configuration = unsafe { OwnedConfiguration::claim(function, ()) }
-        .map_err(|_| PlatformError::Refused("not an i801 SMBus host"))?;
-    // SAFETY: as above; the host has no operation in flight.
-    let mut controller = unsafe { Controller::claim(host, configuration) }
-        .map_err(|(kind, _)| PlatformError::Smbus(kind.into()))?;
-    let host_notify = info.has_host_notify();
-    if host_notify {
-        controller
-            .enable_host_notify()
-            .map_err(PlatformError::Smbus)?;
+    Ok((info, window, firmware, setup))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::probe::native::hand_over::{
+        hand_over,
+        tests::{ADDRESS, BootServices, Event},
+    };
+
+    /// An i801 through the shared hand-over: it has no DMA engine to stop,
+    /// so it is prepared, drained and bound at once; a host no i801 table
+    /// lists is refused with its prepared function still held.
+    #[test]
+    fn an_i801_is_handed_over_and_an_unlisted_host_keeps_its_owner() {
+        let services = BootServices::new(0x8086, 0xa323, [0x0c, 0x05, 0]);
+        // SAFETY: the services are this test's model.
+        let Ok(handed) = (unsafe { hand_over(&services, ADDRESS, &mut Stop) }) else {
+            panic!("the i801 is handed over");
+        };
+        assert_eq!(
+            services.events(),
+            [Event::Prepare, Event::Drain, Event::Bind, Event::RootDrop]
+        );
+        drop((handed.requester, handed.attachment));
+
+        let services = BootServices::new(0x8086, 0x1234, [0x0c, 0x05, 0]);
+        // SAFETY: as above.
+        let Err((_, owner)) = (unsafe { hand_over(&services, ADDRESS, &mut Stop) }) else {
+            panic!("an unlisted host is refused");
+        };
+        assert!(owner.is_some(), "the prepared function stays held");
+        drop(owner);
+        assert_eq!(services.events(), [Event::Prepare]);
     }
-    Ok(Host(Rc::new(RefCell::new(State {
-        location: alloc::format!("{address}"),
-        controller,
-        firmware,
-        host_notify,
-        notified: 0,
-        _attachment: attachment,
-    }))))
 }

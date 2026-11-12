@@ -239,4 +239,4 @@ pub(in crate::probe) unsafe fn hand_over<S: ColdStop>(
 }
 
 #[cfg(test)]
-pub(super) mod tests;
+pub(crate) mod tests;
