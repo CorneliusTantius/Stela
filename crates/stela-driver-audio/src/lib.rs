@@ -201,6 +201,136 @@ pub enum Error {
     Shutdown,
 }
 
+/// What the controller was waiting for, as words.
+impl core::fmt::Display for Phase {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::LinkResetEnter => "the link to enter reset",
+            Self::LinkResetExit => "the link to leave reset",
+            Self::CommandStop => "the command rings to stop",
+            Self::CommandStart => "the command rings to start",
+            Self::CorbResetEnter => "the command ring to enter reset",
+            Self::CorbResetExit => "the command ring to leave reset",
+            Self::RirbReset => "the response ring to reset",
+            Self::Verb => "a codec reply",
+            Self::StreamStop => "a stream to stop",
+            Self::StreamResetEnter => "a stream to enter reset",
+            Self::StreamResetExit => "a stream to leave reset",
+            Self::StreamStart => "a stream to start",
+            Self::CodecPower => "a codec power change",
+            Self::DisplayAudio => "the display audio sink",
+            Self::CodecDepop => "the codec's depop sequence",
+            Self::CodecHeadsetDetection => "headset detection",
+            Self::LinkPowerDown => "the link to power down",
+            Self::LinkPowerUp => "the link to power up",
+        })
+    }
+}
+
+/// A plain account for the boot log.
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::MinimumDelay(error) => return error.fmt(f),
+            Self::Interrupted => "an earlier operation was interrupted",
+            Self::Config(error) => return error.fmt(f),
+            Self::PciCapability(error) => return error.fmt(f),
+            Self::InvalidConfiguration => "its configuration is invalid",
+            Self::ControllerIdentitiesExhausted => "no controller number is left",
+            Self::PciResetControl { offset } => {
+                return write!(
+                    f,
+                    "its PCI reset control {offset:#x} did not take the change"
+                );
+            }
+            Self::RegisterUnavailable { offset } => {
+                return write!(f, "its register {offset:#x} reads all ones");
+            }
+            Self::UnsupportedVersion { major, minor } => {
+                return write!(f, "its HD Audio version {major}.{minor} is unsupported");
+            }
+            Self::UnsupportedRingSize => "its command ring sizes are unsupported",
+            Self::InvalidExtendedCapability { offset } => {
+                return write!(f, "its extended capability at {offset:#x} is malformed");
+            }
+            Self::UnsupportedExtendedCapability { id, version } => {
+                return write!(
+                    f,
+                    "its extended capability {id:#x} version {version} is unsupported"
+                );
+            }
+            Self::ProcessingOwned { offset } => {
+                return write!(
+                    f,
+                    "its processing control at {offset:#x} is still owned by another engine"
+                );
+            }
+            Self::UnsupportedLink { offset } => {
+                return write!(f, "its link at {offset:#x} is unsupported");
+            }
+            Self::LinkPowerUncertain { offset } => {
+                return write!(f, "its link power at {offset:#x} is uncertain");
+            }
+            Self::LinkClockRejected { offset } => {
+                return write!(f, "its link at {offset:#x} did not take the clock choice");
+            }
+            Self::UnsupportedTopology => "its codec layout is unsupported",
+            Self::InvalidVerb => "a codec command is invalid",
+            Self::CodecAbsent => "no codec answered",
+            Self::InvalidCodecGraph => "its codec layout is malformed",
+            Self::InvalidHdmiPort => "the HDMI port is invalid",
+            Self::InvalidEld => "the display's audio description (ELD) is malformed",
+            Self::InvalidChannelMap => "the channel map is invalid",
+            Self::SinkUnavailable => "no display audio sink is connected",
+            Self::SinkChanged => "the display audio sink changed",
+            Self::PlaybackUnderrun => "playback ran out of data",
+            Self::InvalidConnectionList => "a codec connection list is malformed",
+            Self::InvalidFormat => "the audio format is invalid",
+            Self::InvalidBuffer => "the audio buffer is invalid",
+            Self::LinkBandwidth {
+                required_words,
+                available_words,
+            } => {
+                return write!(
+                    f,
+                    "the link has room for {available_words} words per frame, not {required_words}"
+                );
+            }
+            Self::NoDmaMemory => "DMA memory ran out",
+            Self::DmaAddress => "the DMA memory lies above what it can address",
+            Self::NoStream => "no stream is free",
+            Self::StreamsAllocated => "its streams are still in use",
+            Self::NeedsDiscovery => "its codecs are not discovered yet",
+            Self::InvalidStream => "the stream is invalid",
+            Self::StreamRunning => "the stream is still running",
+            Self::StreamStopped => "the stream is stopped",
+            Self::Timeout(phase) => return write!(f, "it timed out waiting for {phase}"),
+            Self::CorbMemory => "its command ring reported a memory error",
+            Self::InvalidRingPointer => "a ring pointer is out of range",
+            Self::StreamDma { status } => {
+                return write!(f, "a stream's DMA failed (status {status:#x})");
+            }
+            Self::InvalidPosition(position) => {
+                return write!(f, "the stream position {position:#x} is out of range");
+            }
+            Self::ConverterRejected => "a codec converter did not take its format",
+            Self::CoefficientRejected { node, index } => {
+                return write!(
+                    f,
+                    "codec node {node:#x} did not take coefficient {index:#x}"
+                );
+            }
+            Self::InvalidPinControl => "a pin control value is invalid",
+            Self::InvalidJackNotification => "the jack notification is invalid",
+            Self::JackNotificationTagsExhausted => "no jack notification tag is left",
+            Self::RouteRejected => "the codec did not take the route",
+            Self::RouteInUse => "the route is in use",
+            Self::NeedsReset => "it needs a reset after a command timed out",
+            Self::Shutdown => "it is shut down",
+        })
+    }
+}
+
 impl From<crate::bus::pci::ConfigError> for Error {
     fn from(error: crate::bus::pci::ConfigError) -> Self {
         Self::Config(error)
@@ -209,5 +339,53 @@ impl From<crate::bus::pci::ConfigError> for Error {
 impl From<crate::bus::pci::CapabilityError> for Error {
     fn from(error: crate::bus::pci::CapabilityError) -> Self {
         Self::PciCapability(error)
+    }
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::{
+        Error, Phase,
+        hda::pci::{AttachError, CapabilityRefusal},
+    };
+
+    #[test]
+    fn audio_failures_read_as_words() {
+        let texts = [
+            format!("{}", Error::Timeout(Phase::CorbResetExit)),
+            format!("{}", Error::RegisterUnavailable { offset: 0x68 }),
+            format!(
+                "{}",
+                Error::LinkBandwidth {
+                    required_words: 12,
+                    available_words: 8,
+                }
+            ),
+            format!(
+                "{}",
+                AttachError::InvalidCapabilities(CapabilityRefusal::ControlOverlap {
+                    control: 0x44,
+                    offset: 0x40,
+                    id: 0x09,
+                })
+            ),
+            format!("{}", AttachError::MmioPreflight(Error::CodecAbsent)),
+            format!(
+                "{}",
+                AttachError::InvalidCapabilities(CapabilityRefusal::PcieOwnerMissing {
+                    found: None
+                })
+            ),
+        ];
+        for text in texts {
+            assert!(
+                !text.contains('{') && !text.contains("::") && !text.contains("Error"),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            format!("{}", Error::Timeout(Phase::Verb)),
+            "it timed out waiting for a codec reply"
+        );
     }
 }

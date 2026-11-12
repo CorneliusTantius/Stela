@@ -44,6 +44,31 @@ pub enum Error {
     TripUnsupported,
 }
 
+/// The method's ACPI name, such as `_BST`.
+impl core::fmt::Display for Method {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// A plain account for the boot log.
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Firmware(method, error) => write!(f, "the ACPI method {method} failed: {error}"),
+            Self::Malformed(method) => {
+                write!(f, "the ACPI method {method} returned an unexpected value")
+            }
+            Self::UnsupportedRevision(revision) => {
+                write!(f, "its _BIX revision {revision} is unsupported")
+            }
+            Self::NotPresent => f.write_str("no battery is present"),
+            Self::PresenceChanged => f.write_str("the battery was inserted or removed"),
+            Self::TripUnsupported => f.write_str("it has no capacity alarm (_BTP)"),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Unit {
     /// Capacity in mWh, rate in mW.

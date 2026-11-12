@@ -43,6 +43,33 @@ pub enum Error {
     },
     Io,
 }
+/// A plain account for the boot log.
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Claim(error) => return error.fmt(f),
+            Self::Config(error) => return error.fmt(f),
+            Self::Unsupported => "this LPSS controller is not supported",
+            Self::Identity => "its identity reads wrong or changed",
+            Self::Mapping => "its register window is not mapped as required",
+            Self::Mmio(error) => return error.fmt(f),
+            Self::Configuration => {
+                "its PCI command register is not as its last owner must leave it"
+            }
+            Self::Register {
+                offset,
+                expected,
+                observed,
+            } => {
+                return write!(
+                    f,
+                    "its register {offset:#x} reads {observed:#x}, not {expected:#x}"
+                );
+            }
+            Self::Io => "its register access failed",
+        })
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Identity {
     pub vendor: u16,

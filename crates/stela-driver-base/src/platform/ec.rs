@@ -130,6 +130,42 @@ pub struct Error {
     pub last_data: Option<ObservedData>,
 }
 
+/// A plain account for the boot log: what failed, the status byte, and
+/// any cleanup that failed after it.
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.kind {
+            ErrorKind::InvalidConfiguration => f.write_str("its configuration is invalid")?,
+            ErrorKind::InvalidRegion => f.write_str("the firmware asked for an invalid access")?,
+            ErrorKind::FirmwareLock => f.write_str("the firmware's global lock was not free")?,
+            ErrorKind::Io => f.write_str("its port access failed")?,
+            ErrorKind::Busy => f.write_str("it was still busy with another transaction")?,
+            ErrorKind::Timeout(phase) => {
+                let phase = match phase {
+                    Phase::Command => "a command",
+                    Phase::Input => "input",
+                    Phase::Output => "output",
+                    Phase::Completion => "the transaction to finish",
+                    Phase::Burst => "burst mode",
+                };
+                write!(f, "it timed out waiting for {phase}")?;
+            }
+            ErrorKind::BurstAcknowledgement(value) => {
+                write!(f, "it answered the burst request with {value:#x}")?;
+            }
+            ErrorKind::NeedsReset => f.write_str("it needs a reset after an earlier failure")?,
+        }
+        write!(f, " (status {:#x})", self.status)?;
+        if self.lock_release_failed {
+            f.write_str(", and its lock was not released")?;
+        }
+        if self.burst_cleanup_failed {
+            f.write_str(", and its burst mode was not left")?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ObservedData {
     pub command: u8,

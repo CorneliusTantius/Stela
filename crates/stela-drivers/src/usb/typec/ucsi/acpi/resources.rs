@@ -19,6 +19,21 @@ pub enum ResourceError {
     InvalidMemory,
 }
 
+/// A plain account for the boot log.
+impl core::fmt::Display for ResourceError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Truncated => "its _CRS resource list is truncated",
+            Self::Checksum => "its _CRS checksum is wrong",
+            Self::MissingEnd => "its _CRS has no end tag",
+            Self::MissingMemory => "its _CRS has no mailbox memory",
+            Self::MultipleMemory => "its _CRS has more than one memory range",
+            Self::UnsupportedMemory => "its _CRS memory descriptor is unsupported",
+            Self::InvalidMemory => "its _CRS mailbox memory range is invalid",
+        })
+    }
+}
+
 fn number(bytes: &[u8]) -> u64 {
     bytes
         .iter()

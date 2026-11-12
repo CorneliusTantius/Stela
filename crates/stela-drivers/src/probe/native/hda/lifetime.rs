@@ -31,6 +31,30 @@ pub enum Error {
     Terminal,
     Clock(crate::ClockError),
 }
+/// A plain account for the boot log.
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Pci(error) => return error.fmt(f),
+            Self::Controller(error) => return error.fmt(f),
+            Self::Preparation(error) => return error.fmt(f),
+            Self::Dma(error) => return error.fmt(f),
+            Self::Allocation(error) => return error.fmt(f),
+            Self::Mapping(error) => return error.fmt(f),
+            Self::Irq(error) => return error.fmt(f),
+            Self::OriginalUsersUnavailable => {
+                "nothing can prove its firmware interrupt users are finished"
+            }
+            Self::ForeignOriginalUsers => {
+                "its firmware interrupt users were recorded for another configuration"
+            }
+            Self::SharedRegisters => "its registers are still shared",
+            Self::Terminal => "an earlier failure stopped it",
+            Self::Clock(error) => return error.fmt(f),
+        })
+    }
+}
+
 impl From<hda::pci::AttachError> for Error {
     fn from(e: hda::pci::AttachError) -> Self {
         Self::Pci(e)

@@ -79,14 +79,14 @@ impl fmt::Display for AttachError {
                 f.write_str("the Wi-Fi regulatory database is missing, so nothing may scan")
             }
             Self::NoNamespace => f.write_str("this build reads no ACPI namespace"),
-            Self::Register(error) => write!(f, "its registers did not answer ({error:?})"),
+            Self::Register(error) => write!(f, "its registers did not answer ({error})"),
             Self::Identity(IdentityError::UnsupportedPci) => {
                 f.write_str("this Intel Wi-Fi adapter is not supported")
             }
             Self::Identity(error) => {
                 write!(f, "this Intel Wi-Fi adapter is not supported: {error}")
             }
-            Self::Power(error) => write!(f, "it did not wake up ({error:?})"),
+            Self::Power(error) => write!(f, "it did not wake up ({error})"),
             Self::NoPinnedFirmware { name, .. } => {
                 write!(f, "its firmware {name} is not on the USB")
             }
@@ -94,14 +94,14 @@ impl fmt::Display for AttachError {
                 write!(f, "its firmware {name} is unreadable ({kind})")
             }
             Self::Firmware { name, error } => {
-                write!(f, "its firmware {name} is invalid ({error:?})")
+                write!(f, "its firmware {name} is invalid ({error})")
             }
             Self::Step(error) => write!(f, "its radio step is unknown ({error})"),
             Self::Boot(boot::Error::RfKilled) => f.write_str(
                 "its radio is switched off by the PC's wireless switch or key (RF kill)",
             ),
             Self::Boot(error) => write!(f, "its firmware did not start ({error:?})"),
-            Self::Stop(error) => write!(f, "it did not stop for Stela to take over ({error:?})"),
+            Self::Stop(error) => write!(f, "it did not stop for Stela to take over ({error})"),
         }
     }
 }

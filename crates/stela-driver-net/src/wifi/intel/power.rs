@@ -72,6 +72,18 @@ pub enum AccessError {
     Minimum(crate::bus::pci::power::Error),
 }
 
+/// A plain account for the boot log.
+impl core::fmt::Display for AccessError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Unavailable => "its registers are unavailable",
+            Self::Bounds => "a register lies outside its register window",
+            Self::Mapping => "its register window is not mapped as required",
+            Self::Minimum(error) => return error.fmt(f),
+        })
+    }
+}
+
 /// Exclusive process-context CSR access and a real advancing delay source.
 /// Native construction requires a checked MMIO/PCI ownership contract.
 pub trait Csr {
@@ -163,6 +175,35 @@ pub enum Error {
 impl From<AccessError> for Error {
     fn from(value: AccessError) -> Self {
         Self::Access(value)
+    }
+}
+
+/// A plain account for the boot log.
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Access(error) => return error.fmt(f),
+            Self::FailedRead { register, value } => {
+                return write!(
+                    f,
+                    "its register {register:#x} reads {value:#x}, a hardware failure value"
+                );
+            }
+            Self::IdentityChanged => "its hardware or radio revision changed",
+            Self::Timeout { register, mask } => {
+                return write!(
+                    f,
+                    "its register {register:#x} did not set bits {mask:#x} in time"
+                );
+            }
+            Self::Rejected { register, mask } => {
+                return write!(f, "its register {register:#x} did not keep bits {mask:#x}");
+            }
+            Self::ManagementUnknown => "it is unknown whether the management engine is using it",
+            Self::ManagementConnected => "the management engine is using it",
+            Self::PersistenceProtected => "its persistence bit is write protected",
+            Self::State => "it is not in the state this step needs",
+        })
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

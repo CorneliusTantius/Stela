@@ -86,6 +86,31 @@ pub enum Error {
     SectionLayout,
 }
 
+/// A plain account for the boot log.
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::ImageSize => "the image size is out of range",
+            Self::Header => "the image header is wrong",
+            Self::Truncated { offset } => {
+                return write!(f, "the image is truncated at {offset:#x}");
+            }
+            Self::ResourceLimit => "the image has more sections or entries than allowed",
+            Self::TlvLength { kind, bytes } => {
+                return write!(f, "its entry {kind:#x} has a wrong length of {bytes} bytes");
+            }
+            Self::Duplicate { kind } => return write!(f, "its entry {kind:#x} appears twice"),
+            Self::CpuCount(count) => return write!(f, "it declares {count} CPUs"),
+            Self::SectionAddress => "a section address is invalid",
+            Self::FirmwareApi { expected, actual } => {
+                return write!(f, "its API version is {actual}, not {expected}");
+            }
+            Self::Missing(what) => return write!(f, "it lacks the {what}"),
+            Self::SectionLayout => "its section layout is invalid",
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageKind {
     Runtime,
@@ -508,6 +533,47 @@ impl<'a> Firmware<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn register_power_and_image_failures_read_as_words() {
+        use super::super::{attach::AttachError, power};
+        let texts = [
+            alloc::format!(
+                "{}",
+                Error::TlvLength {
+                    kind: 0x13,
+                    bytes: 7
+                }
+            ),
+            alloc::format!(
+                "{}",
+                power::Error::Timeout {
+                    register: 0x24,
+                    mask: 0x1
+                }
+            ),
+            alloc::format!(
+                "{}",
+                AttachError::Register(power::AccessError::Minimum(
+                    crate::bus::pci::power::Error::Clock
+                ))
+            ),
+            alloc::format!(
+                "{}",
+                AttachError::Firmware {
+                    name: "iwlwifi-ty-a0-gf-a0-89.ucode",
+                    error: Error::Missing("IML"),
+                }
+            ),
+            alloc::format!("{}", AttachError::Stop(power::Error::ManagementConnected)),
+        ];
+        for text in texts {
+            assert!(
+                !text.contains('{') && !text.contains("::") && !text.contains("Error"),
+                "{text}"
+            );
+        }
+    }
 
     fn image() -> Vec<u8> {
         let mut bytes = vec![0; HEADER_BYTES];

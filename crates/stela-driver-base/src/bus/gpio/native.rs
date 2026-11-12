@@ -32,6 +32,24 @@ impl From<resources::Error> for Error {
     }
 }
 
+/// A plain account for the boot log.
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Firmware(error) => return error.fmt(f),
+            Self::Acpi(error) => return error.fmt(f),
+            Self::Mapping(error) => return error.fmt(f),
+            Self::Intel(error) => return error.fmt(f),
+            Self::Amd(error) => return error.fmt(f),
+            Self::Unsupported => "this GPIO controller is not supported",
+            Self::MissingResource => "its firmware description lacks a register window",
+            Self::Allocation => "memory for it ran out",
+            Self::Busy => "its pads are still in use",
+            Self::Retired => "it is retired",
+        })
+    }
+}
+
 enum Engine {
     Intel(intel::Controller<intel::NativeRegisters>),
     Amd(Box<amd::Controller<amd::NativeRegisters>>),

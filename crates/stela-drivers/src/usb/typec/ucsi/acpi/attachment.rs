@@ -83,6 +83,37 @@ impl From<acpi::Error> for Error {
         Self::Acpi(value)
     }
 }
+
+/// A plain account for the boot log.
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Acpi(error) => return error.fmt(f),
+            Self::Ucsi(error) => return error.fmt(f),
+            Self::Resources(error) => return error.fmt(f),
+            Self::HardwareInactive => "the ACPI hardware session is not active",
+            Self::DeviceUnavailable(status) => {
+                return write!(
+                    f,
+                    "the device is not present and working (_STA {status:#x})"
+                );
+            }
+            Self::InvalidObject(name) => {
+                return write!(f, "the firmware object {name} has an unexpected form");
+            }
+            Self::DependencyUnavailable => "a device it depends on is not ready",
+            Self::MappingMismatch => "its mailbox mapping does not match its firmware resource",
+            Self::ResourcesChanged => "its firmware resources changed",
+            Self::Inactive => "it is not running",
+            Self::NotificationRemovalUncertain(error) => {
+                return write!(
+                    f,
+                    "its notification handler may still be installed: {error}"
+                );
+            }
+        })
+    }
+}
 impl From<UcsiError> for Error {
     fn from(value: UcsiError) -> Self {
         Self::Ucsi(value)

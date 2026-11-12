@@ -265,6 +265,84 @@ pub enum CapabilityRefusal {
     PowerManagementMoved { found: Option<u16> },
 }
 
+/// A plain account for the boot log.
+impl core::fmt::Display for CapabilityRefusal {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::StatusUnreadable => f.write_str("its status register reads all ones"),
+            Self::NoList => f.write_str("it has no capability list"),
+            Self::MsixUnreadable { offset } => {
+                write!(f, "its MSI-X control at {offset:#x} reads all ones")
+            }
+            Self::PcieLayout { offset } => {
+                write!(
+                    f,
+                    "its PCIe capability at {offset:#x} has an unknown layout"
+                )
+            }
+            Self::ClockGateOverlap { offset, id } => write!(
+                f,
+                "its capability {id:#x} at {offset:#x} overlaps the clock gating registers"
+            ),
+            Self::ControlOverlap {
+                control,
+                offset,
+                id,
+            } => write!(
+                f,
+                "its vendor control {control:#x} lies inside capability {id:#x} at {offset:#x}"
+            ),
+            Self::Duplicate { offset, id } => {
+                write!(f, "its capability {id:#x} appears again at {offset:#x}")
+            }
+            Self::PcieOwnerMissing {
+                found: Some(offset),
+            } => write!(
+                f,
+                "its PCIe capability at {offset:#x} does not end at Device Control"
+            ),
+            Self::PcieOwnerMissing { found: None } => {
+                f.write_str("it has no PCIe capability for its snoop control")
+            }
+            Self::PowerManagementMoved {
+                found: Some(offset),
+            } => write!(f, "its power management capability moved to {offset:#x}"),
+            Self::PowerManagementMoved { found: None } => {
+                f.write_str("its power management capability disappeared")
+            }
+        }
+    }
+}
+
+/// A plain account for the boot log.
+impl core::fmt::Display for AttachError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::MinimumDelay(error) => return error.fmt(f),
+            Self::Config(error) => return error.fmt(f),
+            Self::PciCapability(error) => return error.fmt(f),
+            Self::UnsupportedController => "this HD Audio controller is not supported",
+            Self::Ownership => "it may belong to the audio DSP rather than this driver alone",
+            Self::IdentityChanged => "its identity changed",
+            Self::SubsystemUnavailable => "its subsystem ID reads all ones",
+            Self::SubsystemExcluded => "its subsystem is excluded as known broken",
+            Self::BoardIdentityRequired => "its board must be identified first",
+            Self::BoardExcluded => "its board is excluded as known broken",
+            Self::InvalidBar => "its register BAR is invalid",
+            Self::InvalidCapabilities(refusal) => return refusal.fmt(f),
+            Self::MappedPreflightRequired => "its registers must be checked while mapped first",
+            Self::PowerNotReady => "its memory decode is off",
+            Self::ActiveDma { offset } => {
+                return write!(f, "its DMA engine at {offset:#x} is still running");
+            }
+            Self::MmioPreflight(error) => return error.fmt(f),
+            Self::UnsupportedPowerManagement => "it has no power management capability",
+            Self::PowerTransition => "it did not reach full power (D0)",
+            Self::ConfigurationRejected => "its PCI command register did not take the change",
+        })
+    }
+}
+
 /// Match the enumerated identity only; `prepare` rechecks config space.
 /// This is a candidate match; subsystem/DMI exclusions are checked by
 /// prepare before any write. Intel DSP and GPU HDA functions remain separate.

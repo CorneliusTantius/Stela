@@ -18,6 +18,25 @@ pub enum Error {
     Ports,
 }
 
+/// A plain account for the boot log.
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Truncated => "its firmware description is truncated",
+            Self::Length => "its firmware description has a wrong length",
+            Self::Checksum => "its firmware description checksum is wrong",
+            Self::Signature => "its ECDT signature is wrong",
+            Self::Register => "its command or data register is not a valid one-byte register",
+            Self::Path => "its ECDT namespace path is invalid",
+            Self::Resource => "its _CRS port descriptor is not a one-byte port",
+            Self::UnsupportedResource(tag) => {
+                return write!(f, "its _CRS has an unsupported descriptor {tag:#x}");
+            }
+            Self::Ports => "it does not have two distinct I/O ports",
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Register {
     Io(u16),
@@ -176,6 +195,22 @@ pub mod native {
         Malformed(&'static str),
         Resources(Error),
         UnsupportedGpe,
+    }
+
+    /// A plain account for the boot log.
+    impl core::fmt::Display for DiscoveryError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self {
+                Self::Firmware(method, error) => {
+                    write!(f, "the ACPI method {method} failed: {error}")
+                }
+                Self::Malformed(method) => {
+                    write!(f, "the ACPI method {method} returned an unexpected value")
+                }
+                Self::Resources(error) => error.fmt(f),
+                Self::UnsupportedGpe => f.write_str("its _GPE event is not a plain number"),
+            }
+        }
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]

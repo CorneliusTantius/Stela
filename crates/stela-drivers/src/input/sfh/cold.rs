@@ -26,6 +26,23 @@ impl From<super::Error> for Error {
     }
 }
 
+/// A plain account for the boot log.
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Controller(error) => error.fmt(f),
+            Self::UnsupportedSensorMask(mask) => {
+                write!(f, "it runs unknown sensors {mask:#x}")
+            }
+            Self::OriginalNotificationOwnerUnavailable => {
+                f.write_str("nothing can take its notifications over from their original owner")
+            }
+            Self::Interrupted => f.write_str("its sensor stop was interrupted"),
+            Self::Terminal => f.write_str("an earlier sensor stop failed, so it stays held"),
+        }
+    }
+}
+
 /// One observed sensor-stop set, not a configuration-only stopped claim.
 pub struct Stopped {
     acs: u32,

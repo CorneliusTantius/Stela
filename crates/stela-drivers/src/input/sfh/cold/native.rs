@@ -15,6 +15,16 @@ pub enum NativeError {
     Power(crate::block::BlockError),
 }
 
+/// A plain account for the boot log.
+impl core::fmt::Display for NativeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Controller(error) => error.fmt(f),
+            Self::Power(error) => write!(f, "its power change failed: {error}"),
+        }
+    }
+}
+
 struct Resources {
     requester: PreparingRequester,
     mapping: Mapping,

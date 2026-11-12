@@ -48,6 +48,48 @@ impl From<super::Error> for Error {
     }
 }
 
+/// A plain account for the boot log.
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Acpi(error) => return error.fmt(f),
+            Self::InvalidObject(name) => {
+                return write!(f, "the firmware object {name} has an unexpected form");
+            }
+            Self::Unavailable(status) => {
+                return write!(
+                    f,
+                    "the device is not present and working (_STA {status:#x})"
+                );
+            }
+            Self::Truncated => "its resource list is truncated",
+            Self::Malformed => "its resource list is malformed",
+            Self::Checksum => "its resource list checksum is wrong",
+            Self::MissingEnd => "its resource list has no end tag",
+            Self::DependentFunctions => "its resource list uses dependent functions",
+            Self::Limit => "its resources exceed a limit",
+            Self::Unsupported { tag, revision } => {
+                return write!(
+                    f,
+                    "its resource descriptor {tag:#x} revision {revision} is unsupported"
+                );
+            }
+            Self::Unassigned => "its resource is not assigned",
+            Self::OutsideReservation => "its resource lies outside every firmware reservation",
+            Self::Conflict => "its resource overlaps another owner's",
+            Self::ResourceChanged => "its resources changed",
+            Self::Retirement {
+                primary: Some(primary),
+                cleanup,
+            } => return write!(f, "{primary}, and its cleanup failed: {cleanup}"),
+            Self::Retirement {
+                primary: None,
+                cleanup,
+            } => return write!(f, "its cleanup failed: {cleanup}"),
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Source {
     pub index: u8,

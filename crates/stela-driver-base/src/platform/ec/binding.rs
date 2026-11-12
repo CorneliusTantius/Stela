@@ -80,6 +80,63 @@ pub struct Completion {
     pub value: u64,
 }
 
+/// A plain account for the boot log.
+impl core::fmt::Display for Completion {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let operation = match self.operation {
+            Operation::Read => "read",
+            Operation::Write => "write",
+            Operation::Query => "query",
+        };
+        write!(
+            f,
+            "a {}-bit {operation} at {:#x} completed with {:#x}",
+            self.width, self.address, self.value
+        )
+    }
+}
+
+/// A plain account for the boot log.
+impl core::fmt::Display for Failure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Firmware(error) => error.fmt(f),
+            Self::Controller(error) => error.fmt(f),
+            Self::Removed => f.write_str("it was removed"),
+            Self::PendingEvent => f.write_str("an earlier event is still pending"),
+            Self::Retirement {
+                registration,
+                retirement,
+            } => write!(
+                f,
+                "its registration failed: {registration}, and its cleanup failed: {retirement}"
+            ),
+            Self::Unlock {
+                error,
+                controller,
+                io,
+                arbitration,
+                completion,
+            } => {
+                write!(f, "its lock was not released: {error}")?;
+                if let Some(controller) = controller {
+                    write!(f, "; the controller: {controller}")?;
+                }
+                if let Some(io) = io {
+                    write!(f, "; its port access: {io}")?;
+                }
+                if let Some(arbitration) = arbitration {
+                    write!(f, "; its arbitration: {arbitration}")?;
+                }
+                if let Some(completion) = completion {
+                    write!(f, "; {completion}")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// Observations remain available after AML returned its mapped ACPICA status.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Diagnostics {

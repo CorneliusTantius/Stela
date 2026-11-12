@@ -62,6 +62,50 @@ pub const NOT_FOUND: Error = Error(0x0005);
 pub const BAD_PARAMETER: Error = Error(0x1001);
 pub const ALREADY_EXISTS: Error = Error(0x0007);
 pub const LIMIT: Error = Error(0x0010);
+
+impl Error {
+    /// ACPICA's meaning of the status, in words, where it is a common one.
+    fn meaning(self) -> Option<&'static str> {
+        Some(match self.0 {
+            0x0001 => "the firmware call failed",
+            0x0002 => "there are no ACPI tables",
+            0x0003 => "there is no ACPI namespace",
+            0x0004 => "ACPI ran out of memory",
+            0x0005 => "the object was not found",
+            0x0006 => "the object does not exist",
+            0x0007 => "the object already exists",
+            0x0008 => "the object has the wrong type",
+            0x0009 => "a required object is missing",
+            0x000b => "the buffer is too small",
+            0x000e => "the operation is not implemented",
+            0x000f => "the operation is unsupported",
+            0x0010 => "a limit was reached",
+            0x0011 => "the firmware timed out",
+            0x0016 => "the hardware did not answer",
+            0x0017 => "there is no global lock",
+            0x0018 => "the firmware method aborted",
+            0x001a => "no handler is installed",
+            0x001c => "ACPI is not configured",
+            0x001d => "access was denied",
+            0x001e => "an I/O access failed",
+            0x1001 => "a parameter is invalid",
+            0x1003 => "a path name is invalid",
+            0x1004 => "the data is invalid",
+            0x2003 => "a table checksum is wrong",
+            _ => return None,
+        })
+    }
+}
+
+/// The status in words where it is a common one, and always its code.
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.meaning() {
+            Some(meaning) => write!(f, "{meaning} (ACPI status {:#x})", self.0),
+            None => write!(f, "ACPI status {:#x}", self.0),
+        }
+    }
+}
 fn checked(status: Status) -> Result<(), Error> {
     if status == 0 {
         Ok(())

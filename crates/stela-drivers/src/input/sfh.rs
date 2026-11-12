@@ -121,6 +121,97 @@ pub enum Error {
     UnsupportedSetReport,
     InvalidPresence(u8),
 }
+
+/// The sensor's name, as a log reads it.
+impl core::fmt::Display for Sensor {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Accelerometer => "accelerometer",
+            Self::Gyroscope => "gyroscope",
+            Self::Magnetometer => "magnetometer",
+            Self::OperatingMode => "operating mode sensor",
+            Self::HumanPresence => "human presence sensor",
+            Self::AmbientLight => "ambient light sensor",
+            Self::AmbientColor => "ambient color sensor",
+        })
+    }
+}
+
+/// The sensor command a response answers, in words.
+fn command_name(expected: u8) -> &'static str {
+    match expected {
+        SENSOR_ENABLED => "enable",
+        SENSOR_DISABLED => "disable",
+        _ => "sensor",
+    }
+}
+
+/// A plain account for the boot log.
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Config(error) => return error.fmt(f),
+            Self::Capability(error) => return error.fmt(f),
+            Self::Claim(error) => return error.fmt(f),
+            Self::Clock(error) => return error.fmt(f),
+            Self::UnsupportedController => "this sensor hub is not supported",
+            Self::UnsupportedDialect(dialect) => {
+                return write!(f, "its firmware interface {dialect} is unsupported");
+            }
+            Self::PciAuthority => "its PCI function changed under the driver",
+            Self::InvalidBar => "its register BAR is not mapped as required",
+            Self::RegisterUnavailable(offset) => {
+                return write!(f, "its register {offset:#x} reads all ones");
+            }
+            Self::RegisterRejected(offset) => {
+                return write!(f, "its register {offset:#x} did not keep what was written");
+            }
+            Self::DiscoveryFailed(value) => {
+                return write!(f, "its sensor discovery failed ({value:#x})");
+            }
+            Self::NoSensors => "it reports no sensors",
+            Self::NoHidSchema(sensor) => {
+                return write!(f, "its {sensor} has no input report layout");
+            }
+            Self::SensorAbsent(sensor) => return write!(f, "its {sensor} is absent"),
+            Self::SensorDisabled(sensor) => return write!(f, "its {sensor} is disabled"),
+            Self::NotReady => "it is not running",
+            Self::NeedsReset => "it needs a reset after an earlier failure",
+            Self::AlreadyInitialized => "it is already started",
+            Self::Allocation => "memory for its sensors ran out",
+            Self::Memory(error) => return error.fmt(f),
+            Self::Dma(error) => return error.fmt(f),
+            Self::Timeout {
+                sensor,
+                expected,
+                observed,
+            } => {
+                return write!(
+                    f,
+                    "its {sensor} did not answer the {} command in time (response {observed:#x})",
+                    command_name(*expected)
+                );
+            }
+            Self::StaleResponse { sensor, expected } => {
+                return write!(
+                    f,
+                    "its {sensor} showed an old {} answer before the command was sent",
+                    command_name(*expected)
+                );
+            }
+            Self::ReportBuffer { needed } => {
+                return write!(f, "the report buffer is smaller than {needed} bytes");
+            }
+            Self::ReportId { expected, actual } => {
+                return write!(f, "the report ID is {actual:#x}, not {expected:#x}");
+            }
+            Self::UnsupportedSetReport => "it does not accept output reports",
+            Self::InvalidPresence(value) => {
+                return write!(f, "its presence value {value:#x} is invalid");
+            }
+        })
+    }
+}
 /// Native adapters keep exact ECAM and UC BAR2 owners. Register operations
 /// must use aligned 32-bit MMIO and report failures without discarding
 /// writes. `check_authority` verifies the device/configuration epoch.

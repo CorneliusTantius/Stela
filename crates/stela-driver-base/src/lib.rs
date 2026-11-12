@@ -156,6 +156,18 @@ pub enum ClockError {
     DurationTooLong,
 }
 
+/// A plain account for the boot log.
+impl core::fmt::Display for ClockError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Uncalibrated => "the delay clock is not calibrated",
+            Self::DurationOverflow | Self::DurationTooLong => {
+                "a wait is too long for the delay clock"
+            }
+        })
+    }
+}
+
 /// Microsecond waits from a producer-calibrated time-stamp counter.
 /// The producer must preserve a stable TSC rate and processor/clock context.
 /// Native attachment must check its maximum duration before device effects.
@@ -403,6 +415,98 @@ mod tests {
         assert!(Arc::ptr_eq(cloned.firmware.as_ref().unwrap(), &catalog));
         drop(handoff);
         assert_eq!(cloned.firmware.as_ref().unwrap().inventory(), (0, 0));
+    }
+
+    #[test]
+    fn platform_and_bus_failures_read_as_words() {
+        use crate::{
+            bus::{gpio, lpss},
+            platform::ec,
+        };
+        let texts = [
+            alloc::format!("{}", ClockError::Uncalibrated),
+            alloc::format!(
+                "{}",
+                lpss::Error::Register {
+                    offset: 0x204,
+                    expected: 1,
+                    observed: 0,
+                }
+            ),
+            alloc::format!(
+                "{}",
+                lpss::AttachError::Platform(lpss::Error::Mmio(
+                    bus::mmio::owned::Error::ResourceConflict
+                ))
+            ),
+            alloc::format!("{}", gpio::intel::Error::AcpiInterrupt),
+            alloc::format!("{}", gpio::amd::Error::FirmwareWake),
+            alloc::format!("{}", ec::discovery::Error::UnsupportedResource(0x22)),
+            alloc::format!("{}", bus::pci::msi::MsiError::Readback { offset: 0x52 }),
+        ];
+        for text in texts {
+            assert!(
+                !text.contains('{') && !text.contains("::") && !text.contains("Error"),
+                "{text}"
+            );
+        }
+    }
+
+    #[cfg(feature = "native-acpi")]
+    #[test]
+    fn native_platform_failures_read_as_words() {
+        use crate::{
+            bus::gpio,
+            platform::{acpi, battery, ec},
+        };
+        let texts = [
+            alloc::format!("{}", acpi::Error(0x5)),
+            alloc::format!("{}", acpi::Error(0x3333)),
+            alloc::format!(
+                "{}",
+                acpi::resources::Error::Retirement {
+                    primary: Some(acpi::NOT_FOUND),
+                    cleanup: acpi::Error(0x1e),
+                }
+            ),
+            alloc::format!(
+                "{}",
+                battery::Error::Firmware(battery::Method::State, acpi::Error(0x11))
+            ),
+            alloc::format!(
+                "{}",
+                gpio::native::Error::Intel(gpio::intel::Error::TxLocked)
+            ),
+            alloc::format!(
+                "{}",
+                ec::binding::Failure::Unlock {
+                    error: acpi::Error(0x11),
+                    controller: None,
+                    io: Some(acpi::Error(0x1e)),
+                    arbitration: None,
+                    completion: Some(ec::binding::Completion {
+                        operation: ec::binding::Operation::Read,
+                        address: 0x30,
+                        width: 8,
+                        value: 0x7f,
+                    }),
+                }
+            ),
+            alloc::format!(
+                "{}",
+                ec::discovery::native::DiscoveryError::Firmware("_CRS", acpi::NOT_FOUND)
+            ),
+        ];
+        for text in texts {
+            assert!(
+                !text.contains('{') && !text.contains("::") && !text.contains("Error"),
+                "{text}"
+            );
+        }
+        assert_eq!(
+            alloc::format!("{}", acpi::Error(0x5)),
+            "the object was not found (ACPI status 0x5)"
+        );
     }
 
     #[test]

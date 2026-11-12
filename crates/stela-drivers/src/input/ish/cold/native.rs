@@ -20,6 +20,36 @@ pub enum Error {
     Interrupted,
     Terminal,
 }
+
+/// What a missing prerequisite is, in words.
+impl core::fmt::Display for Prerequisite {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::OriginalNotificationOwner => "an owner that takes its notifications over",
+            Self::InheritedAddressInvalidation => {
+                "a way to invalidate the DMA addresses its firmware inherited"
+            }
+        })
+    }
+}
+
+/// A plain account for the boot log.
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Controller(error) => error.fmt(f),
+            Self::Power(error) => write!(f, "its power change failed: {error}"),
+            Self::Missing([first, second]) if first == second => {
+                write!(f, "it needs {first}, which is missing")
+            }
+            Self::Missing([first, second]) => {
+                write!(f, "it needs {first} and {second}, which are missing")
+            }
+            Self::Interrupted => f.write_str("its preparation was interrupted"),
+            Self::Terminal => f.write_str("an earlier preparation failed, so it stays held"),
+        }
+    }
+}
 impl From<crate::bus::pci::ConfigError> for Error {
     fn from(error: crate::bus::pci::ConfigError) -> Self {
         Self::Controller(ControllerError::ConfigAccess(error))

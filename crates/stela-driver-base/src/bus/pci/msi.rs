@@ -64,6 +64,37 @@ pub enum MsiError {
     Released,
 }
 
+/// A plain account for the boot log.
+impl core::fmt::Display for MsiError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Config(error) => return error.fmt(f),
+            Self::MissingCapability => "it has no MSI capability",
+            Self::MalformedCapability => "its MSI capability is malformed",
+            Self::Unsupported => "its MSI layout is unsupported",
+            Self::ActiveMsi => "MSI is already enabled on it",
+            Self::ActiveMsix => "MSI-X is already enabled on it",
+            Self::IdentityChanged => "its identity changed while its MSI was set up",
+            Self::CapabilityChanged => "its MSI capability changed while it was set up",
+            Self::InvalidMessage => "the MSI message is invalid",
+            Self::FailedRead { offset } => {
+                return write!(f, "its MSI register {offset:#x} reads all ones");
+            }
+            Self::Readback { offset } => {
+                return write!(
+                    f,
+                    "its MSI register {offset:#x} did not keep what was written"
+                );
+            }
+            Self::NotProgrammed => "its MSI message is not programmed",
+            Self::TerminalRetirement => "its MSI could not be retired and stays held",
+            Self::StopAlreadyAttempted => "its MSI stop was already attempted",
+            Self::Interrupted => "its MSI change was interrupted",
+            Self::Released => "its MSI owner was already released",
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Layout {
     offset: u16,

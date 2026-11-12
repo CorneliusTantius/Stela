@@ -162,9 +162,108 @@ pub enum Error {
     GenerationExhausted,
 }
 
+/// A plain account for the boot log.
+impl fmt::Display for TransportError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unavailable => f.write_str("its mailbox is unavailable"),
+            Self::Mapping => f.write_str("its mailbox is not mapped"),
+            Self::Bounds { offset, bytes } => {
+                write!(f, "{bytes} bytes at {offset:#x} lie outside its mailbox")
+            }
+            Self::Dsm { function, status } => write!(
+                f,
+                "its firmware method _DSM function {function} answered {status:#x}"
+            ),
+            Self::DsmNoResult { function } => write!(
+                f,
+                "its firmware method _DSM function {function} returned nothing"
+            ),
+            Self::I2c(error) => write!(f, "its I2C transfer failed: {error}"),
+            Self::UnsupportedTransportVersion(version) => {
+                write!(f, "its mailbox version {version:#x} is unsupported")
+            }
+            Self::Io(status) => write!(f, "its mailbox access failed ({status:#x})"),
+        }
+    }
+}
+
+/// The step a UCSI failure happened in, as words.
+impl fmt::Display for Phase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Version => "reading its version",
+            Self::Poll => "polling its status",
+            Self::Submit => "submitting a command",
+            Self::MessageOut => "writing a command's data",
+            Self::MessageIn => "reading a command's reply",
+            Self::Command => "running a command",
+            Self::Acknowledge => "acknowledging a command",
+            Self::Cancel => "cancelling a command",
+            Self::Reset => "resetting it",
+        })
+    }
+}
+
+/// A plain account for the boot log.
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "UCSI {self:?}")
+        match self {
+            Self::TimerBudget { microseconds } => write!(
+                f,
+                "the delay clock cannot time a {microseconds} microsecond UCSI wait"
+            ),
+            Self::Transport { phase, error } => {
+                write!(f, "UCSI failed while {phase}: {error}")
+            }
+            Self::Timeout { phase, cci } => {
+                write!(f, "UCSI timed out while {phase} (status {cci:#x})")
+            }
+            Self::InvalidCci(cci) => write!(f, "the UCSI status {cci:#x} is invalid"),
+            Self::UnexpectedCompletion { phase, cci } => write!(
+                f,
+                "UCSI completed unexpectedly while {phase} (status {cci:#x})"
+            ),
+            Self::UnsupportedVersion(version) => {
+                write!(f, "UCSI version {version:#x} is unsupported")
+            }
+            Self::InvalidConnector { number, count } => write!(
+                f,
+                "UCSI connector {number} is out of range for {count} connectors"
+            ),
+            Self::InvalidArgument => f.write_str("a UCSI command argument is invalid"),
+            Self::InvalidResponseLength { command, bytes } => write!(
+                f,
+                "the UCSI reply to command {command:#x} has a wrong length of {bytes} bytes"
+            ),
+            Self::NotSupported { command, cci } => write!(
+                f,
+                "the UCSI command {command:#x} is not supported (status {cci:#x})"
+            ),
+            Self::Ppm {
+                command, status, ..
+            } => write!(
+                f,
+                "the UCSI command {command:#x} failed with error status {status:#x}"
+            ),
+            Self::PpmRejected { command, cci } => write!(
+                f,
+                "the UCSI command {command:#x} failed with no error status (status {cci:#x})"
+            ),
+            Self::ErrorStatus {
+                command, failure, ..
+            } => write!(
+                f,
+                "the UCSI command {command:#x} failed, and reading why failed too: {failure}"
+            ),
+            Self::Cancelled { command, cci } => write!(
+                f,
+                "the UCSI command {command:#x} was cancelled (status {cci:#x})"
+            ),
+            Self::NeedsReset => f.write_str("UCSI needs a reset after an earlier failure"),
+            Self::NotInitialized => f.write_str("UCSI is not started"),
+            Self::GenerationExhausted => f.write_str("UCSI ran out of request numbers"),
+        }
     }
 }
 impl core::error::Error for Error {}

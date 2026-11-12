@@ -8,6 +8,15 @@ pub enum AttachError {
     Platform(Error),
     I2c(i2c::Error),
 }
+/// A plain account for the boot log.
+impl core::fmt::Display for AttachError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Platform(error) => error.fmt(f),
+            Self::I2c(error) => write!(f, "its I2C controller failed: {error}"),
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AttachStage {
     Validation,

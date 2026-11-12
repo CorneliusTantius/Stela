@@ -61,6 +61,31 @@ pub enum Error {
     Consumer,
 }
 
+/// A plain account for the boot log.
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Access => "a pad register access failed",
+            Self::Mapping => "its register window is not mapped",
+            Self::InvalidPad => "the pad number is invalid",
+            Self::UnownedPad => "the pad is not one it drives",
+            Self::FirmwareWake => "the firmware set the pad as a wake source",
+            Self::FirmwareInterrupt => "the firmware enabled the pad's interrupt",
+            Self::InvalidMux => "the pin function is invalid",
+            Self::MissingMux => "its pin function registers are not mapped",
+            Self::Readback => "a pad register did not keep what was written",
+            Self::DebounceTimeout => "the pad did not settle after its debounce change",
+            Self::InvalidDebounce => "the debounce time is invalid",
+            Self::InvalidDriveStrength => "the drive strength is invalid",
+            Self::Direction => "the pad is set to the other direction",
+            Self::InterruptActive => "the pad's interrupt is still active",
+            Self::Faulted => "an earlier failure stopped the controller",
+            Self::Retired => "the controller is retired",
+            Self::Consumer => "the pad's interrupt consumer failed",
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Pad(u8);
 impl Pad {

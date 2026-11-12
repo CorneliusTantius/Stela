@@ -49,5 +49,45 @@ pub enum Error {
 }
 pub type Result<T> = core::result::Result<T, Error>;
 
+/// A plain account for the boot log.
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::ConfigAccess(error) => return error.fmt(f),
+            Self::Capability(error) => return error.fmt(f),
+            Self::Requirement(what) => return write!(f, "it needs {what}"),
+            Self::Mapping(error) => return error.fmt(f),
+            Self::Config(offset) => {
+                return write!(
+                    f,
+                    "its PCI register {offset:#x} reads wrong or did not keep a write"
+                );
+            }
+            Self::Msi(error) => return error.fmt(f),
+            Self::Irq(error) => return error.fmt(f),
+            Self::Dma(error) => return error.fmt(f),
+            Self::Access(offset) => {
+                return write!(f, "an access to its register {offset:#x} failed");
+            }
+            Self::Removed => "its registers read all ones, as if it was removed",
+            Self::Readback(offset) => {
+                return write!(f, "its register {offset:#x} did not keep what was written");
+            }
+            Self::Timeout(what) => return write!(f, "it timed out waiting for {what}"),
+            Self::Protocol(what) => return write!(f, "its firmware broke the protocol: {what}"),
+            Self::Status(status) => {
+                return write!(f, "its firmware answered with status {status:#x}");
+            }
+            Self::FirmwareReset => "its firmware reset itself",
+            Self::Terminal => "an earlier failure stopped it",
+            Self::InputPollInterrupted => "an input poll was interrupted",
+            Self::StopInterrupted => "its stop was interrupted",
+            Self::PostedMsiRetirementUnavailable => {
+                "its MSI cannot be retired yet, so it stays held"
+            }
+        })
+    }
+}
+
 /// Input reports one poll reads at most, as USB HID bounds its pass.
 const POLL_REPORTS: usize = 16;

@@ -94,19 +94,19 @@ impl fmt::Display for Error {
             Self::Vmd(error) => write!(f, "VMD: {error}"),
             Self::Tg3(error) => write!(f, "tg3: {error}"),
             Self::Aqtion(error) => write!(f, "atlantic: {error}"),
-            Self::Sfh(error) => write!(f, "AMD SFH: {error:?}"),
-            Self::SfhCold(error) => write!(f, "AMD SFH original-owner preparation: {error:?}"),
-            Self::Ish(error) => write!(f, "Intel ISH: {error:?}"),
-            Self::IshCold(error) => write!(f, "Intel ISH original-owner preparation: {error:?}"),
+            Self::Sfh(error) => write!(f, "AMD SFH: {error}"),
+            Self::SfhCold(error) => write!(f, "AMD SFH original-owner preparation: {error}"),
+            Self::Ish(error) => write!(f, "Intel ISH: {error}"),
+            Self::IshCold(error) => write!(f, "Intel ISH original-owner preparation: {error}"),
             Self::IntelWifi(error) => write!(f, "iwlwifi: {error}"),
             Self::MediatekWifi(error) => write!(f, "mt76: {error}"),
             Self::RealtekWifi(error) => write!(f, "rtw88: {error}"),
             Self::IntelBluetooth(error) => write!(f, "btintel_pcie: {error}"),
             Self::Bcm4377(error) => write!(f, "hci_bcm4377: {error}"),
             Self::Ehci(error) => write!(f, "EHCI: {error}"),
-            Self::HdaPci(error) => write!(f, "HD Audio PCI: {error:?}"),
-            Self::Hda(error) => write!(f, "HD Audio: {error:?}"),
-            Self::HdaNative(error) => write!(f, "HD Audio native: {error:?}"),
+            Self::HdaPci(error) => write!(f, "HD Audio PCI: {error}"),
+            Self::Hda(error) => write!(f, "HD Audio: {error}"),
+            Self::HdaNative(error) => write!(f, "HD Audio native: {error}"),
             Self::Usb4(refusal) => write!(f, "USB4 host: {refusal}"),
             Self::Unrecorded => {
                 f.write_str("its driver started and recorded no device and no failure")
@@ -203,31 +203,31 @@ impl fmt::Display for PlatformError {
         match self {
             Self::Handoff(error) => error.fmt(f),
             Self::Config(error) => error.fmt(f),
-            Self::PciCapability(error) => write!(f, "PCI capability: {error:?}"),
+            Self::PciCapability(error) => write!(f, "PCI capability: {error}"),
             #[cfg(feature = "native-acpi")]
-            Self::Acpi(error) => write!(f, "ACPI: {error:?}"),
+            Self::Acpi(error) => write!(f, "ACPI: {error}"),
             Self::Refused(why) => f.write_str(why),
             Self::Ps2(error) => error.fmt(f),
             Self::Native(error) => error.fmt(f),
-            Self::I2c(error) => write!(f, "I2C controller: {error:?}"),
-            Self::Lpss(error) => write!(f, "LPSS: {error:?}"),
-            Self::LpssAttach(error) => write!(f, "LPSS I2C attach: {error:?}"),
+            Self::I2c(error) => write!(f, "I2C controller: {error}"),
+            Self::Lpss(error) => write!(f, "LPSS: {error}"),
+            Self::LpssAttach(error) => write!(f, "LPSS I2C attach: {error}"),
             Self::HidI2c(error) => error.fmt(f),
             Self::HidDescriptor(error) => error.fmt(f),
             Self::Touchpad(error) => error.fmt(f),
             #[cfg(feature = "native-acpi")]
-            Self::Gpio(error) => write!(f, "GPIO controller: {error:?}"),
+            Self::Gpio(error) => write!(f, "GPIO controller: {error}"),
             #[cfg(feature = "native-acpi")]
-            Self::Ec(error) => write!(f, "embedded controller: {error:?}"),
+            Self::Ec(error) => write!(f, "embedded controller: {error}"),
             #[cfg(feature = "native-acpi")]
-            Self::EcDiscovery(error) => write!(f, "embedded controller description: {error:?}"),
+            Self::EcDiscovery(error) => write!(f, "embedded controller description: {error}"),
             #[cfg(feature = "native-acpi")]
-            Self::Battery(error) => write!(f, "battery: {error:?}"),
+            Self::Battery(error) => write!(f, "battery: {error}"),
             Self::Smbus(error) => error.fmt(f),
             #[cfg(feature = "native-acpi")]
-            Self::Ucsi(error) => write!(f, "UCSI: {error:?}"),
+            Self::Ucsi(error) => write!(f, "USB-C controller: {error}"),
             #[cfg(feature = "native-acpi")]
-            Self::AcpiMethod(error) => write!(f, "ACPI method: {error:?}"),
+            Self::AcpiMethod(error) => write!(f, "an ACPI method failed: {error}"),
             Self::HandOver(error) => error.fmt(f),
         }
     }
@@ -2891,6 +2891,80 @@ mod tests {
                 "{text}"
             );
             assert!(!text.contains("Error") && !text.contains("::"), "{text}");
+        }
+    }
+
+    #[test]
+    fn sensor_audio_and_platform_failures_read_as_words() {
+        use input::sfh::Sensor;
+        #[cfg_attr(not(feature = "native-acpi"), allow(unused_mut))]
+        let mut texts = alloc::vec![
+            alloc::format!(
+                "{}",
+                Error::Sfh(input::sfh::Error::Timeout {
+                    sensor: Sensor::AmbientLight,
+                    expected: 4,
+                    observed: 0,
+                })
+            ),
+            alloc::format!(
+                "{}",
+                Error::SfhCold(input::sfh::cold::native::NativeError::Controller(
+                    input::sfh::cold::Error::UnsupportedSensorMask(0x8)
+                ))
+            ),
+            alloc::format!(
+                "{}",
+                Error::IshCold(input::ish::cold::native::Error::Missing([
+                    input::ish::cold::native::Prerequisite::OriginalNotificationOwner,
+                    input::ish::cold::native::Prerequisite::InheritedAddressInvalidation,
+                ]))
+            ),
+            alloc::format!(
+                "{}",
+                Error::Hda(crate::audio::Error::Timeout(
+                    crate::audio::Phase::LinkResetExit
+                ))
+            ),
+            alloc::format!(
+                "{}",
+                Error::HdaNative(native::hda::RetirementError::Pci(
+                    crate::audio::hda::pci::AttachError::ActiveDma { offset: 0x80 }
+                ))
+            ),
+            alloc::format!(
+                "{}",
+                PlatformError::Lpss(crate::bus::lpss::Error::Register {
+                    offset: 0x200,
+                    expected: 0x3,
+                    observed: 0,
+                })
+            ),
+        ];
+        #[cfg(feature = "native-acpi")]
+        texts.extend([
+            alloc::format!(
+                "{}",
+                PlatformError::Battery(crate::platform::battery::Error::Firmware(
+                    crate::platform::battery::Method::Status,
+                    crate::platform::acpi::NOT_FOUND,
+                ))
+            ),
+            alloc::format!(
+                "{}",
+                PlatformError::Ucsi(crate::usb::typec::ucsi::acpi::attachment::Error::Ucsi(
+                    crate::usb::typec::ucsi::Error::Timeout {
+                        phase: crate::usb::typec::ucsi::Phase::Command,
+                        cci: 0x2000_0000,
+                    }
+                ))
+            ),
+        ]);
+        for text in texts {
+            assert!(
+                !text.contains('{') && !text.contains("::") && !text.contains("Error"),
+                "{text}"
+            );
         }
     }
 
