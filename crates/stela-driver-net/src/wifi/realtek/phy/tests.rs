@@ -2,6 +2,7 @@
 //! Shared RTL8822C register, OTP and calibration fixtures.
 extern crate std;
 use super::*;
+use crate::wifi::stepped::block_on;
 use alloc::{sync::Arc, vec, vec::Vec};
 use std::sync::Mutex;
 struct Model {
@@ -17,6 +18,10 @@ struct Model {
     quarantined: usize,
     dac: Option<DacModel>,
     fifo_ready: bool,
+    /// Also answer the power sequence, firmware download and mailbox as a
+    /// whole chip does ([`Model::chip_written`]).
+    chip: bool,
+    beacons: usize,
 }
 #[derive(Default)]
 struct DacModel {
@@ -162,11 +167,78 @@ impl Model {
             self.events.push([k, r, w as u32, v]);
         }
     }
+    /// What a whole chip does after a store: the power state machine's
+    /// self-clearing requests, DDMA and beacon completion, the arbiter's
+    /// ready window, and firmware that boots once its CPU starts on a
+    /// checked image, answering the feature request.
+    fn chip_written(&mut self, r: u32, width: usize, v: u32) {
+        use super::super::registers::{
+            BIT_DDMACH0_OWN, BIT_PCI_BCNQ_FLAG, REG_C2HEVT, REG_CR, REG_DDMA_CH0CTRL,
+            REG_FIFOPAGE_CTRL_2, REG_MCUFW_CTRL, REG_WL2LTECOEX_INDIRECT_ACCESS_CTRL_V1,
+            RTK_PCI_TXBD_BCN_WORK, RTK_PCI_TXBD_RWPTR_CLR,
+        };
+        if !self.chip {
+            return;
+        }
+        match (r, width) {
+            (5, 1) => {
+                let mut stored = v;
+                if v & 1 != 0 {
+                    self.set(REG_CR, 1, 0);
+                    stored &= !1;
+                }
+                if v & 2 != 0 {
+                    self.set(REG_CR, 1, 0xea);
+                    stored &= !2;
+                }
+                self.set(5, 1, stored);
+            }
+            (REG_DDMA_CH0CTRL, 4) => self.set(r, 4, v & !BIT_DDMACH0_OWN),
+            (REG_FIFOPAGE_CTRL_2, 2) => self.set(r, 2, v & !(1 << 15)),
+            (REG_WL2LTECOEX_INDIRECT_ACCESS_CTRL_V1, 4) => self.set(r, 4, 1 << 29),
+            // rtw_pci_reset_buf_desc: the pointers clear, as does the H2C
+            // queue's index on its self-clearing request.
+            (RTK_PCI_TXBD_RWPTR_CLR, 4) => {
+                self.bytes[0x3a0..0x3bc].fill(0);
+                self.set(r, 4, 0);
+            }
+            (0x1330, 4) if v & ((1 << 16) | (1 << 8)) != 0 => {
+                self.set(0x132c, 4, 0);
+                self.set(r, 4, v & !((1 << 16) | (1 << 8)));
+            }
+            // The native beacon queue's kick: the page lands at once.
+            (RTK_PCI_TXBD_BCN_WORK, 1) if v & u32::from(BIT_PCI_BCNQ_FLAG) != 0 => {
+                self.beacons += 1;
+                let valid = self.get(REG_FIFOPAGE_CTRL_2, 2) | (1 << 15);
+                self.set(REG_FIFOPAGE_CTRL_2, 2, valid);
+            }
+            (3, _) if v & 4 != 0 && self.get(REG_MCUFW_CTRL, 2) & 0x4050 == 0x4050 => {
+                let ready = self.get(REG_MCUFW_CTRL, 2) | 0x8000;
+                self.set(REG_MCUFW_CTRL, 2, ready);
+                if self.get(REG_C2HEVT, 1) == 0xfd {
+                    self.set(REG_C2HEVT, 1, 0x19);
+                    self.bytes[0x1a2..0x1af].fill(0);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 struct Bus {
     model: Arc<Mutex<Model>>,
     panic_delay: bool,
     panic_register: Option<u32>,
+    /// The clock delays and deadlines keep; none delays in place.
+    clock: Option<crate::Clock>,
+}
+impl Bus {
+    /// A register access on a clocked bus takes a microsecond, about what a
+    /// PCIe read does.
+    fn access(&self) {
+        if let Some(clock) = self.clock {
+            crate::test_clock::advance(clock, 1);
+        }
+    }
 }
 // SAFETY: the Arc keeps all register/OTP/RF storage live and each access locks
 // the same model before applying its width-specific effect. Delays and responses
@@ -176,6 +248,7 @@ unsafe impl Io for Bus {
         self.model.lock().unwrap().profile
     }
     fn read8(&mut self, r: u32) -> Result<u8, io::Error> {
+        self.access();
         let mut m = self.model.lock().unwrap();
         m.op()?;
         let v = m.get(r, 1);
@@ -183,6 +256,7 @@ unsafe impl Io for Bus {
         Ok(v as u8)
     }
     fn read16(&mut self, r: u32) -> Result<u16, io::Error> {
+        self.access();
         let mut m = self.model.lock().unwrap();
         m.op()?;
         let v = m.get(r, 2);
@@ -190,6 +264,7 @@ unsafe impl Io for Bus {
         Ok(v as u16)
     }
     fn read32(&mut self, r: u32) -> Result<u32, io::Error> {
+        self.access();
         if self.panic_register == Some(r) {
             panic!("modeled register unwind");
         }
@@ -211,25 +286,31 @@ unsafe impl Io for Bus {
         Ok(v)
     }
     fn write8(&mut self, r: u32, v: u8) -> Result<(), io::Error> {
+        self.access();
         let mut m = self.model.lock().unwrap();
         m.op()?;
         m.event(1, r, 1, v.into());
         m.set(r, 1, v.into());
+        m.chip_written(r, 1, v.into());
         Ok(())
     }
     fn write16(&mut self, r: u32, value: u16) -> Result<(), io::Error> {
+        self.access();
         let mut m = self.model.lock().unwrap();
         m.op()?;
         m.event(1, r, 2, value.into());
         m.set(r, 2, value.into());
+        m.chip_written(r, 2, value.into());
         Ok(())
     }
     fn write32(&mut self, r: u32, v: u32) -> Result<(), io::Error> {
+        self.access();
         let mut m = self.model.lock().unwrap();
         m.op()?;
         m.event(1, r, 4, v);
         m.set(r, 4, v);
         m.dac_written(r, v);
+        m.chip_written(r, 4, v);
         if r == 0x30 {
             m.pending = true;
         }
@@ -248,12 +329,30 @@ unsafe impl Io for Bus {
             panic!("modeled timer unwind")
         }
         self.model.lock().unwrap().event(2, 0, 0, us as u32);
+        if let Some(clock) = self.clock {
+            crate::test_clock::advance(clock, us);
+        }
+    }
+    fn now_us(&mut self) -> Result<u64, io::Error> {
+        self.clock
+            .map(|clock| clock.now_us())
+            .ok_or(io::Error::InvalidClock)
+    }
+    fn deadline(&mut self, us: u64) -> Option<crate::Deadline> {
+        self.clock.map(|clock| clock.deadline(us))
     }
     fn submit_beacon(&mut self, _: &[u8]) -> Result<(), io::Error> {
-        panic!("no PHY DMA publication")
+        let mut m = self.model.lock().unwrap();
+        assert!(m.chip, "no PHY DMA publication");
+        m.op()?;
+        m.beacons += 1;
+        let valid = m.get(0x204, 2) | (1 << 15);
+        m.set(0x204, 2, valid);
+        Ok(())
     }
     unsafe fn beacon_consumed(&mut self) -> Result<(), io::Error> {
-        panic!("no PHY DMA completion")
+        assert!(self.model.lock().unwrap().chip, "no PHY DMA completion");
+        Ok(())
     }
     fn quarantine(&mut self) {
         self.model.lock().unwrap().quarantined += 1;
@@ -289,6 +388,8 @@ fn setup(
         quarantined: 0,
         dac: None,
         fifo_ready: false,
+        chip: false,
+        beacons: 0,
     };
     // Decode the board through the same OTP protocol exercised by efuse::read.
     let mac = if invalid_mac {
@@ -307,10 +408,11 @@ fn setup(
         model: model.clone(),
         panic_delay: false,
         panic_register: None,
+        clock: None,
     };
     // SAFETY: Bus keeps the register buffer and 512-byte OTP array behind its mutex.
     // The modeled OTP command/response runs synchronously, with no other reader or reset worker.
-    let board = unsafe { super::super::efuse::read(&mut bus) }
+    let board = block_on(unsafe { super::super::efuse::read(&mut bus) })
         .unwrap()
         .logical()
         .unwrap()
@@ -323,7 +425,7 @@ fn setup(
             m.set(0x1a8, 1, 0x20);
         }
     }
-    let report = super::super::features::read(&mut bus).unwrap();
+    let report = block_on(super::super::features::read(&mut bus)).unwrap();
     {
         let mut m = model.lock().unwrap();
         m.initial(seed);
@@ -365,7 +467,7 @@ fn paths_setup(pattern: usize, igi: u32) -> (Bus, Loaded, Report) {
     let (mut bus, board, report) = setup(1, 0, 0x3f, 0, false, false);
     // SAFETY: Bus exclusively serializes its Arc-held register and OTP model.
     // Board/report values stay live, including mismatch cases; no DMA or other client runs.
-    let loaded = unsafe { initialize(&mut bus, &board, &report) }.unwrap();
+    let loaded = block_on(unsafe { initialize(&mut bus, &board, &report) }).unwrap();
     {
         let mut m = bus.model.lock().unwrap();
         // Broad source-helper input patterns model volatile BB state at
@@ -394,7 +496,7 @@ fn dynamic_setup(
     let (mut bus, board, report) = setup(1, 0, crystal, 0, false, false);
     // SAFETY: Bus exclusively serializes its Arc-held register and OTP model.
     // Board/report values stay live, including mismatch cases; no DMA or other client runs.
-    let loaded = unsafe { initialize(&mut bus, &board, &report) }.unwrap();
+    let loaded = block_on(unsafe { initialize(&mut bus, &board, &report) }).unwrap();
     // SAFETY: The phase value and report remain live while Bus keeps its register/RF
     // model. No other RF client runs; any domain drift is injected by the serialized model.
     let paths = unsafe { loaded.configure_paths(&mut bus, &report) }.unwrap();
@@ -476,7 +578,7 @@ fn trim_setup(case: u32) -> (Bus, DacCalibrated, Report, super::super::efuse::Ph
     let (mut bus, initial, report) = dac_setup(case % 64);
     // SAFETY: The Bus Arc keeps register and scripted ADC/DAC sample storage.
     // Sampling and fault injection are synchronous; no other RF or calibration user can race them.
-    let calibration = unsafe { initial.calibrate_dac(&mut bus, &report) }.unwrap();
+    let calibration = block_on(unsafe { initial.calibrate_dac(&mut bus, &report) }).unwrap();
     {
         let mut m = bus.model.lock().unwrap();
         m.dac = None;
@@ -498,7 +600,7 @@ fn trim_setup(case: u32) -> (Bus, DacCalibrated, Report, super::super::efuse::Ph
     // not a publicly constructed Physical or copied diagnostic byte token.
     // SAFETY: Bus keeps the register buffer and 512-byte OTP array behind its mutex.
     // The modeled OTP command/response runs synchronously, with no other reader or reset worker.
-    let physical = unsafe { super::super::efuse::read(&mut bus) }.unwrap();
+    let physical = block_on(unsafe { super::super::efuse::read(&mut bus) }).unwrap();
     {
         let mut m = bus.model.lock().unwrap();
         m.initial(case as usize);
@@ -523,14 +625,15 @@ fn tail_setup(pattern: usize, a: u8, b: u8) -> (Bus, FactoryInitialized, Report)
     }
     // SAFETY: Bus keeps the register buffer and 512-byte OTP array behind its mutex.
     // The modeled OTP command/response runs synchronously, with no other reader or reset worker.
-    let physical = unsafe { super::super::efuse::read(&mut bus) }.unwrap();
+    let physical = block_on(unsafe { super::super::efuse::read(&mut bus) }).unwrap();
     assert_eq!(
         physical.logical().unwrap().board().raw().thermal_raw,
         [a, b]
     );
     // SAFETY: The calibration, report and decoded OTP objects remain live through the
     // call. Bus serializes their register model, including intentional provenance/profile failures.
-    let factory = unsafe { calibration.initialize_factory(&mut bus, &report, &physical) }.unwrap();
+    let factory =
+        block_on(unsafe { calibration.initialize_factory(&mut bus, &report, &physical) }).unwrap();
     {
         let mut m = bus.model.lock().unwrap();
         m.initial(pattern);
@@ -594,6 +697,8 @@ fn power_setup() -> (Bus, PhyInitialized, Report, channel_power::Plan) {
     }
     (bus, phy, report, plan)
 }
+
+mod chip;
 
 mod mac;
 

@@ -24,7 +24,7 @@ use crate::{
     Clock, Link, LinkError, Mac,
     wifi::{
         Band, Channel, RadioStatus, RawRate, Timestamp,
-        connection::keeper::{self, Advertisement, Keeper, Peer, Radio, Stage},
+        connection::keeper::{self, Advertisement, Keeper, Peer, Radio, Recovery, Stage},
         frame::Mpdu,
         mediatek::reorder::Reorder,
         network::Network,
@@ -189,9 +189,20 @@ pub trait Device {
     fn limitation(&mut self) -> Option<&'static str> {
         None
     }
-    /// The device was quarantined for good: no call reaches it again.
+    /// The device was quarantined: no call reaches it again until a
+    /// [`Self::recover`] that is [`Recovery::Done`].
     fn lost(&self) -> bool {
         false
+    }
+    /// Whether [`Self::recover`] can bring a lost device back.
+    fn recoverable(&self) -> bool {
+        false
+    }
+    /// One bounded step of a chip reset of the lost device, which runs again
+    /// at the same address with nothing of before once it is
+    /// [`Recovery::Done`].
+    fn recover(&mut self) -> Result<Recovery, String> {
+        Err(String::from("no chip reset"))
     }
     /// Nothing holds frames back: a calibration [`Self::prepare_transmit`]
     /// began has ended. Each [`Self::receive`] takes a step of it.
@@ -638,6 +649,89 @@ impl<D: Device> Rtl8822c<D> {
             dropped: 0,
             pending_join: None,
         })
+    }
+
+    /// Forget everything of the device before its chip reset, as mac80211's
+    /// restart starts over with no station, keys or agreements. What was
+    /// told once stays told.
+    fn reset(&mut self) -> Result<(), Error> {
+        let Self {
+            device: _,
+            address,
+            clock,
+            country: _,
+            channels: _,
+            station,
+            scanner,
+            hop,
+            scanned,
+            observed,
+            outbox,
+            events: _,
+            following,
+            received,
+            held,
+            parked,
+            changes,
+            aggregating,
+            unaggregated,
+            no_amsdu,
+            rate_amsdu,
+            tail_joins,
+            admitted,
+            context,
+            keys,
+            next_slot,
+            management_cipher,
+            integrity,
+            tuned,
+            agreements,
+            fragments,
+            report,
+            reporting,
+            port_open,
+            watchdog_at,
+            watchdogs,
+            departing,
+            left,
+            reported: _,
+            dropped: _,
+            pending_join,
+        } = self;
+        *station = Station::new(*address).map_err(Error::Station)?;
+        *scanner = Scanner::new(*address).map_err(Error::Scan)?;
+        *hop = None;
+        *scanned = None;
+        observed.clear();
+        outbox.clear();
+        *following = None;
+        received.clear();
+        held.clear();
+        parked.clear();
+        changes.clear();
+        *aggregating = Default::default();
+        *unaggregated = [false; 8];
+        *no_amsdu = [false; 8];
+        *rate_amsdu = 0;
+        *tail_joins = false;
+        *admitted = None;
+        *context = None;
+        keys.clear();
+        *next_slot = 0;
+        *management_cipher = None;
+        *integrity = None;
+        *tuned = None;
+        *agreements = Default::default();
+        *fragments = Fragments::default();
+        *report = 0;
+        *reporting = None;
+        *port_open = false;
+        *watchdog_at = clock.now_us() + WATCHDOG_US;
+        *watchdogs = 0;
+        *departing = None;
+        *left = false;
+        *pending_join = None;
+        Ok(())
     }
 
     /// Keep `self` connected to `network`; `entropy` gives each handshake's
@@ -1951,6 +2045,20 @@ impl<D: Device> Radio for Rtl8822c<D> {
 
     fn service(&mut self) -> Result<(), Error> {
         self.operate()
+    }
+
+    fn recoverable(&self) -> bool {
+        self.device.recoverable()
+    }
+
+    /// rtw88's `rtw_fw_recovery_work` resets the chip and mac80211 restarts
+    /// with nothing of before; the keeper then joins again.
+    fn recover(&mut self) -> Result<Recovery, String> {
+        let step = self.device.recover()?;
+        if step == Recovery::Done {
+            self.reset().map_err(|error| format!("{error:?}"))?;
+        }
+        Ok(step)
     }
 
     fn take_event(&mut self) -> Option<keeper::Event> {

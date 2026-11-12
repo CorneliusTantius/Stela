@@ -23,9 +23,11 @@ fn table_stream_preflight() {
         (0, 0, false, true, Error::InvalidMac),
     ] {
         let (mut bus, board, report) = setup(cut, rfe, 0x3f, 0, one, invalid);
-        // SAFETY: Bus exclusively serializes its Arc-held register and OTP model.
-        // Board/report values stay live, including mismatch cases; no DMA or other client runs.
-        assert!(matches!(unsafe{initialize(&mut bus,&board,&report)},Err(e)if e==expected));
+        assert!(
+            // SAFETY: Bus exclusively serializes its Arc-held register and OTP model.
+            // Board/report values stay live, including mismatch cases; no DMA or other client runs.
+            matches!(block_on(unsafe { initialize(&mut bus, &board, &report) }),Err(e)if e==expected)
+        );
         let m = bus.model.lock().unwrap();
         assert_eq!(m.calls, 0);
         assert!(m.events.is_empty());
@@ -36,7 +38,7 @@ fn table_stream_preflight() {
     assert!(matches!(
         // SAFETY: Bus exclusively serializes its Arc-held register and OTP model.
         // Board/report values stay live, including mismatch cases; no DMA or other client runs.
-        unsafe { initialize(&mut bus, &board, &other) },
+        block_on(unsafe { initialize(&mut bus, &board, &other) }),
         Err(Error::WrongProfile)
     ));
     assert_eq!(bus.model.lock().unwrap().calls, 0);
@@ -111,7 +113,7 @@ fn table_failure_quarantines() {
     let (mut bus, board, report) = setup(1, 0, 0x7f, 0, false, false);
     // SAFETY: Bus exclusively serializes its Arc-held register and OTP model.
     // Board/report values stay live, including mismatch cases; no DMA or other client runs.
-    unsafe { initialize(&mut bus, &board, &report) }.unwrap();
+    block_on(unsafe { initialize(&mut bus, &board, &report) }).unwrap();
     let total = bus.model.lock().unwrap().calls;
     let mut positions: Vec<usize> = (1..=48).collect();
     positions.extend((1..=32).map(|i| (i * total / 32).max(1)));
@@ -124,7 +126,7 @@ fn table_failure_quarantines() {
         assert!(
             // SAFETY: Bus exclusively serializes its Arc-held register and OTP model.
             // Board/report values stay live, including mismatch cases; no DMA or other client runs.
-            unsafe { initialize(&mut bus, &board, &report) }.is_err(),
+            block_on(unsafe { initialize(&mut bus, &board, &report) }).is_err(),
             "operation {at}"
         );
         assert!(bus.model.lock().unwrap().quarantined >= 1, "operation {at}");
@@ -134,17 +136,17 @@ fn table_failure_quarantines() {
         bus.model.lock().unwrap().mutate = Some((at, r, w, v));
         // SAFETY: Bus exclusively serializes its Arc-held register and OTP model.
         // Board/report values stay live, including mismatch cases; no DMA or other client runs.
-        assert!(unsafe { initialize(&mut bus, &board, &report) }.is_err());
+        assert!(block_on(unsafe { initialize(&mut bus, &board, &report) }).is_err());
         let m = bus.model.lock().unwrap();
         assert!(m.events.iter().any(|e| e[0] == 1 && e[1] >= 0x3c00));
         assert!(m.quarantined >= 1);
     }
     let (mut bus, board, report) = setup(1, 0, 0x7f, 0, false, false);
     bus.panic_delay = true;
-    // SAFETY: Bus exclusively serializes its Arc-held register and OTP model.
-    // Board/report values stay live, including mismatch cases; no DMA or other client runs.
-    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-        initialize(&mut bus, &board, &report)
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        // SAFETY: Bus exclusively serializes its Arc-held register and OTP model.
+        // Board/report values stay live, including mismatch cases; no DMA or other client runs.
+        block_on(unsafe { initialize(&mut bus, &board, &report) })
     }));
     assert!(caught.is_err());
     assert!(bus.model.lock().unwrap().quarantined >= 1);
@@ -177,7 +179,7 @@ fn rtl8822c_tables_match_linux() {
         );
         // SAFETY: Bus exclusively serializes its Arc-held register and OTP model.
         // Board/report values stay live, including mismatch cases; no DMA or other client runs.
-        let loaded = unsafe { initialize(&mut bus, &board, &report) }.unwrap();
+        let loaded = block_on(unsafe { initialize(&mut bus, &board, &report) }).unwrap();
         assert_eq!(loaded.condition(), condition);
         assert_eq!(loaded.profile(), bus.profile());
         let counts = loaded.configured_pairs();

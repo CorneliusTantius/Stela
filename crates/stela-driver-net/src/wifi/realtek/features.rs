@@ -5,7 +5,7 @@
 //! decoding creates diagnostics, never firmware/PHY/ownership evidence.
 use super::{
     identity::{Chip, Profile},
-    io::{Error, Io},
+    io::{Error, Io, sleep},
     registers::*,
 };
 
@@ -128,7 +128,7 @@ pub(super) fn request<I: Io>(io: &mut I) -> Result<(), Error> {
 
 /// Called only after that same Download requested then observed ready,
 /// with no raw-I/O escape/reset/mailbox worker between request and this read.
-pub(super) fn read<I: Io>(io: &mut I) -> Result<Report, Error> {
+pub(super) async fn read<I: Io>(io: &mut I) -> Result<Report, Error> {
     let profile = identity(io)?;
     ready(io)?;
     let mut id = io.read8(REG_C2HEVT)?;
@@ -136,7 +136,7 @@ pub(super) fn read<I: Io>(io: &mut I) -> Result<Report, Error> {
         if id != REQUEST {
             break;
         }
-        io.delay_us(REPORT_POLL_US);
+        sleep(io, REPORT_POLL_US).await;
         id = io.read8(REG_C2HEVT)?;
     }
     if id != REPORT {
@@ -172,6 +172,7 @@ fn ready<I: Io>(io: &mut I) -> Result<(), Error> {
 mod tests {
     extern crate std;
     use super::*;
+    use crate::wifi::stepped::block_on;
     use alloc::vec::Vec;
 
     struct Registers {
@@ -283,13 +284,13 @@ mod tests {
     fn a_report_still_on_its_way_is_waited_for_within_bounds() {
         let mut registers = Registers::new(1 << 27, [255; LENGTH]);
         registers.pending_reads = 5;
-        read(&mut registers).unwrap();
+        block_on(read(&mut registers)).unwrap();
         assert_eq!(registers.delays, 5);
         assert_eq!(registers.id, 0, "the report is acknowledged");
         let mut registers = Registers::new(1 << 27, [255; LENGTH]);
         registers.pending_reads = usize::MAX;
         assert!(matches!(
-            read(&mut registers),
+            block_on(read(&mut registers)),
             Err(Error::HardwareFeatureId { observed: REQUEST })
         ));
         assert_eq!(registers.delays, REPORT_POLLS);
@@ -297,7 +298,7 @@ mod tests {
         // Any other mailbox value is no report, at once.
         let mut registers = Registers::new(1 << 27, [255; LENGTH]);
         registers.id = 0x12;
-        assert!(read(&mut registers).is_err());
+        assert!(block_on(read(&mut registers)).is_err());
         assert_eq!(registers.delays, 0);
     }
     #[test]
@@ -309,7 +310,7 @@ mod tests {
             } else {
                 registers.change_identity_after_payload = true;
             }
-            let result = read(&mut registers);
+            let result = block_on(read(&mut registers));
             if ready {
                 assert!(matches!(
                     result,
@@ -333,7 +334,7 @@ mod tests {
             let raw = trace[offset + 4..offset + 17].try_into().unwrap();
             offset += 17;
             let mut io = Registers::new(sys, raw);
-            let report = read(&mut io).unwrap();
+            let report = block_on(read(&mut io)).unwrap();
             // Source ID + 13 byte loads + ACK. Additional native guards
             // and ACK readback remain separate from donor's operations.
             assert_eq!(

@@ -6,7 +6,7 @@
 //!
 //! [`Rtl8822c`]: super::station::Rtl8822c
 use super::{
-    bootstrap::{Native, Up},
+    bootstrap::{self, Claim, Native, Up},
     calibrate::{Calibration, DpkRun, GapkRun},
     coex::{Coex, Event, Order, Wifi},
     commands::{self, Report},
@@ -35,13 +35,15 @@ use crate::{
     Mac,
     bus::dma::memory::PageSource,
     wifi::Band,
+    wifi::connection::keeper::Recovery,
     wifi::station::{
         operations::ChannelDefinition,
         phy::{AccessCategory, Width},
     },
+    wifi::stepped::{Stepped, block_on},
 };
 use alloc::{collections::VecDeque, format, string::String, vec::Vec};
-use core::fmt::Debug;
+use core::{fmt::Debug, task::Poll};
 
 /// `REG_TCR`'s `BIT_PWRMGT_HWDATA_EN` and `BIT_TCR_UPDATE_TIMIE`.
 const REG_TCR: u32 = 0x604;
@@ -230,6 +232,12 @@ pub struct Hardware {
     /// Bluetooth's reports while a calibration holds the arbiter, as rtw88's
     /// C2H work waits for its mutex.
     held_reports: Vec<Report>,
+    /// What a chip reset brings the function up again from, and how.
+    claim: Claim,
+    alpha2: [u8; 2],
+    dfs_region: u8,
+    /// The chip reset under way, a step of the bring-up each call.
+    recovery: Option<Stepped<'static, Result<Up, bootstrap::Error>>>,
 }
 
 impl Hardware {
@@ -253,16 +261,15 @@ impl Hardware {
             report,
             features,
             board,
-            mut coex,
+            coex,
             mac,
             pages,
             geometry,
             link,
             disabled,
+            claim,
             ..
         } = up;
-        // Past attach, the arbiter's waits are bounded per call.
-        coex.bound_waits();
         let initial = phy.factory().calibration().initial();
         let cck_bounds = initial.cck_bounds();
         let calibration = Calibration::new(board.raw().power_track_raw);
@@ -327,7 +334,48 @@ impl Hardware {
             rfk: None,
             leaving: None,
             held_reports: Vec::new(),
+            claim,
+            alpha2,
+            dfs_region,
+            recovery: None,
         })
+    }
+
+    /// One step of `rtw_fw_recovery_work`'s chip reset: the bring-up again,
+    /// a step per call, from the power sequence on. Done, the chip runs as
+    /// new beneath `self`.
+    ///
+    /// The rings of the boot before, and of each attempt that failed or was
+    /// dropped part way, stay mapped: a ring keeps its pages once configured,
+    /// since nothing proves the chip stopped reaching them until the next
+    /// power sequence. That is one set of rings per attempt, bounded by the
+    /// keeper's ten attempts in a row.
+    fn reset_step(&mut self) -> Result<Recovery, String> {
+        let recovery = match &mut self.recovery {
+            Some(recovery) => recovery,
+            None => {
+                // The power sequence masks the chip's interrupts too; this
+                // only keeps the line quiet until then.
+                let _ = self.interrupts.disable();
+                let claim = self.claim.clone();
+                // SAFETY: the claim attach brought up, which this keeps;
+                // the old rings stay mapped and the power sequence stops
+                // the chip before any is bound again.
+                self.recovery
+                    .insert(Stepped::new(unsafe { bootstrap::start(claim) }))
+            }
+        };
+        let up = match recovery.step() {
+            Poll::Pending => return Ok(Recovery::Pending),
+            Poll::Ready(up) => {
+                self.recovery = None;
+                up.map_err(|error| format!("bring-up: {error}"))?
+            }
+        };
+        // SAFETY: straight from the bring-up, with the MSI attach routed.
+        let fresh = unsafe { Self::new(up, self.alpha2, self.dfs_region, self.vector) }?;
+        drop(core::mem::replace(self, fresh));
+        Ok(Recovery::Done)
     }
 
     /// `rtw_fw_send_h2c_command`: a command firmware's busy mailbox would not
@@ -460,7 +508,8 @@ impl Hardware {
         let boundary = self.boundary;
         let io = self.control.io().map_err(failed("registers"))?;
         for data in [&pages.data[..], &[0]] {
-            download::write_reserved(io, boundary, boundary, data)
+            // Two page waits of 10 ms at most, which the caller may hold.
+            block_on(download::write_reserved(io, boundary, boundary, data))
                 .map_err(failed("reserved pages"))?;
         }
         self.power_gate_pages = Some((pages.info, pages.predistortion));
@@ -1075,6 +1124,14 @@ impl Device for Hardware {
             || self.transmit.quarantined()
             || self.interrupts.state() == interrupt::State::Quarantined
             || self.phy.is_none()
+    }
+
+    fn recoverable(&self) -> bool {
+        true
+    }
+
+    fn recover(&mut self) -> Result<Recovery, String> {
+        self.reset_step()
     }
 }
 
