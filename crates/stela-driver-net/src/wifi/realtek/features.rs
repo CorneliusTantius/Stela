@@ -12,6 +12,10 @@ use super::{
 const REQUEST: u8 = 0xfd;
 const REPORT: u8 = 0x19;
 const LENGTH: usize = 13;
+/// rtw88 reads the report after the whole efuse dump, some milliseconds after
+/// firmware is ready; read at once here, it may still be on its way.
+const REPORT_POLLS: usize = 2000;
+const REPORT_POLL_US: u64 = 10;
 
 /// Source-decoded capabilities. Zero is the source "ignore" value, not proof
 /// of unavailable hardware. HCI/protocol numbers remain raw source encodings;
@@ -127,7 +131,14 @@ pub(super) fn request<I: Io>(io: &mut I) -> Result<(), Error> {
 pub(super) fn read<I: Io>(io: &mut I) -> Result<Report, Error> {
     let profile = identity(io)?;
     ready(io)?;
-    let id = io.read8(REG_C2HEVT)?;
+    let mut id = io.read8(REG_C2HEVT)?;
+    for _ in 0..REPORT_POLLS {
+        if id != REQUEST {
+            break;
+        }
+        io.delay_us(REPORT_POLL_US);
+        id = io.read8(REG_C2HEVT)?;
+    }
     if id != REPORT {
         return Err(Error::HardwareFeatureId { observed: id });
     }
@@ -168,6 +179,9 @@ mod tests {
         raw: [u8; LENGTH],
         id: u8,
         raw_reads: usize,
+        /// Reads of the mailbox that still find the request.
+        pending_reads: usize,
+        delays: usize,
         change_identity_after_payload: bool,
         lose_ready_after_payload: bool,
         events: Vec<u8>,
@@ -187,6 +201,8 @@ mod tests {
                 raw,
                 id: REPORT,
                 raw_reads: 0,
+                pending_reads: 0,
+                delays: 0,
                 change_identity_after_payload: false,
                 lose_ready_after_payload: false,
                 events: Vec::new(),
@@ -204,7 +220,10 @@ mod tests {
             self.profile
         }
         fn read8(&mut self, register: u32) -> Result<u8, Error> {
-            let value = if register == REG_C2HEVT {
+            let value = if register == REG_C2HEVT && self.pending_reads != 0 {
+                self.pending_reads -= 1;
+                REQUEST
+            } else if register == REG_C2HEVT {
                 self.id
             } else {
                 let index = (register - REG_C2HEVT - 2) as usize;
@@ -246,8 +265,9 @@ mod tests {
         fn write32(&mut self, _: u32, _: u32) -> Result<(), Error> {
             panic!("no feature 32-bit store")
         }
-        fn delay_us(&mut self, _: u64) {
-            panic!("source report has no polling/delay")
+        fn delay_us(&mut self, microseconds: u64) {
+            assert_eq!(microseconds, REPORT_POLL_US);
+            self.delays += 1;
         }
         fn submit_beacon(&mut self, _: &[u8]) -> Result<(), Error> {
             panic!("no feature beacon")
@@ -258,6 +278,27 @@ mod tests {
         fn quarantine(&mut self) {
             panic!("outer Download retains/quarantines actual owner")
         }
+    }
+    #[test]
+    fn a_report_still_on_its_way_is_waited_for_within_bounds() {
+        let mut registers = Registers::new(1 << 27, [255; LENGTH]);
+        registers.pending_reads = 5;
+        read(&mut registers).unwrap();
+        assert_eq!(registers.delays, 5);
+        assert_eq!(registers.id, 0, "the report is acknowledged");
+        let mut registers = Registers::new(1 << 27, [255; LENGTH]);
+        registers.pending_reads = usize::MAX;
+        assert!(matches!(
+            read(&mut registers),
+            Err(Error::HardwareFeatureId { observed: REQUEST })
+        ));
+        assert_eq!(registers.delays, REPORT_POLLS);
+        assert_eq!(registers.raw_reads, 0);
+        // Any other mailbox value is no report, at once.
+        let mut registers = Registers::new(1 << 27, [255; LENGTH]);
+        registers.id = 0x12;
+        assert!(read(&mut registers).is_err());
+        assert_eq!(registers.delays, 0);
     }
     #[test]
     fn late_identity_and_ready_loss_cannot_publish_or_ack_a_partial_report() {
