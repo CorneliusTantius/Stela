@@ -264,3 +264,46 @@ fn tx_power_reads_bcd_by_rate_and_writes_absolute_indices() {
     // VHT 1SS MCS8 and MCS9 alone in the last word.
     assert_eq!(r.get(0x1d34, 4) >> 16, 0);
 }
+
+/// One IQK look on a register file.
+fn poll(iqk: &mut Iqk, r: &mut Regs, report: &Report) -> Result<IqkProgress, Error> {
+    // SAFETY: the register file belongs to the calling test alone.
+    unsafe { iqk.poll(r, report) }
+}
+
+#[test]
+fn firmware_iqk_is_one_look_a_poll_until_done_or_out_of_looks() {
+    let (mut r, _, report) = set_up(0);
+    r.set(0x2800 + u32::from(RF_DTXLOK) * 4, 4, 0x1234);
+    r.set(REG_IQKFAILMSK, 4, 1 << 16 | 0x01);
+    let mut iqk = Iqk::default();
+    for _ in 0..3 {
+        assert_eq!(poll(&mut iqk, &mut r, &report), Ok(IqkProgress::Pending));
+    }
+    r.set(0x2800 + u32::from(RF_DTXLOK) * 4, 4, IQK_DONE);
+    assert_eq!(
+        poll(&mut iqk, &mut r, &report),
+        Ok(IqkProgress::Done {
+            finished: true,
+            reload: true,
+            failed: 1
+        })
+    );
+    assert_eq!(r.rf(RF_DTXLOK), 0);
+    // Firmware that never reports done: 300 looks, then on alike.
+    let (mut r, _, report) = set_up(0);
+    r.set(REG_IQKFAILMSK, 4, 0);
+    let mut iqk = Iqk::default();
+    for _ in 1..IQK_POLLS {
+        assert_eq!(poll(&mut iqk, &mut r, &report), Ok(IqkProgress::Pending));
+    }
+    assert_eq!(
+        poll(&mut iqk, &mut r, &report),
+        Ok(IqkProgress::Done {
+            finished: false,
+            reload: false,
+            failed: 0
+        })
+    );
+    assert_eq!(r.sipi().last(), Some(&(RF_DTXLOK, 0)));
+}

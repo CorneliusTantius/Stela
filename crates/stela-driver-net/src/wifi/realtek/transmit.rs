@@ -381,13 +381,26 @@ impl<R: Registers> Rings<R> {
         &mut self,
         source: &dyn PageSource,
     ) -> Result<(), Error> {
+        // SAFETY: forwarded from the caller.
+        unsafe { self.iqk_command(source, true, false) }
+    }
+    /// `rtw_fw_do_iqk` with `clear` and `segment_iqk`.
+    ///
+    /// # Safety
+    /// As [`Self::initial_iqk_command`], for the command's own parameters.
+    pub unsafe fn iqk_command(
+        &mut self,
+        source: &dyn PageSource,
+        clear: bool,
+        segment: bool,
+    ) -> Result<(), Error> {
         if self.poisoned || !self.configured {
             return Err(Error::Quarantined);
         }
         if self.pending() == H2C_COUNT - 1 {
             return Err(Error::Full);
         }
-        self.command(source, iqk(self.sequence))
+        self.command(source, iqk(self.sequence, clear, segment))
     }
     /// `rtw_pci_tx_write_data`: give `queue` one frame, which `packet` describes.
     /// [`Error::Full`] only asks to try again once the queue drains.
@@ -710,11 +723,12 @@ fn phydm_info(rfe: u8, cut: u8, antenna_tx: u8, antenna_rx: u8, sequence: u16) -
     p[11] = (antenna_tx & 15) | ((antenna_rx & 15) << 4);
     p
 }
-fn iqk(sequence: u16) -> [u8; 32] {
+/// `H2C_PKT_IQK`: `IQK_SET_CLEAR` and `IQK_SET_SEGMENT_IQK`.
+fn iqk(sequence: u16, clear: bool, segment: bool) -> [u8; 32] {
     let mut p = [0; 32];
     p[..4].copy_from_slice(&0x000eff01u32.to_le_bytes());
     p[4..8].copy_from_slice(&(9u32 | (u32::from(sequence) << 16)).to_le_bytes());
-    p[8] = 1;
+    p[8] = u8::from(clear) | (u8::from(segment) << 1);
     p
 }
 /// `rtw_pci_tx_write_data`'s two buffer descriptors: the packet descriptor at

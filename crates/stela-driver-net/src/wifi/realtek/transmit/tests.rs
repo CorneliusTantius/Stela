@@ -195,7 +195,10 @@ fn phydm_and_iqk_complete_on_fresh_status() {
         &d.packets[1][48..80],
         &phydm_info(0, report.profile().cut(), 3, 3, 1)
     );
-    assert_eq!(&d.packets[2][48..80], &iqk(2));
+    assert_eq!(&d.packets[2][48..80], &iqk(2, true, false));
+    // rtw8821c_do_iqk's command: no clear, segmented once associated.
+    assert_eq!(iqk(3, false, true)[8], 2);
+    assert_eq!(iqk(3, false, false)[8], 0);
     drop(d);
     assert_eq!(fw.lock().unwrap().get(REG_IQKSTAT, 1), 0);
     assert_eq!(fw.lock().unwrap().now, 320000);
@@ -412,7 +415,7 @@ fn full_phydm_iqk_packets_and_iqk_ready_deadlines_match_unchanged_source() {
             phydm_info((c % 7) as u8, ((c / 7) % 7) as u8, 3, 3, c as u16),
             bytes[offset..offset + 32]
         );
-        assert_eq!(iqk(c as u16), bytes[offset + 32..offset + 64]);
+        assert_eq!(iqk(c as u16, true, false), bytes[offset + 32..offset + 64]);
     }
     let bytes = std::fs::read(dir.join("iqk.bin")).unwrap();
     let mut offset = 0;

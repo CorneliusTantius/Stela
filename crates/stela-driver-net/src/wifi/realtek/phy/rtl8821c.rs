@@ -306,6 +306,67 @@ pub async unsafe fn phy_set_param<I: Io>(
     })
 }
 
+/// `RF_DTXLOK`, where firmware leaves 0xabcde when its IQK ends.
+const RF_DTXLOK: u8 = 0x08;
+const IQK_DONE: u32 = 0xabcde;
+/// `REG_IQKFAILMSK`: bit 16 the reload, the low byte the failed paths.
+const REG_IQKFAILMSK: u32 = 0x1bf0;
+/// `rtw8821c_do_iqk`'s 300 looks, 20 ms apart.
+pub const IQK_POLLS: u16 = 300;
+pub const IQK_POLL_US: u64 = 20_000;
+
+/// Where a firmware IQK stands.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IqkProgress {
+    Pending,
+    /// Firmware reported done, or the looks ran out (rtw88 goes on alike).
+    Done {
+        finished: bool,
+        reload: bool,
+        failed: u8,
+    },
+}
+
+/// `rtw8821c_do_iqk` after its `rtw_fw_do_iqk` command (clear 0, segment
+/// when associated): one look at `RF_DTXLOK` a call, [`IQK_POLL_US`] apart.
+#[derive(Debug, Default)]
+pub struct Iqk {
+    polls: u16,
+}
+
+impl Iqk {
+    /// One look, and the end of the run when firmware is done or the looks
+    /// ran out: `RF_DTXLOK` cleared and the failure mask read.
+    ///
+    /// # Safety
+    /// The Io and report of the boot whose firmware runs the IQK, with
+    /// nothing else reaching the RF.
+    pub unsafe fn poll<I: Io>(
+        &mut self,
+        io: &mut I,
+        report: &Report,
+    ) -> Result<IqkProgress, Error> {
+        if io.profile().chip() != Chip::Rtl8821C {
+            return Err(Error::WrongProfile);
+        }
+        // SAFETY: the caller's boot.
+        let mut rf = unsafe { rf::Registers::new(&mut *io, report) }?;
+        let finished = rf.read(Path::A, RF_DTXLOK, 0xfffff)? == IQK_DONE;
+        self.polls = self.polls.saturating_add(1);
+        if !finished && self.polls < IQK_POLLS {
+            return Ok(IqkProgress::Pending);
+        }
+        rf.write(Path::A, RF_DTXLOK, 0xfffff, 0)?;
+        drop(rf);
+        let mask = io.read32(REG_IQKFAILMSK)?;
+        Ok(IqkProgress::Done {
+            finished,
+            reload: mask & (1 << 16) != 0,
+            failed: mask as u8,
+        })
+    }
+}
+
 /// `rtw8821ce_rf_set`.
 #[derive(Clone, Copy)]
 enum RfSet {
