@@ -115,6 +115,40 @@ pub unsafe fn on<I: Io>(io: &mut I) -> Result<(), Error> {
     result
 }
 
+/// Stop a function its last owner may have left running, as
+/// `rtw_pci_disable_interrupt` and `rtw_mac_power_switch(false)` do: its
+/// interrupts are masked and its MAC, with every DMA engine in it, goes
+/// through the card-disable sequence. A function already off is left as it is.
+///
+/// # Safety
+/// The requester's bus mastering is off and nothing else touches it. On
+/// error the I/O owner is quarantined.
+pub unsafe fn off<I: Io>(io: &mut I) -> Result<(), Error> {
+    let profile = io.profile();
+    if profile.chip() != Chip::Rtl8822C {
+        return Err(Error::UnsupportedChip);
+    }
+    if profile.cut() >= 7 {
+        return Err(Error::UnsupportedCut(profile.cut()));
+    }
+    let mut attempt = Attempt {
+        io,
+        complete: false,
+    };
+    let result = (|| {
+        let observed = attempt.io.read32(REG_SYS_CFG1)?;
+        if observed != profile.observed().sys_cfg1 || observed == u32::MAX {
+            return Err(Error::IdentityChanged);
+        }
+        for register in [REG_HIMR0, REG_HIMR1, REG_HIMR3] {
+            attempt.io.write32(register, 0)?;
+        }
+        switch(attempt.io, false).map(|_| ())
+    })();
+    attempt.complete = result.is_ok();
+    result
+}
+
 fn modify8<I: Io>(io: &mut I, r: u32, clear: u8, set: u8) -> Result<(), Error> {
     let value = io.read8(r)?;
     io.write8(r, (value & !clear) | set)?;
@@ -375,6 +409,36 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn a_running_function_is_masked_and_disabled_and_an_off_one_is_left_alone() {
+        for cut in 0..7 {
+            let mut m = Model::new(cut, true, false);
+            for register in [REG_HIMR0, REG_HIMR1, REG_HIMR3] {
+                m.set(register, 4, u32::MAX);
+            }
+            // SAFETY: the model device belongs to this test alone.
+            unsafe { off(&mut m) }.unwrap();
+            assert_eq!(m.get(REG_CR, 1), 0xea, "cut={cut}");
+            for register in [REG_HIMR0, REG_HIMR1, REG_HIMR3] {
+                assert_eq!(m.get(register, 4), 0);
+            }
+            assert_eq!(m.quarantines, 0);
+            // A later power-on starts from the disabled card.
+            // SAFETY: as above.
+            unsafe { on(&mut m) }.unwrap();
+            assert_eq!(m.get(REG_CR, 1), 0);
+        }
+        let mut m = Model::new(1, false, false);
+        // SAFETY: as above.
+        unsafe { off(&mut m) }.unwrap();
+        assert_eq!(m.get(REG_CR, 1), 0xea);
+        let mut m = Model::new(1, true, false);
+        m.set(REG_SYS_CFG1, 4, u32::MAX);
+        // SAFETY: as above.
+        assert_eq!(unsafe { off(&mut m) }, Err(Error::IdentityChanged));
+        assert_eq!(m.operations, 1);
+        assert_eq!(m.quarantines, 1);
     }
     #[test]
     fn unsupported_cut_and_chip_have_no_successful_skipped_sequence() {

@@ -242,6 +242,7 @@ pub(super) use attach::attach;
 
 mod attach {
     use super::*;
+    use crate::probe::native::hand_over as native_hand_over;
     use crate::{
         Clock,
         bus::{
@@ -249,10 +250,6 @@ mod attach {
             i2c::{Bus, DesignWare, Operation},
             lpss,
             mmio::owned::{CacheAttribute, Mapping, Protection},
-            pci::{
-                Bar,
-                requester::{FunctionRole, StoppedRequester},
-            },
         },
         input::{
             InputDevice,
@@ -792,51 +789,20 @@ mod attach {
         let segment = integer(parent, "_SEG")?.unwrap_or(0) as u16;
         let address = pci_location(adr, segment, bus)
             .ok_or(PlatformError::Refused("I2C controller _ADR out of range"))?;
-        let requester = services.claim_stopped(address).map_err(native)?;
-        let mut function = ManuallyDrop::new(requester.into_function());
-        let identity = lpss::Identity {
-            vendor: function.vendor,
-            device: function.device,
-            subsystem_vendor: 0,
-            subsystem_device: 0,
-        };
-        let inspected = (|| {
-            let profile = lpss::Profile::select(identity).map_err(PlatformError::Lpss)?;
-            let bars = function.bars().map_err(PlatformError::Config)?;
-            Ok((profile, bars))
-        })();
-        let (profile, bars) = match inspected {
-            Ok(observed) => observed,
-            Err(error) => {
-                owners.push(Box::new(function));
+        let mut stop = LpssStop { profile: None };
+        // SAFETY: the mount's contract covers `services`.
+        let handed = match unsafe { native_hand_over::hand_over(services, address, &mut stop) } {
+            Ok(handed) => handed,
+            Err((error, owner)) => {
+                owners.extend(owner);
                 return Err(error);
             }
         };
-        // SAFETY: the mount claimed this function stopped, and sizing its BARs
-        // with decode off left it so.
-        let requester = match unsafe {
-            StoppedRequester::from_stopped_pci(
-                ManuallyDrop::into_inner(function),
-                FunctionRole::Physical,
-            )
-        } {
-            Ok(requester) => ManuallyDrop::new(requester),
-            Err((error, function)) => {
-                owners.push(Box::new(ManuallyDrop::new(function)));
-                return Err(native(ServiceError::Claim(error)));
-            }
-        };
-        let mapped = match bars[0] {
-            Some(bar @ Bar::Memory { .. }) => services.map_bar(address, bar).map_err(native),
-            _ => Err(native(ServiceError::Refused("missing memory BAR"))),
-        };
-        let mapping = match mapped {
-            Ok(mapping) => ManuallyDrop::new(mapping),
-            Err(error) => {
-                owners.push(Box::new(requester));
-                return Err(error);
-            }
-        };
+        let profile = stop.profile.expect("admitted");
+        owners.push(Box::new(handed.attachment));
+        let requester = ManuallyDrop::new(handed.requester);
+        let (mapping, _, _) = handed.registers.expect("BAR0 is mapped");
+        let mapping = ManuallyDrop::new(mapping);
         let board = timing::Board {
             clock_hz: profile.input_clock_hz(),
             sda_hold_ns: profile.source_sda_hold_ns(),
@@ -861,6 +827,41 @@ mod attach {
                 owners.push(Box::new(failure));
                 Err(PlatformError::LpssAttach(error))
             }
+        }
+    }
+
+    /// An LPSS function's vendor stop: as `intel_lpss_init_dev` does before
+    /// it programs anything, the function and its private iDMA are held in
+    /// reset.
+    struct LpssStop {
+        profile: Option<lpss::Profile>,
+    }
+
+    impl native_hand_over::ColdStop for LpssStop {
+        type Error = PlatformError;
+        const BAR: Option<usize> = Some(0);
+        fn admit(
+            &mut self,
+            function: &mut crate::bus::pci::Function<crate::bus::pci::owned::OwnedConfig>,
+        ) -> Result<(), PlatformError> {
+            let identity = lpss::Identity {
+                vendor: function.vendor,
+                device: function.device,
+                subsystem_vendor: 0,
+                subsystem_device: 0,
+            };
+            self.profile = Some(lpss::Profile::select(identity).map_err(PlatformError::Lpss)?);
+            Ok(())
+        }
+        unsafe fn stop(
+            &mut self,
+            _: &mut crate::bus::pci::Function<crate::bus::pci::owned::OwnedConfig>,
+            window: Option<native_hand_over::Window>,
+        ) -> Result<(), PlatformError> {
+            let window = window.ok_or(PlatformError::Refused("missing memory BAR"))?;
+            // SAFETY: the hand-over's BAR0 window, mapped while its owner
+            // lives; nothing else reaches the function.
+            unsafe { lpss::hold_in_reset(window.base, window.bytes) }.map_err(PlatformError::Lpss)
         }
     }
 

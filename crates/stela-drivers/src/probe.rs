@@ -57,6 +57,8 @@ pub enum Error {
     Pch(pch::AttachError),
     /// The mount's [`NativeServices`] refused or lack a resource.
     Native(ServiceError),
+    /// The function could not be taken over from its last owner.
+    HandOver(native::hand_over::HandOverError),
     Vmd(crate::bus::vmd::Error),
     Tg3(net::tg3::Error),
     Aqtion(net::aqtion::native::Error),
@@ -88,6 +90,7 @@ impl fmt::Display for Error {
             Self::Realtek(error) => error.fmt(f),
             Self::Pch(error) => write!(f, "e1000e: {error}"),
             Self::Native(error) => error.fmt(f),
+            Self::HandOver(error) => error.fmt(f),
             Self::Vmd(error) => write!(f, "VMD: {error}"),
             Self::Tg3(error) => write!(f, "tg3: {error}"),
             Self::Aqtion(error) => write!(f, "atlantic: {error}"),
@@ -126,6 +129,12 @@ impl From<crate::bus::pci::ConfigError> for Error {
 impl From<crate::bus::pci::CapabilityError> for Error {
     fn from(error: crate::bus::pci::CapabilityError) -> Self {
         Self::Device(BlockError::PciCapability(error))
+    }
+}
+
+impl From<native::hand_over::HandOverError> for Error {
+    fn from(error: native::hand_over::HandOverError) -> Self {
+        Self::HandOver(error)
     }
 }
 
@@ -179,6 +188,14 @@ pub enum PlatformError {
     /// Finding a device or evaluating its method failed.
     #[cfg(feature = "native-acpi")]
     AcpiMethod(crate::platform::acpi::Error),
+    /// The function could not be taken over from its last owner.
+    HandOver(native::hand_over::HandOverError),
+}
+
+impl From<native::hand_over::HandOverError> for PlatformError {
+    fn from(error: native::hand_over::HandOverError) -> Self {
+        Self::HandOver(error)
+    }
 }
 
 impl fmt::Display for PlatformError {
@@ -211,6 +228,7 @@ impl fmt::Display for PlatformError {
             Self::Ucsi(error) => write!(f, "UCSI: {error:?}"),
             #[cfg(feature = "native-acpi")]
             Self::AcpiMethod(error) => write!(f, "ACPI method: {error:?}"),
+            Self::HandOver(error) => error.fmt(f),
         }
     }
 }

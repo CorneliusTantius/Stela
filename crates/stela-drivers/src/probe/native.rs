@@ -7,14 +7,9 @@ use crate::{
     Clock,
     bluetooth::{bcm4377, intel_pcie},
     bus::{
-        dma::{DomainAllocator, mapping::DmaDomain},
+        dma::DomainAllocator,
         mmio::owned::{CacheAttribute, Mapping, Protection},
-        pci::{
-            Address, Bar, ConfigSpace, Function,
-            msix::MappedBar,
-            owned::OwnedConfig,
-            requester::{FunctionRole, StoppedRequester},
-        },
+        pci::{Address, Bar, ConfigSpace, Function, msix::MappedBar, owned::OwnedConfig},
         vmd,
     },
     net::{
@@ -29,8 +24,11 @@ use crate::{
 use alloc::{boxed::Box, rc::Rc, string::String, sync::Arc, vec::Vec};
 use core::{any::Any, cell::RefCell};
 
+pub mod hand_over;
 pub mod hda;
 pub mod usb4;
+
+use hand_over::{ColdStop, HandOverError, Window, hand_over};
 
 /// A Broadcom Tigon3 adapter over owned BAR0 and APE mappings.
 pub type Tg3 = tg3::Packet<tg3::io::Mmio<OwnedConfig>, Rc<dyn crate::bus::pci::power::Timer>>;
@@ -202,43 +200,6 @@ fn mediatek_identity<C: ConfigSpace>(
         subsystem_vendor: config.read16(0x2c)?,
         subsystem_device: config.read16(0x2e)?,
         revision: config.read8(0x08)?,
-    })
-}
-
-/// A function claimed from the mount, before any device effect.
-struct Claimed {
-    function: Function<OwnedConfig>,
-    domain: Arc<dyn DmaDomain>,
-    bars: [Option<Bar>; 6],
-}
-
-#[expect(
-    clippy::result_large_err,
-    reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
-)]
-fn claim(services: &dyn NativeServices, address: Address) -> Result<Claimed, Failure> {
-    let requester = services
-        .claim_stopped(address)
-        .map_err(|error| (Error::Native(error), None))?;
-    let (requester, binding) = match requester.into_dma_binding() {
-        Ok(value) => value,
-        Err((error, owner)) => {
-            return Err(keep_error(Error::Native(ServiceError::Claim(error)), owner));
-        }
-    };
-    let domain = match services.domain(binding) {
-        Ok(domain) => domain,
-        Err(error) => return Err(keep_error(Error::Native(error), requester)),
-    };
-    let mut function = requester.into_function();
-    let bars = match function.bars() {
-        Ok(bars) => bars,
-        Err(error) => return Err(keep_error(error, (function, domain))),
-    };
-    Ok(Claimed {
-        function,
-        domain,
-        bars,
     })
 }
 
@@ -476,11 +437,62 @@ pub type IntelWifi = wifi::intel::link::Station<
     wifi::intel::radio::bios::service::native::NativeBios,
 >;
 
-/// The owners an MT7925 station keeps: its claimed function and BAR0.
-pub type MediatekOwner = (Function<OwnedConfig>, Mapping);
+/// The owners an MT7925 station keeps: its function, the DMA domain its
+/// requester is bound to, and BAR0.
+pub type MediatekOwner = (
+    Function<OwnedConfig>,
+    crate::bus::pci::requester::preparation::Attachment,
+    Mapping,
+);
 
 /// An MT7925 station over its owned function and BAR0.
 pub type MediatekWifi = mediatek::station::Wifi<MediatekOwner>;
+
+/// MT7925's vendor stop: as `mt7925_pci_probe` does before it maps
+/// anything, its WLAN subsystem is reset, its interrupts masked and its
+/// WFDMA stopped.
+pub(super) struct MediatekStop {
+    pub clock: Clock,
+    pub aspm: bool,
+    pub pci: Option<mediatek::identity::PciIdentity>,
+}
+
+impl ColdStop for MediatekStop {
+    type Error = Error;
+    const BAR: Option<usize> = Some(0);
+    fn admit(&mut self, function: &mut Function<OwnedConfig>) -> Result<(), Error> {
+        let pci = mediatek_identity(function)?;
+        if pci.chip() != Some(mediatek::identity::Chip::Mt7925) {
+            return Err(Error::MediatekWifi(
+                mediatek::attach::AttachError::UnsupportedChip(pci),
+            ));
+        }
+        self.pci = Some(pci);
+        Ok(())
+    }
+    unsafe fn stop(
+        &mut self,
+        _: &mut Function<OwnedConfig>,
+        window: Option<Window>,
+    ) -> Result<(), Error> {
+        let (Some(pci), Some(window)) = (self.pci, window) else {
+            return Err(HandOverError::Vanished.into());
+        };
+        // SAFETY: the hand-over's BAR0 window, kept by its owner, with bus
+        // mastering sealed off and no other user.
+        unsafe {
+            mediatek::bootstrap::stop(
+                pci,
+                window.base,
+                window.bytes,
+                window.owner,
+                self.clock,
+                self.aspm,
+            )
+        }
+        .map_err(|error| Error::MediatekWifi(mediatek::attach::AttachError::Stop(error)))
+    }
+}
 
 /// Attach a MediaTek Wi-Fi function: BAR0 holds its registers and remap
 /// windows.
@@ -498,31 +510,18 @@ pub(super) unsafe fn mediatek_wifi(
     completion: Option<crate::bus::irq::MsiMessage>,
     mut inputs: mediatek::attach::Inputs,
 ) -> Result<Located<mediatek::attach::Attached<MediatekOwner>>, Failure> {
-    let Claimed {
-        mut function,
-        domain,
-        bars,
-    } = claim(services, address)?;
-    let pci = match mediatek_identity(&mut function) {
-        Ok(pci) => pci,
-        Err(error) => return Err(keep_error(error, (function, domain))),
+    let mut stop = MediatekStop {
+        clock: inputs.clock,
+        aspm: inputs.aspm,
+        pci: None,
     };
-    let registers = match map(services, address, &bars, 0) {
-        Ok(registers) => registers,
-        Err(error) => return Err(keep_error(Error::Native(error), (function, domain))),
-    };
-    let (base, bytes) = match registers
-        .bytes()
-        .and_then(|bytes| Ok((registers.address(0, bytes)?, bytes)))
-    {
-        Ok(window) => window,
-        Err(error) => {
-            return Err(keep_error(
-                Error::Native(ServiceError::Mapping(error)),
-                (function, domain, registers),
-            ));
-        }
-    };
+    // SAFETY: forwarded from the caller.
+    let handed = unsafe { hand_over(services, address, &mut stop) }?;
+    let pci = stop.pci.expect("admitted");
+    let (registers, base, bytes) = handed.registers.expect("BAR0 is mapped");
+    let attachment = handed.attachment;
+    let domain = attachment.domain();
+    let mut function = handed.requester.into_function();
     let configured = (|| -> Result<bool, Error> {
         let interrupt = function.interrupts()?.msi;
         function.enable_polled()?;
@@ -536,16 +535,16 @@ pub(super) unsafe fn mediatek_wifi(
     })();
     inputs.vector = match configured {
         Ok(vector) => vector,
-        Err(error) => return Err(keep_error(error, (function, domain, registers))),
+        Err(error) => return Err(keep_error(error, (function, attachment, registers))),
     };
     #[expect(
         clippy::arc_with_non_send_sync,
         reason = "The serialized BAR and queue retainers require Arc<dyn Any>; this PCI custody remains !Send and !Sync."
     )]
-    let owner = Arc::new((function, registers));
+    let owner = Arc::new((function, attachment, registers));
     let kept = Box::new(owner.clone()) as Box<dyn Any>;
-    // SAFETY: the mount claimed the stopped function, mapped its BAR0
-    // uncached and supplied an isolating domain; `owner` keeps the function
+    // SAFETY: the function was stopped and bound to its own domain by the
+    // hand-over, BAR0 is mapped uncached, `owner` keeps the function, domain
     // and mapping, and its interrupts are off.
     match unsafe { mediatek::attach::attach(pci, base.cast(), bytes, owner, domain, inputs) } {
         Ok(attached) => Ok(Located {
@@ -559,7 +558,57 @@ pub(super) unsafe fn mediatek_wifi(
 /// An RTL8822C station on its hardware.
 pub type RealtekWifi = realtek_wifi::station::Wifi<realtek_wifi::hardware::Hardware>;
 
-/// Attach an RTL8822C: `rtw_pci_io_mapping` finds its registers in BAR2.
+/// RTL8822C's vendor stop: as `rtw_pci_disable_interrupt` and
+/// `rtw_mac_power_switch` leave it, its interrupts are masked and its MAC,
+/// with every DMA engine in it, disabled.
+pub(super) struct RealtekStop {
+    pub clock: Clock,
+    pub observed: Option<realtek_wifi::identity::Observed>,
+}
+
+impl ColdStop for RealtekStop {
+    type Error = Error;
+    /// `rtw_pci_io_mapping` finds its registers in BAR2.
+    const BAR: Option<usize> = Some(2);
+    unsafe fn stop(
+        &mut self,
+        function: &mut Function<OwnedConfig>,
+        window: Option<Window>,
+    ) -> Result<(), Error> {
+        use realtek_wifi::attach::AttachError;
+        let Some(window) = window else {
+            return Err(HandOverError::Vanished.into());
+        };
+        let (vendor, device) = (function.vendor, function.device);
+        let config = function.config();
+        let observed = realtek_wifi::identity::Observed {
+            vendor,
+            device,
+            subsystem_vendor: config.read16(0x2c)?,
+            subsystem_device: config.read16(0x2e)?,
+            pci_revision: config.read8(0x08)?,
+            // SAFETY: this function's own mapped BAR2, whose first page holds
+            // SYS_CFG1.
+            sys_cfg1: unsafe { crate::bus::mmio::Mmio::new(window.base.as_ptr() as u64, 4096) }
+                .read32(0xf0),
+        };
+        self.observed = Some(observed);
+        let profile = realtek_wifi::identity::Profile::select(observed)
+            .map_err(|error| Error::RealtekWifi(AttachError::Identity(error)))?;
+        // SAFETY: the hand-over's BAR2 window, mapped while its owner lives,
+        // which outlives this I/O; nothing else reaches it.
+        let mut io = unsafe {
+            realtek_wifi::io::ColdIo::new(window.base, window.bytes, self.clock, profile)
+        }
+        .map_err(|error| Error::RealtekWifi(AttachError::Stop(error.into())))?;
+        // SAFETY: bus mastering is sealed off and nothing else touches the
+        // function.
+        unsafe { realtek_wifi::power::off(&mut io) }
+            .map_err(|error| Error::RealtekWifi(AttachError::Stop(error)))
+    }
+}
+
+/// Attach an RTL8822C over its BAR2 registers.
 ///
 /// # Safety
 /// As for [`tg3`].
@@ -573,35 +622,19 @@ pub(super) unsafe fn realtek_wifi(
     completion: Option<crate::bus::irq::MsiMessage>,
     mut inputs: realtek_wifi::attach::Inputs,
 ) -> Result<Located<RealtekWifi>, Failure> {
-    let Claimed {
-        mut function,
-        domain,
-        bars,
-    } = claim(services, address)?;
-    let registers = match map(services, address, &bars, 2) {
-        Ok(registers) => registers,
-        Err(error) => return Err(keep_error(Error::Native(error), (function, domain))),
+    let mut stop = RealtekStop {
+        clock: inputs.clock,
+        observed: None,
     };
-    let (base, bytes) = match registers
-        .bytes()
-        .and_then(|bytes| Ok((registers.address(0, bytes)?, bytes)))
-    {
-        Ok(window) => window,
-        Err(error) => {
-            return Err(keep_error(
-                Error::Native(ServiceError::Mapping(error)),
-                (function, domain, registers),
-            ));
-        }
-    };
+    // SAFETY: forwarded from the caller.
+    let handed = unsafe { hand_over(services, address, &mut stop) }?;
+    let observed = stop.observed.expect("stopped");
+    let (registers, base, bytes) = handed.registers.expect("BAR2 is mapped");
+    let attachment = handed.attachment;
+    let domain = attachment.domain();
+    let mut function = handed.requester.into_function();
     let configured = (|| -> Result<_, Error> {
         let link_control = crate::bus::pci::link_control_word(&function)?;
-        let config = function.config();
-        let identity = (
-            config.read16(0x2c)?,
-            config.read16(0x2e)?,
-            config.read8(0x08)?,
-        );
         let interrupt = function.interrupts()?.msi;
         function.enable_polled()?;
         let vector = match (completion, interrupt) {
@@ -611,33 +644,24 @@ pub(super) unsafe fn realtek_wifi(
             }
             _ => false,
         };
-        Ok((link_control, identity, vector))
+        Ok((link_control, vector))
     })();
-    let (link_control, (subsystem_vendor, subsystem_device, pci_revision), vector) =
-        match configured {
-            Ok(configured) => configured,
-            Err(error) => return Err(keep_error(error, (function, domain, registers))),
-        };
+    let (link_control, vector) = match configured {
+        Ok(configured) => configured,
+        Err(error) => return Err(keep_error(error, (function, attachment, registers))),
+    };
     inputs.link_control = link_control;
     inputs.vector = vector;
-    let observed = realtek_wifi::identity::Observed {
-        vendor: function.vendor,
-        device: function.device,
-        subsystem_vendor,
-        subsystem_device,
-        pci_revision,
-        // SAFETY: same owned mapped BAR2, whose first page holds SYS_CFG1.
-        sys_cfg1: unsafe { crate::bus::mmio::Mmio::new(base.as_ptr() as u64, 4096) }.read32(0xf0),
-    };
     #[expect(
         clippy::arc_with_non_send_sync,
         reason = "The serialized Realtek backend retains Arc<dyn Any>; this PCI custody remains !Send and !Sync."
     )]
-    let owner: Arc<dyn Any> = Arc::new((function, registers));
+    let owner: Arc<dyn Any> = Arc::new((function, attachment, registers));
     let kept = Box::new(owner.clone()) as Box<dyn Any>;
-    // SAFETY: the mount claimed the stopped function, mapped its BAR2 uncached
-    // and supplied an isolating domain; `owner` keeps the function and mapping,
-    // and the device's interrupt masks are off until the station starts.
+    // SAFETY: the function was stopped and bound to its own domain by the
+    // hand-over, BAR2 is mapped uncached, `owner` keeps the function, domain
+    // and mapping, and the device's interrupt masks are off until the
+    // station starts.
     match unsafe {
         realtek_wifi::attach::attach(base.cast(), bytes, owner, domain, observed, inputs)
     } {
@@ -646,6 +670,56 @@ pub(super) unsafe fn realtek_wifi(
             link,
         }),
         Err(error) => Err((Error::RealtekWifi(error), Some(kept))),
+    }
+}
+
+/// The CSR window iwlwifi reaches an Intel radio through.
+#[cfg(feature = "native-acpi")]
+const INTEL_CSR_BYTES: usize = 16384;
+
+/// Intel Wi-Fi's vendor stop: as `iwl_pci_probe` and
+/// `_iwl_trans_pcie_gen2_stop_device` leave it, the radio is stopped and
+/// reset through its CSRs.
+#[cfg(feature = "native-acpi")]
+pub(super) struct IntelStop {
+    pub minimum: Rc<dyn crate::bus::pci::power::Timer>,
+    pub family: Option<wifi::intel::firmware::Family>,
+}
+
+#[cfg(feature = "native-acpi")]
+impl ColdStop for IntelStop {
+    type Error = Error;
+    const BAR: Option<usize> = Some(0);
+    fn admit(&mut self, function: &mut Function<OwnedConfig>) -> Result<(), Error> {
+        use wifi::intel::{attach::AttachError, identity::IdentityError};
+        let (family, _) = wifi::intel::identity::device(function.device).ok_or(
+            Error::IntelWifi(AttachError::Identity(IdentityError::UnsupportedPci)),
+        )?;
+        self.family = Some(family);
+        Ok(())
+    }
+    unsafe fn stop(
+        &mut self,
+        _: &mut Function<OwnedConfig>,
+        window: Option<Window>,
+    ) -> Result<(), Error> {
+        use wifi::intel::attach::AttachError;
+        let (Some(family), Some(window)) = (self.family, window) else {
+            return Err(HandOverError::Vanished.into());
+        };
+        if window.bytes < INTEL_CSR_BYTES {
+            return Err(
+                HandOverError::Mapping(crate::bus::mmio::owned::Error::InvalidRange).into(),
+            );
+        }
+        // SAFETY: the hand-over's BAR0 window, kept by its owner while this
+        // runs; nothing else reaches it.
+        let mut csr = unsafe {
+            wifi::intel::power::NativeCsr::from_window(window.base, self.minimum.clone())
+        }
+        .map_err(|error| Error::IntelWifi(AttachError::Register(error)))?;
+        wifi::intel::power::stop(&mut csr, family)
+            .map_err(|error| Error::IntelWifi(AttachError::Stop(error)))
     }
 }
 
@@ -664,28 +738,20 @@ pub(super) unsafe fn intel_wifi<B: wifi::intel::radio::bios::service::BiosIo>(
     completion: Option<crate::bus::irq::MsiMessage>,
     inputs: wifi::intel::link::Inputs<B>,
 ) -> Result<Located<wifi::intel::link::Station<wifi::intel::boot::NativeBootIo, B>>, Failure> {
+    use wifi::intel::attach::{AttachError, Pci, attach};
     let minimum = services
         .minimum_delay()
         .map_err(|error| (Error::Native(error), None))?;
-    use wifi::intel::attach::{AttachError, Pci, attach};
-    let Claimed {
-        mut function,
-        domain,
-        bars,
-    } = claim(services, address)?;
-    let registers = match map(services, address, &bars, 0) {
-        Ok(registers) => registers,
-        Err(error) => return Err(keep_error(Error::Native(error), (function, domain))),
+    let mut stop = IntelStop {
+        minimum: minimum.clone(),
+        family: None,
     };
-    let window = match registers.address(0, 16384) {
-        Ok(window) => window,
-        Err(error) => {
-            return Err(keep_error(
-                Error::Native(ServiceError::Mapping(error)),
-                (function, domain, registers),
-            ));
-        }
-    };
+    // SAFETY: forwarded from the caller.
+    let handed = unsafe { hand_over(services, address, &mut stop) }?;
+    let (registers, window, _) = handed.registers.expect("BAR0 is mapped");
+    let attachment = handed.attachment;
+    let domain = attachment.domain();
+    let mut function = handed.requester.into_function();
     let configured = (|| -> Result<_, Error> {
         let vendor = function.vendor;
         let device = function.device;
@@ -729,10 +795,11 @@ pub(super) unsafe fn intel_wifi<B: wifi::intel::radio::bios::service::BiosIo>(
     })();
     let (pci, vector) = match configured {
         Ok(configured) => configured,
-        Err(error) => return Err(keep_error(error, (function, domain, registers))),
+        Err(error) => return Err(keep_error(error, (function, attachment, registers))),
     };
     let owner: Rc<dyn wifi::intel::boot::FunctionOwner> = Rc::new(IntelOwner {
         function: RefCell::new(function),
+        _attachment: attachment,
         _registers: registers,
         vector,
         minimum: minimum.clone(),
@@ -740,14 +807,15 @@ pub(super) unsafe fn intel_wifi<B: wifi::intel::radio::bios::service::BiosIo>(
     let kept = |owner: &Rc<dyn wifi::intel::boot::FunctionOwner>| {
         Some(Box::new(owner.clone()) as Box<dyn Any>)
     };
-    // SAFETY: the mount claimed the stopped function and mapped its BAR0
-    // uncached; `owner` keeps both, and its interrupts are off.
+    // SAFETY: the mount handed over the function, which was stopped and
+    // bound to its own domain above; BAR0 is mapped uncached and `owner`
+    // keeps both, and its interrupts are off.
     let io = unsafe {
         wifi::intel::boot::NativeBootIo::from_window(window.cast(), owner.clone(), minimum.clone())
     }
     .map_err(|error| (Error::IntelWifi(AttachError::Boot(error)), kept(&owner)))?;
-    // SAFETY: the mount's domain isolates this requester, and the caller's
-    // contract covers `inputs`.
+    // SAFETY: the function's own attachment isolates this requester, and the
+    // caller's contract covers `inputs`.
     match unsafe { attach(io, pci, domain, inputs) } {
         Ok(link) => Ok(Located {
             location: alloc::format!("{address}"),
@@ -782,6 +850,8 @@ impl IntelVector {
 #[cfg(feature = "native-acpi")]
 struct IntelOwner {
     function: RefCell<Function<OwnedConfig>>,
+    /// The function's own DMA domain, which outlives every mapping in it.
+    _attachment: crate::bus::pci::requester::preparation::Attachment,
     _registers: Mapping,
     vector: Option<IntelVector>,
     minimum: Rc<dyn crate::bus::pci::power::Timer>,
@@ -880,11 +950,37 @@ pub struct Vmd {
     pub owner: Box<dyn Any>,
 }
 
+/// Intel VMD's vendor stop. The host runs no engine of its own: the devices
+/// behind it reach memory only through it, as its requester, and the
+/// preparation's seal keeps its bus mastering off, so none of them can. The
+/// host's scan stops each of them before its bus mastering comes back.
+pub(super) struct VmdStop {
+    pub profile: Option<vmd::Profile>,
+}
+
+impl ColdStop for VmdStop {
+    type Error = Error;
+    /// The host maps parts of its BARs itself.
+    const BAR: Option<usize> = None;
+    fn admit(&mut self, function: &mut Function<OwnedConfig>) -> Result<(), Error> {
+        self.profile =
+            Some(vmd::Profile::identify(function.vendor, function.device).map_err(Error::Vmd)?);
+        Ok(())
+    }
+    unsafe fn stop(
+        &mut self,
+        _: &mut Function<OwnedConfig>,
+        _: Option<Window>,
+    ) -> Result<(), Error> {
+        Ok(())
+    }
+}
+
 /// Attach the NVMe controller behind an Intel VMD host: BAR0 holds the
 /// children's configuration space, BAR2 and BAR4 their memory windows.
 ///
 /// # Safety
-/// As for [`tg3`]; every device behind the host is stopped as well.
+/// As for [`tg3`].
 #[allow(
     clippy::result_large_err,
     reason = "a failed attach hands back the owners that must outlive the device"
@@ -897,102 +993,85 @@ pub(super) unsafe fn vmd(
     let minimum = services
         .minimum_delay()
         .map_err(|error| (Error::Native(error), None))?;
-    let refused = |error: ServiceError| (Error::Native(error), None);
-    let failed = |error: vmd::Error, owner: Box<dyn Any>| (Error::Vmd(error), Some(owner));
-    let requester = services.claim_stopped(address).map_err(refused)?;
-    let (requester, binding) = match requester.into_dma_binding() {
-        Ok(value) => value,
-        Err((error, owner)) => {
-            return Err(keep_error(Error::Native(ServiceError::Claim(error)), owner));
-        }
-    };
-    let domain = match services.domain(binding) {
-        Ok(domain) => domain,
-        Err(error) => return Err(keep_error(Error::Native(error), requester)),
-    };
-    let mut function = requester.into_function();
-    let profile = match vmd::Profile::identify(function.vendor, function.device) {
-        Ok(profile) => profile,
-        Err(error) => return Err(keep_error(Error::Vmd(error), (function, domain))),
-    };
-    let bars = match function.bars() {
-        Ok(bars) => bars,
-        Err(error) => return Err(keep_error(error, (function, domain))),
-    };
-    // SAFETY: the mount claimed this function stopped, and sizing its BARs
-    // with decode off left it so.
-    let requester =
-        match unsafe { StoppedRequester::from_stopped_pci(function, FunctionRole::Physical) } {
-            Ok(requester) => requester,
-            Err((error, function)) => {
-                return Err(keep_error(
-                    Error::Native(ServiceError::Claim(error)),
-                    (function, domain),
-                ));
-            }
-        };
+    let mut stop = VmdStop { profile: None };
+    // SAFETY: forwarded from the caller.
+    let handed = unsafe { hand_over(services, address, &mut stop) }?;
+    let profile = stop.profile.expect("admitted");
+    let attachment = handed.attachment;
+    let domain = attachment.domain();
+    let requester = handed.requester;
+    let bars = handed.bars;
     let reserve = |index: usize| match bars[index] {
         Some(bar @ Bar::Memory { .. }) => services.bar_resource(address, bar),
         _ => Err(ServiceError::Refused("missing memory BAR")),
     };
-    let cfgbar = reserve(0).map_err(refused)?;
-    let membar1 = reserve(2).map_err(refused)?;
-    let membar2 = reserve(4).map_err(refused)?;
-    let authority = services.authority().map_err(refused)?;
-    let map = |resource: &crate::bus::mmio::owned::Resource, window: core::ops::Range<u64>| {
-        authority
-            .map(
-                resource.clone(),
-                window.start as usize,
-                (window.end - window.start) as usize,
-                CacheAttribute::Uncached,
-                Protection::ReadWrite,
-            )
-            .map_err(|error| refused(ServiceError::Mapping(error)))
+    let reserved = (|| {
+        let authority = services.authority()?;
+        let map = |resource: &crate::bus::mmio::owned::Resource, window: core::ops::Range<u64>| {
+            authority
+                .map(
+                    resource.clone(),
+                    window.start as usize,
+                    (window.end - window.start) as usize,
+                    CacheAttribute::Uncached,
+                    Protection::ReadWrite,
+                )
+                .map_err(ServiceError::Mapping)
+        };
+        let (cfgbar, membar1, membar2) = (reserve(0)?, reserve(2)?, reserve(4)?);
+        let configuration = map(&cfgbar, 0..cfgbar.physical_span().bytes())?;
+        let shadow = profile
+            .shadow_window()
+            .map(|window| map(&membar2, window))
+            .transpose()?;
+        Ok(([cfgbar, membar1, membar2], configuration, shadow, authority))
+    })();
+    let (reservations, configuration, shadow, authority) = match reserved {
+        Ok(reserved) => reserved,
+        Err(error) => return Err(keep_error(Error::Native(error), (requester, attachment))),
     };
-    let configuration = map(&cfgbar, 0..cfgbar.physical_span().bytes())?;
-    let shadow = profile
-        .shadow_window()
-        .map(|window| map(&membar2, window))
-        .transpose()?;
     let resources = vmd::NativeResources {
         requester,
-        bars: [cfgbar, membar1, membar2],
+        bars: reservations,
         cfgbar: configuration,
         shadow,
         msix: None,
     };
-    // SAFETY: the mount reserved and mapped these BARs for this stopped host,
-    // and no other owner reaches the hierarchy behind it.
-    let registers = unsafe { vmd::NativeRegisters::claim(resources) }
-        .map_err(|(error, resources)| failed(error, Box::new(resources)))?;
-    let mut host = vmd::Host::initialize(registers).map_err(|(error, registers)| {
-        (
-            Error::Vmd(error),
-            registers.map(|r| Box::new(r) as Box<dyn Any>),
-        )
-    })?;
+    let failed = |error: vmd::Error, owner: Box<dyn Any>| (Error::Vmd(error), Some(owner));
+    // SAFETY: the mount reserved and mapped these BARs for this host, which
+    // the hand-over stopped and bound to its own domain, and no other owner
+    // reaches the hierarchy behind it.
+    let registers = match unsafe { vmd::NativeRegisters::claim(resources) } {
+        Ok(registers) => registers,
+        Err((error, resources)) => return Err(failed(error, Box::new((resources, attachment)))),
+    };
+    let mut host = match vmd::Host::initialize(registers) {
+        Ok(host) => host,
+        Err((error, registers)) => {
+            return Err(failed(error, Box::new((registers, attachment))));
+        }
+    };
     let mut others = match host.scan() {
         Ok(children) => children,
-        Err(error) => return Err(failed(error, Box::new(host))),
+        Err(error) => return Err(failed(error, Box::new((host, attachment)))),
     };
     let Some(index) = others.iter().position(|child| child.class == [1, 8, 2]) else {
         return Ok(Vmd {
             nvme: None,
             others,
-            owner: Box::new(host),
+            owner: Box::new((host, attachment)),
         });
     };
     let child = others.remove(index);
     let bytes = match host.memory_bar_bytes(child.address) {
         Ok(bytes) => bytes,
-        Err(error) => return Err(failed(error, Box::new(host))),
+        Err(error) => return Err(failed(error, Box::new((host, attachment)))),
     };
     // SAFETY: `bytes` is the child's firmware-assigned BAR0, sized with its
     // decode off, and the stopped hierarchy has no other owner.
     let bar = match unsafe { vmd::endpoint::FirmwareBar::claim(&mut host, child.address, bytes) } {
         Ok(bar) => bar,
-        Err(error) => return Err(failed(error, Box::new(host))),
+        Err(error) => return Err(failed(error, Box::new((host, attachment)))),
     };
     let label = alloc::format!(
         "{address} VMD {:02x}:{:02x}.{}",
@@ -1000,8 +1079,9 @@ pub(super) unsafe fn vmd(
         child.address.device,
         child.address.function
     );
-    // SAFETY: the mount's domain covers the host's requester and its aliases,
-    // its permission issued these mappings, and the hierarchy is stopped.
+    // SAFETY: the host's own domain covers its requester, which the devices
+    // behind it reach memory as, the mount's permission issued these
+    // mappings, and the hierarchy is stopped.
     match unsafe {
         crate::storage::nvme::vmd::attach(
             host,
@@ -1017,9 +1097,12 @@ pub(super) unsafe fn vmd(
         Ok((attached, hierarchy)) => Ok(Vmd {
             nvme: Some(attached),
             others,
-            owner: Box::new(hierarchy),
+            owner: Box::new((hierarchy, attachment)),
         }),
-        Err((error, hierarchy)) => Err((Error::Device(error), Some(Box::new(hierarchy)))),
+        Err((error, hierarchy)) => Err((
+            Error::Device(error),
+            Some(Box::new((hierarchy, attachment))),
+        )),
     }
 }
 
@@ -1466,10 +1549,9 @@ mod tests {
         ));
         assert!(services.requests.borrow().is_empty());
         assert!(services.preparations.borrow().is_empty());
-        assert!(services.stopped.borrow().is_empty());
     }
     #[test]
-    fn ehci_requests_original_preparation_without_a_stopped_or_bound_grant() {
+    fn ehci_requests_original_preparation_without_a_bound_grant() {
         let services = Refusing::minimum_only();
         let clock = Clock {
             ticks_per_microsecond: 1000,
@@ -1482,7 +1564,6 @@ mod tests {
         ));
         assert_eq!(*services.requests.borrow(), [address()]);
         assert_eq!(*services.preparations.borrow(), [address()]);
-        assert!(services.stopped.borrow().is_empty());
     }
 
     #[test]
@@ -1498,7 +1579,6 @@ mod tests {
             Err((Error::Native(ServiceError::Unavailable), None))
         ));
         assert_eq!(*services.preparations.borrow(), [address()]);
-        assert!(services.stopped.borrow().is_empty());
         // SAFETY: as above.
         let aqtion = unsafe { aqtion(&services, address()) };
         assert!(matches!(
@@ -1506,12 +1586,14 @@ mod tests {
             Err((Error::Native(ServiceError::Unavailable), None))
         ));
         assert_eq!(*services.preparations.borrow(), [address(); 2]);
-        assert!(services.stopped.borrow().is_empty());
         // SAFETY: as above.
         let vmd = unsafe { vmd(&services, address(), clock) };
         assert!(matches!(
             vmd,
-            Err((Error::Native(ServiceError::Unavailable), None))
+            Err((
+                Error::HandOver(HandOverError::Service(ServiceError::Unavailable)),
+                None
+            ))
         ));
         // SAFETY: as above.
         let bluetooth = unsafe { intel_bluetooth(&services, address(), clock) };

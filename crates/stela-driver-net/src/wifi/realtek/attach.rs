@@ -49,6 +49,10 @@ pub enum AttachError {
     Bootstrap(bootstrap::Error),
     Hardware(String),
     Station(station::Error),
+    /// The function is not an adapter this driver runs.
+    Identity(super::identity::IdentityError),
+    /// Stopping what the function's last owner left running failed.
+    Stop(super::power::Error),
 }
 
 impl fmt::Display for AttachError {
@@ -63,6 +67,10 @@ impl fmt::Display for AttachError {
             Self::Bootstrap(error) => write!(f, "RTL8822C bring-up: {error}"),
             Self::Hardware(error) => write!(f, "RTL8822C: {error}"),
             Self::Station(error) => write!(f, "RTL8822C station: {error}"),
+            Self::Identity(error) => {
+                write!(f, "this Realtek Wi-Fi adapter is not supported ({error:?})")
+            }
+            Self::Stop(error) => write!(f, "it did not stop for Stela to take over ({error:?})"),
         }
     }
 }

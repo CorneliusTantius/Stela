@@ -295,6 +295,104 @@ unsafe impl<Q: BeaconQueue> Io for NativeIo<Q> {
     }
 }
 
+/// The bare registers of a requester its last owner may have left powered,
+/// which only [`super::power::off`] uses to stop it before Stela binds its
+/// DMA. It has no beacon queue; after an uncertain step it refuses access.
+pub struct ColdIo {
+    registers: Mmio,
+    clock: Clock,
+    profile: Profile,
+    bytes: usize,
+    quarantined: bool,
+}
+impl ColdIo {
+    /// # Safety
+    /// `window` is the uncached BAR of the RTL8822C requester `profile` was
+    /// read from, mapped for at least `bytes` while this lives, with no other
+    /// user; the clock is calibrated on this CPU.
+    pub unsafe fn new(
+        window: NonNull<u8>,
+        bytes: usize,
+        clock: Clock,
+        profile: Profile,
+    ) -> Result<Self, Error> {
+        if bytes < BAR_BYTES || window.as_ptr().addr() & 3 != 0 {
+            return Err(Error::Register);
+        }
+        if clock.ticks_per_microsecond == 0 {
+            return Err(Error::InvalidClock);
+        }
+        if profile.chip() != Chip::Rtl8822C {
+            return Err(Error::WrongChip);
+        }
+        Ok(Self {
+            // SAFETY: the constructor's mapped-BAR contract.
+            registers: unsafe { Mmio::new(window.as_ptr() as u64, bytes) },
+            clock,
+            profile,
+            bytes,
+            quarantined: false,
+        })
+    }
+    fn check(&self, register: u32, width: usize) -> Result<(), Error> {
+        if self.quarantined
+            || !(register as usize).is_multiple_of(width)
+            || (register as usize)
+                .checked_add(width)
+                .is_none_or(|end| end > self.bytes)
+        {
+            return Err(Error::Register);
+        }
+        Ok(())
+    }
+}
+// SAFETY: the constructor binds the requester's own BAR; each register
+// operation is a volatile access, and no beacon can be submitted.
+unsafe impl Io for ColdIo {
+    fn profile(&self) -> Profile {
+        self.profile
+    }
+    fn read8(&mut self, register: u32) -> Result<u8, Error> {
+        self.check(register, 1)?;
+        Ok(self.registers.read8(register as usize))
+    }
+    fn read16(&mut self, register: u32) -> Result<u16, Error> {
+        self.check(register, 2)?;
+        Ok(self.registers.read16(register as usize))
+    }
+    fn read32(&mut self, register: u32) -> Result<u32, Error> {
+        self.check(register, 4)?;
+        Ok(self.registers.read32(register as usize))
+    }
+    fn write8(&mut self, register: u32, value: u8) -> Result<(), Error> {
+        self.check(register, 1)?;
+        self.registers.write8(register as usize, value);
+        Ok(())
+    }
+    fn write16(&mut self, register: u32, value: u16) -> Result<(), Error> {
+        self.check(register, 2)?;
+        self.registers.write16(register as usize, value);
+        Ok(())
+    }
+    fn write32(&mut self, register: u32, value: u32) -> Result<(), Error> {
+        self.check(register, 4)?;
+        self.registers.write32(register as usize, value);
+        Ok(())
+    }
+    fn delay_us(&mut self, microseconds: u64) {
+        self.clock.delay(microseconds);
+    }
+    fn submit_beacon(&mut self, _: &[u8]) -> Result<(), Error> {
+        Err(Error::Queue)
+    }
+    unsafe fn beacon_consumed(&mut self) -> Result<(), Error> {
+        Err(Error::Queue)
+    }
+    fn quarantine(&mut self) {
+        self.quarantined = true;
+    }
+}
+
 /// The exclusive BAR of one RTL8822C requester, shared by its beacon, RX and
 /// TX register blocks. The owner keeps the PCI claim and mapping alive.
 pub struct Bar {

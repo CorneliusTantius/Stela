@@ -11,6 +11,24 @@ const RESET_B: u32 = 1;
 const INIT_DONE: u32 = 1 << 4;
 
 impl<I: BarIo> Control<I> {
+    /// Stop an MT7925 its last owner may have left running, as
+    /// `mt7925_pci_probe` does up to `mt7925_dma_init`'s forced
+    /// `mt792x_dma_disable`: firmware then driver own it, its WLAN subsystem
+    /// is reset, its interrupts are masked and its WFDMA is stopped and reset.
+    ///
+    /// # Safety
+    /// The requester's bus mastering is off and nothing else touches it; this
+    /// control is used for nothing else afterwards.
+    pub(in crate::wifi::mediatek) unsafe fn cold_stop(&mut self, aspm: bool) -> Result<(), Error> {
+        self.firmware_own()?;
+        self.driver_own(aspm)?;
+        // SAFETY: the caller's contract: nothing else reaches the function,
+        // and no ring of this control exists.
+        unsafe { self.initial_wfsys_reset() }?;
+        self.mask_interrupts()?;
+        self.stop_dma(true)?;
+        Ok(())
+    }
     /// # Safety
     /// This is the initial exclusive MT7925 WLAN install epoch, before
     /// any rings/engine publication, with no old WLAN firmware/DMA/IRQ users.

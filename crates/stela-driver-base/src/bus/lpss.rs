@@ -325,6 +325,35 @@ impl<R: Registers> core::fmt::Debug for ControllerFailure<R> {
             .finish_non_exhaustive()
     }
 }
+/// Hold an LPSS function and its private iDMA in reset, as
+/// `intel_lpss_init_dev` does before it programs anything: whatever its
+/// last owner left running stops, and nothing restarts until
+/// [`Controller::initialize`] releases the reset.
+///
+/// # Safety
+/// `base..base+bytes` is the function's own uncached BAR0 mapping, alive for
+/// this call, with nothing else reaching it.
+pub unsafe fn hold_in_reset(base: core::ptr::NonNull<u8>, bytes: usize) -> Result<(), Error> {
+    if bytes < WINDOW_BYTES || !(base.as_ptr() as usize).is_multiple_of(4) {
+        return Err(Error::Mapping);
+    }
+    // SAFETY: the caller's mapped window, at least WINDOW_BYTES long.
+    let registers = unsafe { crate::bus::mmio::Mmio::new(base.as_ptr() as u64, bytes) };
+    if registers.read32(CAPS) == u32::MAX {
+        return Err(Error::Identity);
+    }
+    registers.write32(RESET, 0);
+    let observed = registers.read32(RESET);
+    if observed & RESET_FUNCTION_AND_IDMA != 0 {
+        return Err(Error::Register {
+            offset: RESET,
+            expected: 0,
+            observed,
+        });
+    }
+    Ok(())
+}
+
 impl<R: Registers> Controller<R> {
     /// Park the same provider before metadata callbacks, reset and remap.
     pub fn initialize(registers: R) -> Result<Self, ControllerFailure<R>> {

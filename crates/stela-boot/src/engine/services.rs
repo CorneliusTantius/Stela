@@ -25,7 +25,7 @@ use stela_drivers::{
             owned::OwnedConfig,
             power::Timer,
             requester::{
-                ClaimError, FunctionRole, RequesterBinding, StoppedRequester,
+                ClaimError, FunctionRole, RequesterBinding,
                 preparation::{AttachmentBackend, DetachError, Root},
             },
         },
@@ -251,12 +251,6 @@ unsafe impl NativeServices for Services<'_> {
         })
     }
 
-    fn claim_stopped(&self, _: Address) -> Result<StoppedRequester, ServiceError> {
-        Err(ServiceError::Refused(
-            "native endpoint engine stop receipt unavailable",
-        ))
-    }
-
     fn bridge(&self, _: Address) -> Result<Function<OwnedConfig>, ServiceError> {
         Err(ServiceError::Refused(
             "native bridge forwarding handoff unavailable",
@@ -299,28 +293,6 @@ unsafe impl NativeServices for Services<'_> {
 
     fn authority(&self) -> Result<owned::Authority, ServiceError> {
         Ok(self.mmio.authority().clone())
-    }
-
-    fn domain(&self, binding: RequesterBinding) -> Result<Arc<dyn DmaDomain>, ServiceError> {
-        let address = binding.address();
-        let binding = match self.remappers.domain(self.mmio, binding) {
-            Ok(domain) => {
-                return domain.map_err(|error| {
-                    output::arguments(format_args!(
-                        "HOST IOMMU domain for {address:?} refused: {error:?}\n"
-                    ));
-                    ServiceError::Refused("the IOMMU refused the requester's domain")
-                });
-            }
-            Err(binding) => binding,
-        };
-        if !PASSTHROUGH_REPORTED.swap(true, Ordering::Relaxed) {
-            output::arguments(format_args!("no IOMMU: device DMA unrestricted\n"));
-        }
-        Ok(Arc::new(Passthrough::retaining(
-            self.dma_regions(),
-            binding,
-        )))
     }
 
     fn dma_translated(&self, address: Address) -> bool {

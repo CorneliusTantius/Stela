@@ -3,14 +3,12 @@
 //! mappings, per-requester DMA domains and the ACPI namespace.
 use crate::bus::irq::IrqController;
 use crate::bus::{
-    dma::{mapping::DmaDomain, memory::PageSource},
+    dma::memory::PageSource,
     mmio::owned::{self, Mapping},
     pci::{
         Address, Bar, Function,
         owned::OwnedConfig,
-        requester::{
-            ClaimError, RequesterBinding, StoppedRequester, preparation::PreparingRequester,
-        },
+        requester::{ClaimError, preparation::PreparingRequester},
     },
     thunderbolt::manager::Platform,
 };
@@ -50,7 +48,7 @@ impl fmt::Display for ServiceError {
             Self::Mapping(error) => write!(f, "native mapping: {error:?}"),
             Self::Config(error) => error.fmt(f),
             Self::PciCapability(error) => write!(f, "PCI capability: {error:?}"),
-            Self::Claim(error) => write!(f, "stopped requester: {error:?}"),
+            Self::Claim(error) => error.fmt(f),
         }
     }
 }
@@ -61,14 +59,14 @@ impl fmt::Display for ServiceError {
 /// pages and the ACPI namespace.
 ///
 /// # Safety
-/// Implementations transfer ownership: each [`claim_stopped`](Self::claim_stopped)
-/// requester is the unique owner of its configuration, with engines, DMA and
-/// interrupts stopped and drained, as [`StoppedRequester::from_stopped_pci`]
-/// requires. Each bridge is the unique owner of its configuration space,
-/// left forwarding. Each mapping covers exactly the requested BAR, uncached and
-/// read/write, with no other accessor. Each domain meets the [`DmaDomain`]
-/// contract for its kind. Every
-/// returned owner stays valid in every access context `probe`'s drivers use.
+/// Implementations transfer ownership: each prepared requester is the unique
+/// owner of its configuration and original DMA root, as
+/// [`PreparingRequester::new`] requires, and its root binds a domain that
+/// meets the [`DmaDomain`](crate::bus::dma::mapping::DmaDomain) contract for its kind. Each bridge is the unique
+/// owner of its configuration space, left forwarding. Each mapping covers
+/// exactly the requested BAR, uncached and read/write, with no other
+/// accessor. Every returned owner stays valid in every access context
+/// `probe`'s drivers use.
 /// A mount that supplies the ACPI namespace also grants `probe` port I/O to
 /// the i8042 at ports 0x60 and 0x64 when the namespace lists one or the FADT
 /// does not rule one out (Linux `acpi_parse_fadt`), with IRQ1
@@ -97,10 +95,6 @@ pub unsafe trait NativeServices {
     /// conflicting reset/configuration/routing owners throughout preparation.
     fn prepare_requester(&self, address: Address) -> Result<PreparingRequester, ServiceError>;
 
-    /// Claim the function at `address` as a stopped requester through an owned
-    /// mapping of its configuration space.
-    fn claim_stopped(&self, address: Address) -> Result<StoppedRequester, ServiceError>;
-
     /// The PCI-to-PCI bridge at `address` through an owned mapping of its
     /// configuration space, left forwarding, for a driver that sets its
     /// link's upstream end as Linux's ASPM core does through `bus->self`.
@@ -116,10 +110,6 @@ pub unsafe trait NativeServices {
 
     /// The mapping permission that issues [`Self::map_bar`]'s mappings.
     fn authority(&self) -> Result<owned::Authority, ServiceError>;
-
-    /// The DMA domain for the requester `binding` names. The domain keeps the
-    /// binding, and with it the configuration epoch it keeps.
-    fn domain(&self, binding: RequesterBinding) -> Result<Arc<dyn DmaDomain>, ServiceError>;
 
     /// Whether the mount's IOMMU confines the DMA of the function at
     /// `address`.
@@ -265,7 +255,6 @@ pub(crate) mod tests {
     pub(crate) struct Refusing {
         pub(crate) requests: RefCell<Vec<Address>>,
         pub(crate) preparations: RefCell<Vec<Address>>,
-        pub(crate) stopped: RefCell<Vec<Address>>,
         model_minimum: bool,
     }
     impl Refusing {
@@ -308,11 +297,6 @@ pub(crate) mod tests {
             self.preparations.borrow_mut().push(address);
             Err(ServiceError::Unavailable)
         }
-        fn claim_stopped(&self, address: Address) -> Result<StoppedRequester, ServiceError> {
-            self.requests.borrow_mut().push(address);
-            self.stopped.borrow_mut().push(address);
-            Err(ServiceError::Unavailable)
-        }
         fn bridge(&self, address: Address) -> Result<Function<OwnedConfig>, ServiceError> {
             self.requests.borrow_mut().push(address);
             Err(ServiceError::Unavailable)
@@ -327,9 +311,6 @@ pub(crate) mod tests {
         }
         fn authority(&self) -> Result<owned::Authority, ServiceError> {
             Err(ServiceError::Unavailable)
-        }
-        fn domain(&self, _: RequesterBinding) -> Result<Arc<dyn DmaDomain>, ServiceError> {
-            Err(ServiceError::Refused("requester shares an IOMMU group"))
         }
         fn interrupts(&self) -> Result<&'static dyn IrqController, ServiceError> {
             Err(ServiceError::Unavailable)
@@ -369,7 +350,7 @@ pub(crate) mod tests {
             function: 0,
         };
         assert_eq!(
-            services.claim_stopped(address).err(),
+            services.prepare_requester(address).err(),
             Some(ServiceError::Unavailable)
         );
         assert_eq!(*services.requests.borrow(), [address]);
