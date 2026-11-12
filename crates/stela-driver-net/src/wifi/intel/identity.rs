@@ -35,16 +35,25 @@ const BZ_SUBDEVICES: [u16; 35] = [
     0x1791, 0x1792, 0x4090, 0x40c4, 0x40e0, 0x4110, 0x4314, 0x1775, 0x1776, 0x1735, 0x1736,
 ];
 const BZ_LISTED: u16 = 0xa840;
-/// The BE1730x, the one Killer product `iwl_rf_fm_160mhz` holds to 160 MHz.
+/// The Killer BE1730x and BE1735x, which pcie/drv.c holds to 160 MHz
+/// (`iwl_rf_fm_160mhz`, `iwl_rf_wh_160mhz`) by subdevice alone.
 const KILLER_1730: u16 = 0x1730;
 const KILLER_1731: u16 = 0x1731;
+const KILLER_1735: u16 = 0x1735;
+const KILLER_1736: u16 = 0x1736;
+/// The Killer AX1650s and AX1650i, AX201 products whose subdevices carry
+/// the bandwidth-limit bit; pcie/drv.c names them after AX203, so they win.
+const KILLER_1650S: u16 = 0x1651;
+const KILLER_1650I: u16 = 0x1652;
 const RF_HR2: u32 = 0x10a;
 const RF_GF: u32 = 0x10d;
 const RF_FM: u32 = 0x112;
 const CDB: u32 = 1 << 28;
 /// `REG_CRF_ID_TYPE`s of the admitted radios, for a blank OTP.
 const CRF_HR2: u32 = 0x504;
-const CRF_HR2_CDB: u32 = 0x507;
+/// `REG_CRF_ID_TYPE_HR_CDB`, an HR2 that is CDB only if the WFPM or the
+/// slave bit says so.
+const CRF_HR2_CDB: u32 = 0x503;
 const CRF_GF: u32 = 0x410;
 const CRF_FM: u32 = 0x910;
 /// CNVI_AUX_MISC_CHIP_PROD_TYPE_BZ_U.
@@ -73,7 +82,7 @@ pub enum Rf {
 /// What `iwl_nvm_fixup_sband_iftd` reads of a device whose radio has EHT.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct EhtLimits {
-    /// `bw_limit` of `iwl_rf_fm_160mhz`.
+    /// `bw_limit` of `iwl_rf_fm_160mhz`: BE202 and the Killer BE1730x.
     pub stops_at_160: bool,
     /// `reduced_cap_sku`, which also drops 320 MHz and MCS 12 and 13.
     pub reduced: bool,
@@ -277,18 +286,24 @@ pub struct Profile {
     firmware: &'static str,
     pnvm: Option<&'static str>,
     scu_force_active: bool,
+    /// [`EhtLimits::stops_at_160`].
+    stops_at_160: bool,
 }
 
 /// The system vendors `dmi_force_scu_active_approved_list` names.
 const SCU_FORCE_ACTIVE_VENDORS: [&str; 2] = ["Dell Inc.", "Alienware"];
 
-/// The Killer subdevices pcie/drv.c lists after BE202's bandwidth limit, which
-/// have that subdevice bit and are their own products.
-const fn killer(device: u16, subdevice: u16) -> bool {
-    matches!(
-        subdevice,
-        KILLER_1730 | KILLER_1731 | 0x1771 | 0x1772 | 0x1791 | 0x1792
-    ) || (device == BE200 && matches!(subdevice, 0x1773 | 0x1774))
+/// Whether `iwl_pci_find_dev_info` holds an FM radio to 160 MHz. It takes
+/// the last entry of pcie/drv.c that matches, so the Killer subdevices,
+/// listed after BE202, decide before the bandwidth-limit bit they also carry.
+const fn fm_stops_at_160(device: u16, subdevice: u16) -> bool {
+    match subdevice {
+        KILLER_1730 | KILLER_1731 | KILLER_1735 | KILLER_1736 => true,
+        0x1771 | 0x1772 | 0x1775 | 0x1776 | 0x1791 | 0x1792 => false,
+        0x1773 | 0x1774 if device == BE200 => false,
+        // BE202 (`iwl_rf_fm_160mhz`).
+        _ => subdevice & BANDWIDTH_LIMITED != 0,
+    }
 }
 
 /// CSR_HW_RF_ID, or `map_crf_id`'s reading of the silicon on a blank OTP.
@@ -340,14 +355,18 @@ impl Profile {
         };
         let limited = observed.subsystem_device & BANDWIDTH_LIMITED != 0;
         let another_product = match radio {
-            RF_HR2 => platform.integrated && limited,
+            RF_HR2 => {
+                platform.integrated
+                    && limited
+                    && !matches!(observed.subsystem_device, KILLER_1650S | KILLER_1650I)
+            }
             RF_GF => platform.integrated && observed.subsystem_device == AX231,
-            _ => limited && !killer(observed.device, observed.subsystem_device),
+            _ => false,
         };
         if !fitted || another_product || radio_id & CDB != 0 {
-            // A CDB radio chooses a distinct gf4 image or is BE401, and AX203,
-            // AX231 and BE202 have their own configurations. Each needs its
-            // own complete profile before admission.
+            // A CDB radio chooses a distinct gf4 image or is BE401, and AX203
+            // and AX231 have their own configurations. Each needs its own
+            // complete profile before admission.
             return Err(IdentityError::UnsupportedRadio(radio_id));
         }
         if observed.device == BZ_LISTED && !BZ_SUBDEVICES.contains(&observed.subsystem_device) {
@@ -382,6 +401,8 @@ impl Profile {
             firmware,
             pnvm,
             scu_force_active: false,
+            stops_at_160: radio == RF_FM
+                && fm_stops_at_160(observed.device, observed.subsystem_device),
         })
     }
 
@@ -415,7 +436,7 @@ impl Profile {
     /// while matching a PNVM section, and `urm` is the STEP's state.
     pub fn eht_limits(&self, sku: [u32; 3], urm: bool) -> Option<EhtLimits> {
         (self.radio == Rf::Fm).then_some(EhtLimits {
-            stops_at_160: matches!(self.observed.subsystem_device, KILLER_1730 | KILLER_1731),
+            stops_at_160: self.stops_at_160,
             reduced: sku[0] & REDUCED_CAPABILITY != 0,
             urm,
             slow_bus: !self.platform.integrated && self.observed.link_speed < SPEED_8GT,
@@ -829,14 +850,23 @@ mod tests {
             Profile::select(bz(0x900)).unwrap_err(),
             IdentityError::UnsupportedStep(0x460)
         );
+        // BE202 is `iwl_rf_fm_160mhz`: the same firmware, held to 160 MHz.
         let be202 = Observed {
             radio_id: radio,
-            ..integrated(BE200, 0x472, RF_FM, 0x0220)
+            ..integrated(0x7740, 0x460, RF_FM, 0x0220)
         };
-        assert!(matches!(
-            Profile::select(be202),
-            Err(IdentityError::UnsupportedRadio(_))
-        ));
+        let limits = Profile::select(Observed {
+            silicon: Silicon {
+                crf: 0,
+                cnv: 0x0100_0900,
+                wfpm: 0,
+            },
+            ..be202
+        })
+        .unwrap()
+        .eht_limits([0; 3], false)
+        .unwrap();
+        assert!(limits.stops_at_160 && !limits.reaches_320());
         let unlisted = Observed {
             subsystem_device: 0x0021,
             ..bz(0x0100_0900)
@@ -859,18 +889,56 @@ mod tests {
             subsystem_device,
             ..integrated(BE200, 0x472, RF_FM, 0x0020)
         };
-        for subdevice in [0x1771, 0x1772, 0x1773, 0x1774, 0x1791, 0x1792] {
+        for subdevice in [
+            0x1771, 0x1772, 0x1773, 0x1774, 0x1775, 0x1776, 0x1791, 0x1792,
+        ] {
             let limits = Profile::select(be200(subdevice))
                 .unwrap()
                 .eht_limits([0; 3], false)
                 .unwrap();
             assert!(limits.reaches_320(), "{subdevice:x}");
         }
-        for subdevice in [KILLER_1730, KILLER_1731] {
+        for subdevice in [KILLER_1730, KILLER_1731, KILLER_1735, KILLER_1736, 0x0220] {
             let profile = Profile::select(be200(subdevice)).unwrap();
             assert!(profile.eht_limits([0; 3], false).unwrap().stops_at_160);
         }
-        assert!(Profile::select(be200(0x1775)).is_err(), "named BE202");
+        // The discrete Killer subdevices are BE200's alone; elsewhere their
+        // limit bit makes the radio a BE202.
+        let other = Observed {
+            device: 0x7740,
+            silicon: Silicon {
+                crf: 0,
+                cnv: 0x0100_0900,
+                wfpm: 0,
+            },
+            ..be200(0x1773)
+        };
+        let limits = Profile::select(Observed {
+            hardware_revision: 0x460,
+            ..other
+        })
+        .unwrap()
+        .eht_limits([0; 3], false)
+        .unwrap();
+        assert!(limits.stops_at_160);
+    }
+
+    #[test]
+    fn killer_ax1650s_and_ax1650i_are_ax201s_despite_the_limit_bit() {
+        for subdevice in [KILLER_1650S, KILLER_1650I] {
+            let profile = Profile::select(integrated(0x06f0, 0x332, RF_HR2, subdevice)).unwrap();
+            assert_eq!(
+                profile.firmware_request().name,
+                "iwlwifi-Qu-c0-hr-b0-77.ucode"
+            );
+            let so = Profile::select(integrated(0x7af0, 0x370, RF_HR2, subdevice)).unwrap();
+            assert_eq!(so.firmware_request().name, "iwlwifi-so-a0-hr-b0-89.ucode");
+        }
+        // AX203 keeps its own configuration.
+        assert!(matches!(
+            Profile::select(integrated(0x06f0, 0x332, RF_HR2, 0x0244)),
+            Err(IdentityError::UnsupportedRadio(_))
+        ));
     }
 
     #[test]
@@ -901,6 +969,16 @@ mod tests {
         blank.silicon.crf = 0x0100_0000 | CRF_HR2;
         let profile = Profile::select(blank).unwrap();
         assert_eq!(profile.radio(), Rf::Hr);
+        // `map_crf_id`: REG_CRF_ID_TYPE_HR_CDB is an HR2 whose CDB comes
+        // from the WFPM or the slave bit alone.
+        let cdb_type = Observed {
+            silicon: Silicon {
+                crf: 0x0100_0000 | 0x503,
+                ..blank.silicon
+            },
+            ..blank
+        };
+        assert_eq!(Profile::select(cdb_type).unwrap().radio(), Rf::Hr);
         blank.silicon.wfpm = 1 << 4;
         assert!(matches!(
             Profile::select(blank),
