@@ -573,22 +573,6 @@ const REALTEK_WIFI_LICENSE: Artifact = Artifact {
     sha256: "a61351665b4f264f6c631364f85b907d8f8f41f8b369533ef4021765f9f3b62e",
 };
 
-/// ORACLE PIN PENDING: the length and sha256 of linux-firmware's
-/// `rtw88/rtw8821c_fw.bin` at [`WIFI_FIRMWARE_REVISION`], which the
-/// coordinator's oracle measures.
-const RTW8821C_FW_LENGTH: usize = 0;
-const RTW8821C_FW_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
-
-/// Recipes whose pins wait on the oracle. Once pinned, each moves into
-/// [`REALTEK_WIFI`], where the RTL8821C's selection and bundle arms already
-/// look for it; until then neither finds it, and setup installs nothing.
-pub const REALTEK_WIFI_PENDING: &[Recipe] = &[wifi(
-    "rtw88/rtw8821c_fw.bin",
-    RTW8821C_FW_LENGTH,
-    RTW8821C_FW_SHA256,
-    &REALTEK_WIFI_LICENSE,
-)];
-
 pub const REALTEK_WIFI: &[Recipe] = &[
     wifi(
         "rtw88/rtw8822c_fw.bin",
@@ -606,6 +590,12 @@ pub const REALTEK_WIFI: &[Recipe] = &[
         "rtw89/rtw8852b_fw-2.bin",
         1554594,
         "6ff6aeb56bb5b85cba333b755f8cc1dbfe9ff6e5b16e39f6ba01ce7f1eaa7714",
+        &REALTEK_WIFI_LICENSE,
+    ),
+    wifi(
+        "rtw88/rtw8821c_fw.bin",
+        139472,
+        "2ef409bc418549fcf294061dd0cae1fc22fd9da79b60524950b25de18732f3f0",
         &REALTEK_WIFI_LICENSE,
     ),
 ];

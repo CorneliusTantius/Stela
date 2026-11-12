@@ -163,8 +163,7 @@ fn approved_downloads_match_recipe_and_license_content_pins() {
     for (recipe, directory) in [
         (&REALTEK_WIFI[1], "linux-firmware"),
         (&REALTEK_WIFI[2], "linux-firmware"),
-        // The RTL8821C's pins wait on this oracle.
-        (&REALTEK_WIFI_PENDING[0], "linux-firmware"),
+        (&REALTEK_WIFI[3], "linux-firmware"),
         (&REGULATORY[1], "wireless-regdb"),
     ] {
         let image = std::fs::read(root.join(directory).join(recipe.image.member)).unwrap();
