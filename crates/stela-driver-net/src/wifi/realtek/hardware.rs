@@ -239,6 +239,7 @@ impl Hardware {
             pages,
             geometry,
             link,
+            disabled,
             ..
         } = up;
         let initial = phy.factory().calibration().initial();
@@ -294,7 +295,7 @@ impl Hardware {
             dynamic,
             cck_bounds,
             features,
-            deep: Deep::new(features),
+            deep: Deep::new(features, !disabled.lps_deep),
             link,
             templates: None,
             power_gate_pages: None,

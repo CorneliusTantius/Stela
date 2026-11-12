@@ -98,19 +98,21 @@ impl Link {
         cut: u8,
         rfe: u8,
         host_control: u16,
+        aspm: bool,
     ) -> Result<Self, Error> {
         if cut >= CUT_D {
             set_mask(io, REG_HCI_MIX_CFG, AUX_TO_FAST_CLOCK, 1)?;
         }
         let mut answered = dbi_write8(io, CLOCK_DELAY, 0)?;
-        if host_control & HOST_CLOCK_REQUEST != 0 {
+        // `rtw_pci_disable_aspm` leaves both modules as they are.
+        if aspm && host_control & HOST_CLOCK_REQUEST != 0 {
             answered &= set_link_bits(io, CLOCK_REQUEST, true)?;
         }
         if rfe == CURRENT_RFE {
             set_mask(io, REG_ANAPARSW_MAC_0, SWITCHER_CURRENT, 1)?;
         }
         Ok(Self {
-            l1: answered && host_control & HOST_L1 != 0,
+            l1: aspm && answered && host_control & HOST_L1 != 0,
             answered,
         })
     }
@@ -229,10 +231,10 @@ mod tests {
     fn the_chip_follows_only_what_the_host_enabled() {
         let mut bus = Bus::default();
         bus.config.insert(CLOCK_DELAY, 0x55);
-        Link::configure(&mut bus, 0, 0, 0).unwrap();
+        Link::configure(&mut bus, 0, 0, 0, true).unwrap();
         assert_eq!(bus.link(), 0, "the host enabled neither");
         assert_eq!(bus.config[&CLOCK_DELAY], 0, "REFCLK calibrates itself");
-        Link::configure(&mut bus, 0, 0, HOST_CLOCK_REQUEST).unwrap();
+        Link::configure(&mut bus, 0, 0, HOST_CLOCK_REQUEST, true).unwrap();
         assert_eq!(bus.link(), CLOCK_REQUEST);
     }
 
@@ -240,7 +242,7 @@ mod tests {
     fn l1_runs_only_under_power_save_on_a_link_that_allows_it() {
         let mut bus = Bus::default();
         bus.config.insert(LINK_CONFIG, 0x81);
-        let mut link = Link::configure(&mut bus, 0, 0, HOST_L1).unwrap();
+        let mut link = Link::configure(&mut bus, 0, 0, HOST_L1, true).unwrap();
         assert_eq!(bus.link(), 0x81, "off until power save begins");
         link.set_l1(&mut bus, true).unwrap();
         assert_eq!(bus.link(), 0x81 | L1);
@@ -248,18 +250,31 @@ mod tests {
         assert_eq!(bus.link(), 0x81);
 
         let mut bus = Bus::default();
-        let mut link = Link::configure(&mut bus, 0, 0, 0).unwrap();
+        let mut link = Link::configure(&mut bus, 0, 0, 0, true).unwrap();
         link.set_l1(&mut bus, true).unwrap();
         assert_eq!(bus.link(), 0, "the host never enabled L1");
     }
 
     #[test]
+    fn a_system_with_aspm_disabled_keeps_both_modules_off() {
+        let mut bus = Bus::default();
+        bus.config.insert(CLOCK_DELAY, 0x55);
+        let mut link =
+            Link::configure(&mut bus, 0, 0, HOST_CLOCK_REQUEST | HOST_L1, false).unwrap();
+        assert_eq!(bus.link(), 0, "no CLKREQ though the host enabled it");
+        assert_eq!(bus.config[&CLOCK_DELAY], 0, "the clock delay is not ASPM");
+        link.set_l1(&mut bus, true).unwrap();
+        assert_eq!(bus.link(), 0, "no L1 under power save");
+        assert!(link.answered());
+    }
+
+    #[test]
     fn a_later_cut_and_one_board_take_their_own_settings() {
         let mut bus = Bus::default();
-        Link::configure(&mut bus, 2, 4, 0).unwrap();
+        Link::configure(&mut bus, 2, 4, 0, true).unwrap();
         assert_eq!(bus.word(REG_HCI_MIX_CFG), 0);
         assert_eq!(bus.word(REG_ANAPARSW_MAC_0), 0);
-        Link::configure(&mut bus, CUT_D, CURRENT_RFE, 0).unwrap();
+        Link::configure(&mut bus, CUT_D, CURRENT_RFE, 0, true).unwrap();
         assert_eq!(bus.word(REG_HCI_MIX_CFG), AUX_TO_FAST_CLOCK);
         assert_eq!(bus.word(REG_ANAPARSW_MAC_0), 1 << 28);
     }
@@ -267,7 +282,7 @@ mod tests {
     #[test]
     fn a_silent_bridge_leaves_l1_off_and_says_so() {
         let mut bus = Bus::default();
-        let mut link = Link::configure(&mut bus, 0, 0, HOST_L1).unwrap();
+        let mut link = Link::configure(&mut bus, 0, 0, HOST_L1, true).unwrap();
         assert!(link.answered());
         bus.silent = true;
         link.set_l1(&mut bus, true).unwrap();
