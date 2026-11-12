@@ -15,7 +15,7 @@ use super::{
     download,
     dynamic::{self, Dynamic, set_mask},
     features,
-    firmware_control::Control,
+    firmware_control::{self, Control},
     interrupt::Controller,
     io::{Bar, Io},
     link::Link,
@@ -122,6 +122,8 @@ const RECEIVE_TAG_SLIPPED: &str =
     "received buffers whose DMA tag was out of step (PCIe bus timeouts), which are still taken";
 /// rtw88's "failed to poll iqk status bit", after which it goes on.
 const IQK_UNFINISHED: &str = "an IQK calibration firmware did not report done within 300 ms";
+/// rtw88's "failed to send h2c command", after which it goes on.
+const MAILBOX_BUSY: &str = "firmware commands dropped while its mailbox stayed busy";
 
 fn failed<E: Debug>(step: &'static str) -> impl FnOnce(E) -> String {
     move |error| format!("{step}: {error:?}")
@@ -303,6 +305,18 @@ impl Hardware {
         })
     }
 
+    /// `rtw_fw_send_h2c_command`: a command firmware's busy mailbox would not
+    /// take is dropped, as rtw88 drops it, and told once.
+    fn send(&mut self, command: (u32, u32), step: &'static str) -> Result<(), String> {
+        match self.control.command(command) {
+            Err(firmware_control::Error::MailboxTimeout { .. }) => {
+                self.limit_once(MAILBOX_BUSY);
+                Ok(())
+            }
+            result => result.map_err(failed(step)),
+        }
+    }
+
     /// Tell the station of `limitation` the first time it happens.
     fn limit_once(&mut self, limitation: &'static str) {
         if !self.reported.contains(&limitation) {
@@ -345,10 +359,7 @@ impl Hardware {
             .map_err(failed("coex"))?;
         for order in run.orders {
             match order {
-                Order::Command(command) => self
-                    .control
-                    .command(command)
-                    .map_err(failed("coex command"))?,
+                Order::Command(command) => self.send(command, "coex command")?,
                 Order::Wake => self.set_power_save(false)?,
                 Order::SingleStream(single) if single != self.single_stream => {
                     self.single_stream = single;
@@ -384,13 +395,10 @@ impl Hardware {
             let Some((info, predistortion)) = self.power_gate_pages else {
                 return Ok(());
             };
-            self.control
-                .command(commands::power_gate_pages(
-                    info,
-                    predistortion,
-                    self.keys != 0,
-                ))
-                .map_err(failed("power gate"))?;
+            self.send(
+                commands::power_gate_pages(info, predistortion, self.keys != 0),
+                "power gate",
+            )?;
         }
         if !self.deep.transmit_wakes() && self.transmit.frames_pending() {
             return Ok(());
@@ -427,13 +435,10 @@ impl Hardware {
                 .map_err(failed("reserved pages"))?;
         }
         self.power_gate_pages = Some((pages.info, pages.predistortion));
-        self.control
-            .command(commands::reserved_pages(
-                pages.ps_poll,
-                pages.null,
-                pages.qos_null,
-            ))
-            .map_err(failed("reserved pages"))
+        self.send(
+            commands::reserved_pages(pages.ps_poll, pages.null, pages.qos_null),
+            "reserved pages",
+        )
     }
 
     /// `rtw_ops_set_key`'s last step: a power gate restores keys from the pages.
@@ -501,10 +506,10 @@ impl Hardware {
     fn adapt(&mut self) -> Result<(), String> {
         if self.features & ADAPTIVITY != 0 {
             let (mode, gain, threshold, density) = self.dynamic.adaptivity();
-            return self
-                .control
-                .command(commands::adaptivity(mode, gain, threshold, density))
-                .map_err(failed("adaptivity"));
+            return self.send(
+                commands::adaptivity(mode, gain, threshold, density),
+                "adaptivity",
+            );
         }
         let (rising, falling) = self.dynamic.energy_thresholds();
         let io = self.control.io().map_err(failed("registers"))?;
@@ -532,9 +537,7 @@ impl Hardware {
                 .await_bluetooth(io)
                 .map_err(failed("bluetooth calibration"))?;
         }
-        self.control
-            .command(commands::calibration(starting))
-            .map_err(failed("calibration notice"))?;
+        self.send(commands::calibration(starting), "calibration notice")?;
         let io = self.control.io().map_err(failed("registers"))?;
         self.calibration
             .await_firmware(io)
@@ -768,7 +771,7 @@ impl Device for Hardware {
 
     fn command(&mut self, command: (u32, u32)) -> Result<(), String> {
         self.rouse()?;
-        self.control.command(command).map_err(failed("command"))
+        self.send(command, "command")
     }
 
     fn set_templates(&mut self, templates: &Templates) -> Result<(), String> {
@@ -784,9 +787,7 @@ impl Device for Hardware {
             if !self.asleep && !self.coex.stays_awake() {
                 self.arbitrate(Event::Sleeping(true))?;
                 self.asleep = true;
-                self.control
-                    .command(commands::power_mode(true, PORT))
-                    .map_err(failed("power mode"))?;
+                self.send(commands::power_mode(true, PORT), "power mode")?;
                 self.set_link_power(true)?;
             }
             return if self.asleep {
@@ -801,9 +802,7 @@ impl Device for Hardware {
         }
         self.asleep = false;
         self.set_link_power(false)?;
-        self.control
-            .command(commands::power_mode(false, PORT))
-            .map_err(failed("power mode"))?;
+        self.send(commands::power_mode(false, PORT), "power mode")?;
         self.wait_for_power_save_to_end()?;
         self.arbitrate(Event::Sleeping(false))
     }
@@ -918,9 +917,7 @@ impl Device for Hardware {
         let linked = self.connected;
         self.dynamic.sample(linked);
         if linked {
-            self.control
-                .command(commands::rssi(MAC_ID, self.dynamic.rssi(), stbc))
-                .map_err(failed("rssi"))?;
+            self.send(commands::rssi(MAC_ID, self.dynamic.rssi(), stbc), "rssi")?;
         }
         let (alarms, cck_alarms) = self.false_alarms()?;
         if let Some(gain) = self.dynamic.gain(alarms, linked) {
@@ -933,9 +930,7 @@ impl Device for Hardware {
                 .detect_cck(io, cck_alarms, linked)
                 .map_err(failed("cck detection"))?;
         }
-        self.control
-            .command(self.dynamic.phy_info())
-            .map_err(failed("phy info"))?;
+        self.send(self.dynamic.phy_info(), "phy info")?;
         let io = self.control.io().map_err(failed("registers"))?;
         // rtw88 would put the second transmit path back here; a game
         // controller holds it, so one path has none to choose from.
@@ -978,9 +973,7 @@ impl Device for Hardware {
         }
         self.scanning = scanning;
         if self.features & NOTIFY_SCAN != 0 {
-            self.control
-                .command(commands::scan(scanning))
-                .map_err(failed("scan notice"))?;
+            self.send(commands::scan(scanning), "scan notice")?;
         }
         if scanning {
             self.write_gain(dynamic::MAX_COVERAGE)

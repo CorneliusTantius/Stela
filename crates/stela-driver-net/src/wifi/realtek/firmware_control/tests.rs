@@ -424,6 +424,33 @@ fn mailbox_last_atomic_read_order_rotation_and_real_owner_lifetime() {
     assert!(!m.lock().unwrap().events.iter().any(|e| e[0] == 1));
 }
 #[test]
+fn a_command_a_busy_mailbox_refuses_is_dropped_and_the_next_one_goes_through() {
+    let (mut c, m, _, _) = fixture();
+    {
+        let mut s = m.lock().unwrap();
+        s.busy_reads = 31;
+        s.busy_seen = 0;
+    }
+    // rtw_fw_send_h2c_command: "failed to send h2c command", and on.
+    assert_eq!(
+        c.command((0x1234, 0x5678)),
+        Err(Error::MailboxTimeout { mailbox: 0 })
+    );
+    assert!(!c.quarantined());
+    assert_eq!(c.next_mailbox(), 0);
+    assert_eq!(m.lock().unwrap().quarantine, 0);
+    assert!(!m.lock().unwrap().events.iter().any(|e| e[0] == 1));
+    // The mailbox frees, and the next command takes it.
+    c.command((0x4321, 0x8765)).unwrap();
+    assert_eq!(c.next_mailbox(), 1);
+    let s = m.lock().unwrap();
+    let events = source_events(&s.events);
+    assert_eq!(
+        &events[events.len() - 2..],
+        &[[1, 0x1f0, 4, 0x8765], [1, 0x1d0, 4, 0x4321]]
+    );
+}
+#[test]
 fn fresh_start_and_sticky_finish_are_distinct_from_completion() {
     let (mut c, m, _, _) = fixture();
     {
