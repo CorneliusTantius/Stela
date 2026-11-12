@@ -19,6 +19,7 @@ use super::{
     io::{Bar, Io, NativeIo},
     link::Link,
     phy::{self, PhyInitialized, source_mac},
+    quirks::Disabled,
     receive, transmit,
 };
 use crate::{
@@ -107,6 +108,8 @@ pub struct Up {
     pub clock: Clock,
     pub pages: &'static dyn PageSource,
     pub link: Link,
+    /// What `rtw_pci_quirks` turns off on this system.
+    pub disabled: Disabled,
 }
 
 /// `rtw_chip_info_setup`, then `rtw_power_on` and `rtw_core_start`.
@@ -195,8 +198,15 @@ pub unsafe fn bring_up(claim: Claim) -> Result<Up, Error> {
         (mac_state, phy)
     };
     let geometry = mac_state.fifo();
-    let link = Link::configure(&mut io, profile.cut(), board.raw().rfe_raw, link_control)
-        .map_err(at("pcie link"))?;
+    let disabled = Disabled::load(firmware);
+    let link = Link::configure(
+        &mut io,
+        profile.cut(),
+        board.raw().rfe_raw,
+        link_control,
+        !disabled.aspm,
+    )
+    .map_err(at("pcie link"))?;
     let interrupts = Controller::new(bar().map_err(at("bar"))?).map_err(at("interrupts"))?;
     transmit
         .general_info(pages, geometry)
@@ -241,5 +251,6 @@ pub unsafe fn bring_up(claim: Claim) -> Result<Up, Error> {
         clock,
         pages,
         link,
+        disabled,
     })
 }

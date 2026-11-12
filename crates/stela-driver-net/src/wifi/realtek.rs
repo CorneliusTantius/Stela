@@ -29,6 +29,7 @@ pub mod io;
 pub mod link;
 pub mod phy;
 pub mod power;
+pub mod quirks;
 pub mod receive;
 pub mod regd;
 pub mod registers;
