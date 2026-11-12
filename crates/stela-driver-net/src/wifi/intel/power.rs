@@ -309,13 +309,6 @@ impl<C: Csr> Nic<C> {
         let value = self.read(register)?;
         self.write(register, value | mask)
     }
-    fn set_checked(&mut self, register: u32, mask: u32) -> Result<(), Error> {
-        self.set(register, mask)?;
-        if self.read(register)? & mask != mask {
-            return Err(Error::Rejected { register, mask });
-        }
-        Ok(())
-    }
     fn poll(&mut self, register: u32, mask: u32, microseconds: u32) -> Result<(), Error> {
         // Same 10us interval/strict deadline as iwl_poll_bits_mask. A failed
         // register read is never a successful set-bit observation.
@@ -338,7 +331,9 @@ impl<C: Csr> Nic<C> {
             Err(Error::Timeout { .. }) => {}
             Err(e) => return Err(e),
         }
-        self.set_checked(LINK_PWR, 1 << 31)?;
+        // As `iwl_pcie_prepare_card_hw`, a set without a read back: the
+        // ownership poll that follows is the check.
+        self.set(LINK_PWR, 1 << 31)?;
         self.io.delay_us(1000)?;
         for _ in 0..10 {
             self.set(HW_IF, WAKE_ME)?;
@@ -423,11 +418,12 @@ impl<C: Csr> Nic<C> {
         if self.bisr {
             self.io.delay_us(2000)?;
         }
+        // The clock poll, not a read back of the request, says it woke.
         let wake = if self.family >= Family::Bz {
-            self.set_checked(GP, BZ_MAC_ACCESS | MAC_INIT)?;
+            self.set(GP, BZ_MAC_ACCESS | MAC_INIT)?;
             self.poll(GP, MAC_STATUS, 25000)
         } else {
-            self.set_checked(GP, 4)?;
+            self.set(GP, 4)?;
             self.poll(GP, MAC_CLOCK, 25000)
         };
         if self.bisr {
@@ -587,15 +583,26 @@ impl<C: Csr> Power<C> {
         }
         // AX200's pinned MAC cfg has umac_prph_offset=0. AX210 uses
         // +0x300000, but has no persistence-clear step in this donor routine.
-        let hpm = self.nic.read_prph(0xa03440)?;
+        // `iwl_trans_pcie_clear_persistence_bit` reads without NIC access, so
+        // a MAC still asleep answers with a hardware-error word, which Linux
+        // takes as nothing to clear.
+        self.nic
+            .write(PRPH_RADDR, (0xa03440 & 0x000fffff) | (3 << 24))?;
+        let hpm = self.nic.io.read32(PRPH_RDATA)?;
+        if is_hardware_error(hpm) {
+            return Ok(());
+        }
+        if hpm == u32::MAX {
+            return Err(Error::FailedRead {
+                register: PRPH_RDATA,
+                value: hpm,
+            });
+        }
         if hpm & (1 << 12) != 0 {
             if self.nic.read_prph(0xa04d00)? & (1 << 12) != 0 {
                 return Err(Error::PersistenceProtected);
             }
             self.nic.write_prph(0xa03440, hpm & !(1 << 12))?;
-            if self.nic.read_prph(0xa03440)? & (1 << 12) != 0 {
-                return Err(Error::PersistenceProtected);
-            }
         }
         Ok(())
     }
@@ -623,10 +630,12 @@ impl<C: Csr> Power<C> {
         if self.profile.platform().integrated && self.profile.family() == Family::Ax200 {
             self.force_power_gating(management)?;
         }
-        self.nic.set_checked(CHICKEN, 0x00800000)?;
-        self.nic.set_checked(HPET, 0xffff0000)?;
-        self.nic.set_checked(HW_IF, 0x00080000)?;
-        self.nic.set_checked(GIO, 2)?;
+        // `iwl_pcie_apm_init` sets these bits and reads none of them back;
+        // a bit a register does not keep is no reason to refuse the device.
+        self.nic.set(CHICKEN, 0x00800000)?;
+        self.nic.set(HPET, 0xffff0000)?;
+        self.nic.set(HW_IF, 0x00080000)?;
+        self.nic.set(GIO, 2)?;
         self.nic.activate()?;
         Ok(Awake {
             family: self.profile.family(),

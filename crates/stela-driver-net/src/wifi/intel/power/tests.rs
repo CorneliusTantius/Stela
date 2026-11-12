@@ -321,6 +321,21 @@ fn every_source_operation_failure_and_failed_word_poison_the_epoch() {
     for family in [Family::Ax200, Family::Ax210] {
         let mut baseline = Power::new(Model::new(family), profile(family));
         baseline.wake(ManagementSession::Unknown).unwrap();
+        // The persistence word is read without NIC access; Linux takes a
+        // hardware-error word there as nothing to clear.
+        let persistence = baseline
+            .nic
+            .io
+            .ops
+            .windows(2)
+            .position(|ops| {
+                matches!(
+                    ops,
+                    [Op::Write(PRPH_RADDR, 0x0300_3440), Op::Read(PRPH_RDATA)]
+                )
+            })
+            .map(|index| index + 1);
+        assert_eq!(persistence.is_some(), family == Family::Ax200);
         for (index, op) in baseline.nic.io.ops.iter().enumerate() {
             let mut model = Model::new(family);
             model.fail = Some(index);
@@ -342,6 +357,10 @@ fn every_source_operation_failure_and_failed_word_poison_the_epoch() {
                     model.sentinel = Some(index);
                     model.sentinel_value = sentinel_value;
                     let mut power = Power::new(model, profile(family));
+                    if Some(index) == persistence && is_hardware_error(sentinel_value) {
+                        assert!(power.wake(ManagementSession::Unknown).is_ok());
+                        continue;
+                    }
                     assert!(
                         matches!(
                             power.wake(ManagementSession::Unknown),
@@ -509,6 +528,27 @@ fn a_bz_mac_resets_and_wakes_through_gp_control() {
     assert!(ops.iter().any(|op| {
         matches!(op, Op::Write(GP, value) if value & (BZ_MAC_ACCESS | MAC_INIT) == BZ_MAC_ACCESS | MAC_INIT)
     }));
+}
+
+/// `iwl_trans_pcie_clear_persistence_bit` reads HPM_DEBUG without NIC access
+/// and leaves a hardware-error word alone, and `iwl_pcie_apm_init` sets its
+/// bits without reading them back.
+#[test]
+fn an_asleep_persistence_word_and_unkept_apm_bits_still_wake_the_mac() {
+    let family = Family::Ax200;
+    let mut model = Model::new(family);
+    model.peripheral.insert(0x3440, 0xa5a5_a5a2);
+    let mut power = Power::new(model, profile(family));
+    assert!(power.wake(ManagementSession::NotConnected).is_ok());
+    let ops = &power.nic.io.ops;
+    assert!(!ops.iter().any(|op| matches!(op, Op::Write(PRPH_WADDR, _))));
+    let mut model = Model::new(family);
+    model.peripheral.insert(0x3440, u32::MAX);
+    let mut power = Power::new(model, profile(family));
+    assert!(matches!(
+        power.wake(ManagementSession::NotConnected),
+        Err(Error::FailedRead { .. })
+    ));
 }
 
 #[test]
