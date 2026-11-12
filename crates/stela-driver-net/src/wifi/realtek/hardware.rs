@@ -124,6 +124,10 @@ const RECEIVE_TAG_SLIPPED: &str =
 const IQK_UNFINISHED: &str = "an IQK calibration firmware did not report done within 300 ms";
 /// rtw88's "failed to send h2c command", after which it goes on.
 const MAILBOX_BUSY: &str = "firmware commands dropped while its mailbox stayed busy";
+/// The arbiter waits a few steps for a calibration, not rtw88's 600 ms at once.
+const COEX_WAIT_CUT: &str = "an antenna path set while a Bluetooth calibration still ran";
+/// The synthesizer lock waits 20 ms, not rtw88's 100.
+const LOCK_UNSETTLED: &str = "a synthesizer lock that had not settled within 20 ms";
 
 fn failed<E: Debug>(step: &'static str) -> impl FnOnce(E) -> String {
     move |error| format!("{step}: {error:?}")
@@ -234,7 +238,7 @@ impl Hardware {
             report,
             features,
             board,
-            coex,
+            mut coex,
             mac,
             pages,
             geometry,
@@ -242,6 +246,8 @@ impl Hardware {
             disabled,
             ..
         } = up;
+        // Past attach, the arbiter's waits are bounded per call.
+        coex.bound_waits();
         let initial = phy.factory().calibration().initial();
         let cck_bounds = initial.cck_bounds();
         let calibration = Calibration::new(board.raw().power_track_raw);
@@ -358,6 +364,9 @@ impl Hardware {
         // SAFETY: this worker owns the radio, and its frames wait for it.
         let run = unsafe { self.coex.notify(io, &self.report, now, wifi, event) }
             .map_err(failed("coex"))?;
+        if self.coex.take_cut_wait() {
+            self.limit_once(COEX_WAIT_CUT);
+        }
         for order in run.orders {
             match order {
                 Order::Command(command) => self.send(command, "coex command")?,
@@ -956,6 +965,9 @@ impl Device for Hardware {
         // SAFETY: as above.
         unsafe { self.dynamic.track_temperature(io, &self.report, band) }
             .map_err(failed("temperature"))?;
+        if self.dynamic.take_unsettled_lock() {
+            self.limit_once(LOCK_UNSETTLED);
+        }
         self.adapt()?;
         Ok(Watched {
             level: self.dynamic.level(),

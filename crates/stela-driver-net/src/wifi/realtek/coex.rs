@@ -142,6 +142,9 @@ const BREAK_TABLE: u32 = 0xf0ff_ffff;
 /// `COEX_RFK_TIMEOUT` over `COEX_MIN_DELAY`, in its steps.
 const CALIBRATION_TRIES: u32 = 60;
 const CALIBRATION_STEP_US: u64 = 10_000;
+/// The steps of that wait one call takes once the radio runs: rtw88 sleeps
+/// through all of them under its mutex, which here would hold the caller.
+const RUNTIME_CALIBRATION_TRIES: u32 = 2;
 /// `BT_MP_INFO_OP_*`.
 const OP_SCAN_TYPE: u8 = 0x2d;
 const OP_LNA_CONSTRAINT: u8 = 0x32;
@@ -437,6 +440,12 @@ pub struct Coex {
     inquiry_remains: bool,
     /// `bt_iqk_state`.
     calibration: u8,
+    /// Steps of `rtw_coex_check_rfk`'s wait one call takes, and those taken
+    /// since a calibration was last seen over.
+    calibration_tries: u32,
+    calibration_waited: u32,
+    /// A path changed while a calibration still ran, not yet told.
+    calibration_cut: bool,
     bluetooth: Bluetooth,
     hid: HidDevices,
     counters: Counters,
@@ -513,6 +522,9 @@ impl Coex {
             reenabling: false,
             inquiry_remains: false,
             calibration: 0,
+            calibration_tries: CALIBRATION_TRIES,
+            calibration_waited: 0,
+            calibration_cut: false,
             bluetooth: Bluetooth::default(),
             hid: HidDevices::default(),
             counters: Counters::default(),
@@ -535,6 +547,17 @@ impl Coex {
             aggregate_limit: false,
             limited: Limited::default(),
         }
+    }
+
+    /// From here on, each call waits for a calibration a few steps at most;
+    /// the wait's 600 ms add up over calls.
+    pub fn bound_waits(&mut self) {
+        self.calibration_tries = RUNTIME_CALIBRATION_TRIES;
+    }
+
+    /// Whether a path changed while a calibration ran, once each time.
+    pub fn take_cut_wait(&mut self) -> bool {
+        core::mem::take(&mut self.calibration_cut)
     }
 
     /// `coex_stat->wl_force_lps_ctrl`, which `rtw_enter_lps` obeys.
@@ -864,15 +887,24 @@ impl Coex {
         if !self.shared || self.calibration == CALIBRATION_ABANDONED {
             return Ok(());
         }
-        for _ in 0..CALIBRATION_TRIES {
+        for _ in 0..self.calibration_tries {
             let bluetooth = io.read16(REG_WIFI_BT_INFO)? & SCORE_BT_CALIBRATING != 0;
             let wifi = io.read8(REG_ARFR4)? & WL_CALIBRATING != 0;
             if !bluetooth && !wifi {
+                self.calibration_waited = 0;
                 return Ok(());
             }
+            if self.calibration_waited >= CALIBRATION_TRIES {
+                break;
+            }
+            self.calibration_waited += 1;
             io.delay_us(CALIBRATION_STEP_US);
         }
-        self.calibration = CALIBRATION_ABANDONED;
+        if self.calibration_waited >= CALIBRATION_TRIES {
+            self.calibration = CALIBRATION_ABANDONED;
+        } else {
+            self.calibration_cut = true;
+        }
         Ok(())
     }
 
@@ -1280,6 +1312,7 @@ impl Coex {
         match source {
             SOURCE_CALIBRATION => {
                 self.calibration = bytes.get(1).copied().unwrap_or(0);
+                self.calibration_waited = 0;
                 return Ok(());
             }
             SOURCE_SCOREBOARD => {
@@ -1662,6 +1695,32 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn a_running_calibration_holds_a_call_a_few_steps_and_all_calls_600_ms() {
+        let mut rig = Rig::new(true);
+        rig.bus.board = Some(SCORE_ON | SCORE_BT_CALIBRATING);
+        rig.coex.bound_waits();
+        // Two 10 ms steps a call, as long as the 60 steps last.
+        for call in 1..30 {
+            rig.coex.await_calibrations(&mut rig.bus).unwrap();
+            assert_eq!(rig.coex.calibration_waited, 2 * call);
+            assert!(rig.coex.take_cut_wait());
+            assert!(!rig.coex.take_cut_wait(), "told once a call");
+        }
+        rig.coex.await_calibrations(&mut rig.bus).unwrap();
+        assert_eq!(
+            rig.coex.calibration, CALIBRATION_ABANDONED,
+            "as rtw88 gives up"
+        );
+        assert!(!rig.coex.take_cut_wait());
+        // A new report of Bluetooth's calibration starts the wait again.
+        rig.coex.calibration = 0;
+        rig.coex.calibration_waited = 0;
+        rig.bus.board = Some(SCORE_ON);
+        rig.coex.await_calibrations(&mut rig.bus).unwrap();
+        assert!(!rig.coex.take_cut_wait());
     }
 
     #[test]
