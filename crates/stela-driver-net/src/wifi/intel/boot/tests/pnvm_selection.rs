@@ -90,8 +90,18 @@ fn alive_bios_source_scratch_doorbell_and_raw_notification_preserve_tables() {
     }
 }
 
+/// Whether the PNVM doorbell (`UREG_DOORBELL_TO_ISR6_PNVM`) rang.
+fn pnvm_doorbell(state: &Mutex<ModelState>) -> bool {
+    state
+        .lock()
+        .unwrap()
+        .ops
+        .windows(2)
+        .any(|ops| ops == [Op::Write(0x444, 0x03d05c04), Op::Write(0x44c, 1 << 20)])
+}
+
 #[test]
-fn zero_sku_requests_nothing_and_missing_capture_or_bad_bios_never_fake_fallback() {
+fn zero_sku_requests_nothing_and_tables_linux_does_without_leave_the_doorbell() {
     if crate::test_process::isolate_model() {
         return;
     }
@@ -133,14 +143,17 @@ fn zero_sku_requests_nothing_and_missing_capture_or_bad_bios_never_fake_fallback
             catalog: &provider,
             requests: RefCell::new(Vec::new()),
         };
-        let mut boot = start_ax210(
-            &catalog,
-            crate::wifi::intel::platform::load_step(observation, &step_catalog).unwrap(),
-            &source,
-            &domain,
-            &state,
-            &drops,
-        );
+        // Without a capture the STEP data is left out, as Linux leaves out
+        // a variable it cannot read.
+        let step = if mode == 1 {
+            crate::wifi::intel::platform::load_step_or_ignore(
+                crate::wifi::intel::platform::Observation::NotCaptured,
+                &step_catalog,
+            )
+        } else {
+            crate::wifi::intel::platform::load_step(observation, &step_catalog).unwrap()
+        };
+        let mut boot = start_ax210(&catalog, step, &source, &domain, &state, &drops);
         event(&state, 1);
         boot.poll().unwrap();
         let mut packet = rx_packet(1, 0xcafe, 0);
@@ -160,24 +173,62 @@ fn zero_sku_requests_nothing_and_missing_capture_or_bad_bios_never_fake_fallback
                 assert!(spy.requests.borrow().is_empty());
                 assert!(state.lock().unwrap().ops.is_empty());
             }
+            // `iwl_get_pnvm_image`: a BIOS image that cannot be read falls
+            // back to the file; a reduced-power table that cannot be read is
+            // left out and the doorbell still rings.
             1 => {
+                assert_eq!(result.unwrap(), PnvmProgress::Waiting);
+                assert_eq!(
+                    spy.requests.borrow().as_slice(),
+                    ["iwlwifi-ty-a0-gf-a0.pnvm"]
+                );
+                let receipts = boot.platform_receipts().unwrap();
                 assert!(matches!(
-                    result,
-                    Err(Error::Calibration(calibration::Error::Observation { .. }))
+                    receipts.pnvm,
+                    calibration::Source::External {
+                        bios_fallback: Some(_),
+                        ..
+                    }
                 ));
-                assert!(spy.requests.borrow().is_empty());
-                assert!(state.lock().unwrap().ops.is_empty());
+                assert!(matches!(
+                    receipts.reduced_power,
+                    calibration::Source::Skipped
+                ));
+                assert!(matches!(
+                    receipts.skipped.as_slice(),
+                    [calibration::Error::Observation { .. }]
+                ));
+                assert!(pnvm_doorbell(&state));
+                assert_eq!(
+                    crate::wifi::intel::link::degraded(&boot),
+                    [
+                        "the platform's Wi-Fi STEP data: the firmware boots without it",
+                        "the platform's reduced-power Wi-Fi tables: the firmware runs without them"
+                    ]
+                );
             }
+            // `iwl_pnvm_parse`: a BIOS image without this SKU gives no PNVM
+            // and no switch to the file, and the firmware still gets its
+            // doorbell to run on its defaults.
             2 => {
-                assert!(matches!(
-                    result,
-                    Err(Error::Calibration(calibration::Error::Selection(_)))
-                ));
+                assert_eq!(result.unwrap(), PnvmProgress::Waiting);
                 assert_eq!(
                     spy.requests.borrow().as_slice(),
                     [crate::wifi::intel::platform::Variable::OemPnvm.resource_name()]
                 );
-                assert!(state.lock().unwrap().ops.is_empty());
+                let receipts = boot.platform_receipts().unwrap();
+                assert!(matches!(receipts.pnvm, calibration::Source::Skipped));
+                assert!(matches!(
+                    receipts.skipped.as_slice(),
+                    [calibration::Error::Selection(_)]
+                ));
+                assert!(pnvm_doorbell(&state));
+                assert_eq!(
+                    crate::wifi::intel::link::degraded(&boot),
+                    ["the Wi-Fi PNVM tables for this adapter: the firmware runs on its defaults"]
+                );
+                complete(&boot, &domain, 1, 2, &pnvm_packet(0));
+                assert_eq!(boot.poll_pnvm().unwrap(), PnvmProgress::Observed);
             }
             _ => {
                 assert_eq!(result.unwrap(), PnvmProgress::Waiting);
@@ -198,7 +249,7 @@ fn zero_sku_requests_nothing_and_missing_capture_or_bad_bios_never_fake_fallback
                 ));
             }
         }
-        if mode < 3 {
+        if mode != 1 && mode != 3 {
             assert_eq!(source.calls.load(Ordering::Relaxed), calls);
         }
         boot.stop().unwrap();

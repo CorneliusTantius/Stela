@@ -54,6 +54,12 @@ pub enum Source<'a> {
         image: resources::Image<'a>,
         bios_fallback: Option<Observation>,
     },
+    /// The table was required but could not be acquired or matched to the
+    /// SKU. As `iwl_pnvm_load_pnvm_to_trans` and
+    /// `iwl_pnvm_load_reduce_power_to_trans` do, nothing is handed to the
+    /// firmware for it, the doorbell still rings and the firmware runs on
+    /// its built-in defaults; the reason is in [`Receipts::skipped`].
+    Skipped,
 }
 #[derive(Debug)]
 pub struct Receipts<'a> {
@@ -61,6 +67,8 @@ pub struct Receipts<'a> {
     pub pnvm_version: Option<u32>,
     pub reduced_power: Source<'a>,
     pub transfer: Transfer,
+    /// Why each [`Source::Skipped`] table was left out, PNVM first.
+    pub skipped: Vec<Error>,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Transfer {
@@ -132,72 +140,33 @@ pub(super) fn prepare<'a>(
                 pnvm_version: None,
                 reduced_power: Source::NotRequired,
                 transfer: Transfer::NotRequired,
+                skipped: Vec::new(),
             },
             pnvm: Vec::new(),
             reduced_power: Vec::new(),
         });
     }
-    let (source, data) = match plan.pnvm {
-        PnvmSource::None => (Source::NotRequired, None),
-        PnvmSource::External => {
-            let image = external(profile, provider)?;
-            (
-                Source::External {
-                    image,
-                    bios_fallback: None,
-                },
-                Some(image.bytes()),
-            )
-        }
-        PnvmSource::Bios { external_fallback } => {
-            let observation = observations.oem_pnvm;
-            if unavailable(Variable::OemPnvm, observation)? {
-                if external_fallback {
-                    let image = external(profile, provider)?;
-                    (
-                        Source::External {
-                            image,
-                            bios_fallback: Some(observation),
-                        },
-                        Some(image.bytes()),
-                    )
-                } else {
-                    (Source::Unavailable { observation }, None)
-                }
-            } else {
-                let loaded = bios(Variable::OemPnvm, observation, provider)?;
-                (
-                    Source::Bios {
-                        observation,
-                        image: loaded.image,
-                    },
-                    Some(loaded.package.payload()),
-                )
+    let mut skipped = Vec::new();
+    // A provider that answers with another file's binding is a broken
+    // catalog, not a missing table, and stays a failure.
+    let (source, pnvm, pnvm_version) =
+        match pnvm_tables(profile, sku, plan.pnvm, observations, provider) {
+            Ok(tables) => tables,
+            Err(Error::Binding) => return Err(Error::Binding),
+            Err(error) => {
+                skipped.push(error);
+                (Source::Skipped, Vec::new(), None)
             }
-        }
-    };
-    let (pnvm, pnvm_version) = if let Some(data) = data {
-        // A successfully acquired BIOS image that fails SKU/HW selection is
-        // not acquisition absence and never silently switches to external.
-        let selection = pnvm::Pnvm::parse(data)?.select(profile, sku)?;
-        (selection.chunks().to_vec(), selection.version())
-    } else {
-        (Vec::new(), None)
-    };
-    let observation = observations.reduced_power;
-    let (reduced_source, reduced_power) = if unavailable(Variable::ReducedPower, observation)? {
-        (Source::Unavailable { observation }, Vec::new())
-    } else {
-        let loaded = bios(Variable::ReducedPower, observation, provider)?;
-        let selection = pnvm::Pnvm::parse(loaded.package.payload())?.select_reduced_power(sku)?;
-        (
-            Source::Bios {
-                observation,
-                image: loaded.image,
-            },
-            selection.chunks().to_vec(),
-        )
-    };
+        };
+    let (reduced_source, reduced_power) =
+        match reduced_power_tables(sku, observations.reduced_power, provider) {
+            Ok(tables) => tables,
+            Err(Error::Binding) => return Err(Error::Binding),
+            Err(error) => {
+                skipped.push(error);
+                (Source::Skipped, Vec::new())
+            }
+        };
     Ok(Prepared {
         receipts: Receipts {
             pnvm: source,
@@ -208,10 +177,93 @@ pub(super) fn prepare<'a>(
             } else {
                 Transfer::NotUsedBeforeAx210
             },
+            skipped,
         },
         pnvm,
         reduced_power,
     })
+}
+
+type PnvmTables<'a> = (Source<'a>, Vec<pnvm::Chunk<'a>>, Option<u32>);
+
+/// `iwl_get_pnvm_image` and `iwl_pnvm_parse`: the BIOS image for a non-Intel
+/// SKU, the file beside the firmware when the BIOS has none it can read, and
+/// the sections of this SKU in whichever was found.
+fn pnvm_tables<'a>(
+    profile: &Profile,
+    sku: [u32; 3],
+    source: PnvmSource,
+    observations: Observations,
+    provider: &'a dyn resources::Provider,
+) -> Result<PnvmTables<'a>, Error> {
+    let (source, data) = match source {
+        PnvmSource::None => return Ok((Source::NotRequired, Vec::new(), None)),
+        PnvmSource::External => {
+            let image = external(profile, provider)?;
+            (
+                Source::External {
+                    image,
+                    bios_fallback: None,
+                },
+                image.bytes(),
+            )
+        }
+        PnvmSource::Bios { external_fallback } => {
+            let observation = observations.oem_pnvm;
+            let read = match unavailable(Variable::OemPnvm, observation) {
+                Ok(true) => None,
+                Ok(false) => Some(bios(Variable::OemPnvm, observation, provider)),
+                Err(error) => Some(Err(error)),
+            };
+            match read {
+                Some(Ok(loaded)) => (
+                    Source::Bios {
+                        observation,
+                        image: loaded.image,
+                    },
+                    loaded.package.payload(),
+                ),
+                Some(Err(Error::Binding)) => return Err(Error::Binding),
+                // Whatever kept the BIOS image out, the file stands in.
+                _ if external_fallback => {
+                    let image = external(profile, provider)?;
+                    (
+                        Source::External {
+                            image,
+                            bios_fallback: Some(observation),
+                        },
+                        image.bytes(),
+                    )
+                }
+                Some(Err(error)) => return Err(error),
+                None => return Ok((Source::Unavailable { observation }, Vec::new(), None)),
+            }
+        }
+    };
+    // A BIOS image that holds no section for this SKU does not switch to the
+    // file either: Linux gives up on PNVM for this boot.
+    let selection = pnvm::Pnvm::parse(data)?.select(profile, sku)?;
+    Ok((source, selection.chunks().to_vec(), selection.version()))
+}
+
+/// `iwl_uefi_get_reduced_power` and `iwl_uefi_reduce_power_parse`.
+fn reduced_power_tables<'a>(
+    sku: [u32; 3],
+    observation: Observation,
+    provider: &'a dyn resources::Provider,
+) -> Result<(Source<'a>, Vec<pnvm::Chunk<'a>>), Error> {
+    if unavailable(Variable::ReducedPower, observation)? {
+        return Ok((Source::Unavailable { observation }, Vec::new()));
+    }
+    let loaded = bios(Variable::ReducedPower, observation, provider)?;
+    let selection = pnvm::Pnvm::parse(loaded.package.payload())?.select_reduced_power(sku)?;
+    Ok((
+        Source::Bios {
+            observation,
+            image: loaded.image,
+        },
+        selection.chunks().to_vec(),
+    ))
 }
 
 #[cfg(test)]

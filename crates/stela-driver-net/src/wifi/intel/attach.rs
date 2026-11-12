@@ -19,7 +19,7 @@ use crate::{
     bus::dma::{mapping::DmaDomain, memory::PageSource},
     firmware::{ErrorKind, Provider},
 };
-use alloc::{format, string::String, sync::Arc};
+use alloc::{string::String, sync::Arc};
 use core::fmt;
 
 /// CSR_HW_REV.
@@ -220,8 +220,7 @@ pub(super) unsafe fn start<Q: BootIo>(
         // SAFETY: the caller's contract is RomBoot's.
         Family::Ax200 => unsafe { RomBoot::start(power, staged, pages, Some(domain), entries) },
         _ => {
-            let step = platform::load_step(observations.step, firmware)
-                .map_err(|error| AttachError::Step(format!("{error:?}")))?;
+            let step = platform::load_step_or_ignore(observations.step, firmware);
             // SAFETY: as above; no CSME session is attached to the function.
             unsafe {
                 RomBoot::start_ax210(

@@ -387,6 +387,30 @@ pub struct Wifi<Q: BootIo, B: BiosIo> {
     /// Where this firmware keeps its error logs.
     tables: Tables,
     restart: Restart<Q, B>,
+    /// Platform tables this boot left out, as Linux does, reported once the
+    /// station client for this boot exists.
+    degraded: Vec<&'static str>,
+}
+
+/// What a boot past ALIVE left out of the platform tables Linux also does
+/// without: the STEP equalizer data, the PNVM and the reduced-power tables.
+pub(super) fn degraded<Q: BootIo>(boot: &RomBoot<'_, Q>) -> Vec<&'static str> {
+    let mut left = Vec::new();
+    if boot
+        .step_configuration()
+        .is_some_and(|step| step.ignored().is_some())
+    {
+        left.push("the platform's Wi-Fi STEP data: the firmware boots without it");
+    }
+    if let Some(receipts) = boot.platform_receipts() {
+        if matches!(receipts.pnvm, super::calibration::Source::Skipped) {
+            left.push("the Wi-Fi PNVM tables for this adapter: the firmware runs on its defaults");
+        }
+        if matches!(receipts.reduced_power, super::calibration::Source::Skipped) {
+            left.push("the platform's reduced-power Wi-Fi tables: the firmware runs without them");
+        }
+    }
+    left
 }
 
 /// The legacy rate bits `LegacyPeer` takes for the 500 kb/s rate units of a
@@ -469,6 +493,7 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
             reported: false,
             tables: Tables::default(),
             restart,
+            degraded: Vec::new(),
         };
         Keeper::keep(wifi, inputs.network, inputs.entropy, inputs.clock)
     }
@@ -701,7 +726,11 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
                 Ok(Some(alive)) => {
                     self.tables = Tables::of(&alive);
                     // SAFETY: forwarded from `poll`.
-                    match unsafe { boot.begin_pnvm(self.firmware, self.observations, pages) } {
+                    let begun = unsafe { boot.begin_pnvm(self.firmware, self.observations, pages) };
+                    if begun.is_ok() {
+                        self.degraded = degraded(&boot);
+                    }
+                    match begun {
                         Ok(PnvmProgress::Skipped | PnvmProgress::Observed) => Ok(self.nvm(*boot)),
                         Ok(PnvmProgress::Waiting) => {
                             self.deadline = Some(self.clock.deadline(PNVM_TIMEOUT_US));
@@ -728,6 +757,9 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
                         match Association::new(self.address) {
                             Ok(peer) => self.client = station::Client::new(peer),
                             Err(error) => return Err((Error::Station(error), nvm)),
+                        }
+                        for left in core::mem::take(&mut self.degraded) {
+                            self.client.unsupported(left);
                         }
                         match nvm.begin_radio() {
                             Ok(radio) => Ok(Stage::Radio(Box::new(radio))),

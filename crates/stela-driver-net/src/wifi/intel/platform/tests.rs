@@ -207,6 +207,49 @@ fn custom_provider_cannot_redirect_an_observed_resource_name_or_target() {
         }
     }
 }
+/// `iwl_uefi_get_step_table` ignores a STEP variable it cannot read or whose
+/// revision is not 1: the firmware boots with both mailboxes zero.
+#[test]
+fn an_unusable_step_variable_boots_with_zero_mailboxes_as_linux_does() {
+    let empty = Catalog::from_handoff(vec![]).unwrap();
+    for observation in [
+        Observation::NotCaptured,
+        Observation::from_error(Stage::Read, (1 << 63) | 21, None),
+        Observation::BoundExceeded {
+            stage: Stage::Probe,
+            status: 0,
+            reported_bytes: MAX_VARIABLE_BYTES as u64 + 1,
+        },
+    ] {
+        let step = load_step_or_ignore(observation, &empty);
+        assert_eq!(step.mailboxes(), [0; 2]);
+        assert!(step.ignored().is_some(), "{observation:?}");
+        assert!(step.step().is_none() && step.image().is_none());
+    }
+    let mut captured =
+        CapturedVariable::from_variable(Variable::Step, vec![2, 0, 1, 2, 3, 4], 7, None).unwrap();
+    let observation = captured.observation();
+    let catalog = Catalog::from_handoff(vec![captured.take_resource().unwrap()]).unwrap();
+    let step = load_step_or_ignore(observation, &catalog);
+    assert!(matches!(
+        step.ignored(),
+        Some(LoadError::Step(StepError::Revision(2)))
+    ));
+    assert_eq!(step.mailboxes(), [0; 2]);
+    let absent = load_step_or_ignore(
+        Observation::from_error(Stage::Probe, NOT_FOUND, None),
+        &empty,
+    );
+    assert!(absent.ignored().is_none());
+    let mut captured =
+        CapturedVariable::from_variable(Variable::Step, vec![1, 0, 1, 2, 3, 4], 7, None).unwrap();
+    let observation = captured.observation();
+    let catalog = Catalog::from_handoff(vec![captured.take_resource().unwrap()]).unwrap();
+    let step = load_step_or_ignore(observation, &catalog);
+    assert!(step.ignored().is_none());
+    assert_eq!(step.mailboxes(), [0x03020101, 4]);
+}
+
 #[test]
 fn borrowed_permanent_capture_keeps_the_byte_pointer_and_provenance() {
     static RAW: [u8; 8] = [1, 0xfe, 0x12, 0x34, 0x56, 0x78, 0xaa, 0xbb];

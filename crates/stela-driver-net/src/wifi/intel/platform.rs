@@ -489,6 +489,8 @@ pub struct StepConfiguration<'a> {
 #[derive(Debug)]
 enum StepValue<'a> {
     Absent,
+    /// Captured but unreadable, or of a revision Linux does not parse.
+    Ignored(LoadError),
     Present {
         image: resources::Image<'a>,
         step: Step<'a>,
@@ -500,22 +502,42 @@ impl<'a> StepConfiguration<'a> {
     }
     pub fn image(&self) -> Option<&resources::Image<'a>> {
         match &self.value {
-            StepValue::Absent => None,
+            StepValue::Absent | StepValue::Ignored(_) => None,
             StepValue::Present { image, .. } => Some(image),
         }
     }
     pub fn step(&self) -> Option<Step<'a>> {
         match self.value {
-            StepValue::Absent => None,
+            StepValue::Absent | StepValue::Ignored(_) => None,
             StepValue::Present { step, .. } => Some(step),
+        }
+    }
+    /// Why a captured STEP variable was left out, when it was.
+    pub fn ignored(&self) -> Option<&LoadError> {
+        match &self.value {
+            StepValue::Ignored(error) => Some(error),
+            _ => None,
         }
     }
     pub fn mailboxes(&self) -> [u32; 2] {
         match self.value {
-            StepValue::Absent => [0; 2],
+            StepValue::Absent | StepValue::Ignored(_) => [0; 2],
             StepValue::Present { step, .. } => step.mailboxes(),
         }
     }
+}
+
+/// `iwl_uefi_get_step_table`: a STEP variable that cannot be read, or whose
+/// revision is not 1, leaves both mailboxes zero as an absent one does, and
+/// the firmware boots without the equalizer data. The reason is kept.
+pub fn load_step_or_ignore<'a>(
+    observation: Observation,
+    provider: &'a dyn resources::Provider,
+) -> StepConfiguration<'a> {
+    load_step(observation, provider).unwrap_or_else(|error| StepConfiguration {
+        observation,
+        value: StepValue::Ignored(error),
+    })
 }
 
 pub fn load_step<'a>(
