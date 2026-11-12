@@ -309,10 +309,11 @@ fn inputs(options: &[u8], mut volume: FileSystem) -> Result<Inputs> {
         return Err(refuse!("diagnostic options require a diagnostics build"));
     }
     // Read while the firmware's FAT driver runs; the engine reports a file
-    // it cannot use.
+    // it cannot use. An open network has none.
     let wifi_key = system
         .ssid
         .as_ref()
+        .filter(|_| !system.wifi_open)
         .and_then(|_| {
             let path = system.wifi_key.as_deref().unwrap_or(DEFAULT_WIFI_KEY);
             let path = uefi::CString16::try_from(path).ok()?;

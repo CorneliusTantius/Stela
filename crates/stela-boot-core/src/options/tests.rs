@@ -224,6 +224,36 @@ fn wifi_names_escape_spaces_and_the_key_path_defaults() {
 }
 
 #[test]
+fn an_open_network_is_a_setting_of_its_own_and_takes_no_key_file() {
+    let open = round_trip("--system --wifi Cafe --wifi-open --wifi-country DE");
+    assert!(open.wifi_open);
+    assert_eq!(open.ssid.as_deref(), Some("Cafe"));
+    assert_eq!(open.wifi_key, None, "no key file is read");
+    assert_eq!(
+        open.to_string(),
+        "--system --wifi Cafe --wifi-open --wifi-country DE"
+    );
+    // Without the setting, the default key file stays the network's key.
+    let keyed = round_trip("--system --wifi Cafe");
+    assert!(!keyed.wifi_open);
+    assert_eq!(keyed.wifi_key.as_deref(), Some(DEFAULT_WIFI_KEY));
+    assert_eq!(
+        System::parse("--system --wifi-open"),
+        Err(Error::Constraint(Constraint::WifiDependency))
+    );
+    for text in [
+        "--system --wifi Cafe --wifi-open --wifi-key \\EFI\\k",
+        "--system --wifi Cafe --wifi-key \\EFI\\stela\\wifi.key --wifi-open",
+    ] {
+        assert_eq!(
+            System::parse(text),
+            Err(Error::Constraint(Constraint::WifiOpenKey)),
+            "{text}"
+        );
+    }
+}
+
+#[test]
 fn static_ipv4_and_dns_round_trip_and_stay_in_their_subnet() {
     let text = "--system --ipv4 192.168.1.20/24 --ipv4-gateway 192.168.1.1 --dns 1.1.1.1,2606:4700:4700::1111";
     let options = round_trip(text);

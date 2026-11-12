@@ -80,6 +80,7 @@ pub mod topology;
 pub mod tsc;
 #[cfg(target_arch = "x86_64")]
 pub mod vtd;
+pub mod wifi_setting;
 pub mod work_status;
 pub mod worker_bindings;
 pub mod writeback_placement;

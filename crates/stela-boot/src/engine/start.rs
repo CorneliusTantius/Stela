@@ -2562,46 +2562,42 @@ fn start_platform(
 }
 
 /// The network `--wifi` names, with the secret of the key file the loader
-/// read, whose bytes are wiped here. A file it cannot use is reported once,
-/// without its contents, and no network is joined.
+/// read, whose bytes are wiped here, or none when `--wifi-open` sets it as
+/// open. A file it cannot use is reported once, without its contents, and
+/// no network is joined.
 fn wifi_network(
     handoff: &Handoff,
     options: &Options,
 ) -> Option<stela_drivers::net::wifi::network::Network> {
     let ssid = options.ssid.as_ref()?;
-    let path = options
-        .wifi_key
-        .as_deref()
-        .unwrap_or(stela_boot_core::options::DEFAULT_WIFI_KEY);
     let bytes = handoff.wifi_key.bytes as usize;
-    if bytes == 0 {
-        output::arguments(format_args!(
-            "HOST Wi-Fi key {path} is missing, empty or unreadable: the network is not joined\n"
-        ));
-        return None;
-    }
-    // SAFETY: the loader left the key's bytes allocated, and only this
-    // reads them.
-    let key = unsafe {
-        core::slice::from_raw_parts_mut(
-            layout::physical(handoff.wifi_key.physical) as *mut u8,
-            bytes,
-        )
+    let key: &mut [u8] = if bytes == 0 {
+        &mut []
+    } else {
+        // SAFETY: the loader left the key's bytes allocated, and only this
+        // reads them.
+        unsafe {
+            core::slice::from_raw_parts_mut(
+                layout::physical(handoff.wifi_key.physical) as *mut u8,
+                bytes,
+            )
+        }
     };
-    let secret = stela_drivers::net::wifi::network::Secret::parse(key);
+    let secret = stela_boot_core::wifi_setting::secret(options, key);
     for byte in key.iter_mut() {
         // SAFETY: a byte of the key, which nothing else reads.
         unsafe { core::ptr::write_volatile(byte, 0) };
     }
     let secret = match secret {
         Ok(secret) => secret,
-        Err(error) => {
-            output::arguments(format_args!(
-                "HOST Wi-Fi key {path} unusable ({error}): the network is not joined\n"
-            ));
+        Err(line) => {
+            output::arguments(format_args!("{line}"));
             return None;
         }
     };
+    if options.wifi_open {
+        output::arguments(format_args!("{}", stela_boot_core::wifi_setting::OPEN));
+    }
     let country = options
         .wifi_country
         .as_deref()

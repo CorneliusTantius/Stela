@@ -152,6 +152,7 @@ impl ParseState<'_> {
                     return Err(Error::DuplicateWifiKey);
                 }
             }
+            WIFI_OPEN => options.wifi_open = true,
             IPV4 => {
                 let ipv4 = value().and_then(StaticIpv4::parse).ok_or(Error::Ipv4)?;
                 if options.ipv4.replace(ipv4).is_some() {
@@ -314,7 +315,7 @@ impl ParseState<'_> {
         if options.native_rounds || options.native_shared_check || options.native_bootstrap_check {
             options.parallel = false;
         }
-        if options.ssid.is_some() && options.wifi_key.is_none() {
+        if options.ssid.is_some() && options.wifi_key.is_none() && !options.wifi_open {
             options.wifi_key = Some(String::from(DEFAULT_WIFI_KEY));
         }
         options.check()?;

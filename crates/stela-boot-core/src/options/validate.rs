@@ -43,8 +43,13 @@ fn restore(options: &System) -> Result<(), Error> {
 }
 
 fn wifi(options: &System) -> Result<(), Error> {
-    if options.ssid.is_none() && (options.wifi_key.is_some() || options.wifi_country.is_some()) {
+    if options.ssid.is_none()
+        && (options.wifi_key.is_some() || options.wifi_country.is_some() || options.wifi_open)
+    {
         return Err(Error::Constraint(Constraint::WifiDependency));
+    }
+    if options.wifi_open && options.wifi_key.is_some() {
+        return Err(Error::Constraint(Constraint::WifiOpenKey));
     }
     Ok(())
 }

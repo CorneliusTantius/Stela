@@ -42,6 +42,8 @@ pub const SCANOUT_MIRROR: &str = "--scanout-mirror";
 pub const WIFI: &str = "--wifi";
 pub const WIFI_KEY: &str = "--wifi-key";
 pub const WIFI_COUNTRY: &str = "--wifi-country";
+/// The `--wifi` network is open: joined with no key, and no key file read.
+pub const WIFI_OPEN: &str = "--wifi-open";
 pub const USB4_APPROVE: &str = "--usb4-approve";
 /// The ESP file `--wifi` reads its key from without `--wifi-key`.
 pub const DEFAULT_WIFI_KEY: &str = "\\EFI\\stela\\wifi.key";
@@ -319,8 +321,12 @@ pub struct System {
     /// line writes `%`, whitespace and control characters as `%XX`.
     pub ssid: Option<String>,
     /// The ESP file holding the network's passphrase or PSK (`--wifi-key
-    /// PATH`); `DEFAULT_WIFI_KEY` when `--wifi` is set without it.
+    /// PATH`); `DEFAULT_WIFI_KEY` when `--wifi` is set without it or
+    /// `--wifi-open`.
     pub wifi_key: Option<String>,
+    /// The network is open, wpa_supplicant's `key_mgmt=NONE` (`--wifi-open`):
+    /// no key file is read, and a protected AP of its name is never joined.
+    pub wifi_open: bool,
     /// The ISO 3166-1 alpha-2 regulatory country, uppercase
     /// (`--wifi-country XX`).
     pub wifi_country: Option<String>,
@@ -407,6 +413,7 @@ impl Default for System {
             guest_network: false,
             ssid: None,
             wifi_key: None,
+            wifi_open: false,
             wifi_country: None,
             ipv4: None,
             ipv4_gateway: None,
@@ -795,6 +802,7 @@ impl fmt::Display for System {
                 .as_deref()
                 .filter(|&path| path != DEFAULT_WIFI_KEY),
         )?;
+        line.flag(WIFI_OPEN, self.wifi_open)?;
         line.value(WIFI_COUNTRY, self.wifi_country.as_deref())?;
         line.value(IPV4, self.ipv4)?;
         line.value(IPV4_GATEWAY, self.ipv4_gateway)?;
