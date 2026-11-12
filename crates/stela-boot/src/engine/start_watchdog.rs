@@ -16,7 +16,7 @@ use core::{
 use stela_boot_core::{
     apic::{self, Apic},
     start_watchdog::{
-        Cpuid, Hardware, LVT_PERFORMANCE, Line, Plan, Started, Stopped, Watchdog, report,
+        Cpuid, Hardware, LVT_PERFORMANCE, Line, Rate, Started, Stopped, Watchdog, report,
     },
 };
 
@@ -75,8 +75,11 @@ impl Hardware for Processor {
     fn write_lvt(&mut self, value: u32) {
         self.apic.write(LVT_PERFORMANCE, value);
     }
+    fn tsc(&mut self) -> u64 {
+        stela_drivers::Clock::ticks()
+    }
     fn spin(&mut self) {
-        let ticks = (self.tsc_hz / 100_000).max(1_000);
+        let ticks = (self.tsc_hz / 10_000).max(10_000);
         let started = stela_drivers::Clock::ticks();
         while stela_drivers::Clock::ticks().wrapping_sub(started) < ticks {
             core::hint::spin_loop();
@@ -117,20 +120,31 @@ fn cpuid() -> Cpuid {
 /// Take a counter on this processor before the scan, or say once why no
 /// start is bounded.
 pub(super) fn enable(tsc_hz: u64) {
-    let plan = Plan::new(stela_drivers::probe::DEVICE_START_US, MARGIN_US, tsc_hz);
     let mut processor = Processor::here(tsc_hz);
-    match Watchdog::enable(&cpuid(), plan, &mut processor) {
+    let budget = stela_drivers::probe::DEVICE_START_US;
+    match Watchdog::enable(&cpuid(), budget, MARGIN_US, tsc_hz, &mut processor) {
         Ok(watchdog) => {
             // SAFETY: ENABLED does not name this processor yet: its NMI
             // reads no slot.
             unsafe { *WATCHDOG.0.get() = Some(watchdog) };
             ENABLED.store(gs(), Ordering::Release);
+            let plan = watchdog.plan;
+            let (counts, hz, latest) = match plan.rate {
+                Rate::Fixed(hz) => ("reference cycles at a measured", hz, ""),
+                Rate::Core(hz) => (
+                    "core cycles against a ceiling of",
+                    hz,
+                    " on a core at the TSC's rate, later on a slower one",
+                ),
+            };
             output::arguments(format_args!(
-                "HOST DEVICE WATCHDOG on: counter MSR {:#x}, a start is stopped at the \
-                 earliest {} s after it begins, later on a core slower than {} MHz\n",
+                "HOST DEVICE WATCHDOG on: counter MSR {:#x} counts {counts} {} kHz; a start is \
+                 stopped at the earliest {} s, at the latest {} s{latest}, of unhalted time \
+                 after it begins\n",
                 watchdog.counter.counter,
+                hz / 1_000,
                 plan.least_us() / 1_000_000,
-                plan.ceiling_hz / 1_000_000
+                plan.latest_us().div_ceil(1_000_000)
             ));
         }
         Err(why) => output::arguments(format_args!(
