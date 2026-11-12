@@ -3255,7 +3255,7 @@ fn reset_access_refusal_retains_stopped_owner_and_never_boots_or_retries() {
     );
     assert!(!wifi.radio().no_reset());
     assert!(!wifi.signals());
-    assert_eq!(wifi.transmit(&[1; 60]), Err(crate::LinkError::NoCarrier));
+    assert!(wifi.transmit(&[1; 60]).is_err());
     let operations = native.state.lock().unwrap().ops.clone();
     assert_eq!(
         operations
@@ -3273,6 +3273,23 @@ fn reset_access_refusal_retains_stopped_owner_and_never_boots_or_retries() {
         assert!(!wifi.carrier());
     }
     assert_eq!(native.state.lock().unwrap().ops, operations);
+    // The keeper says why once and stops: the radio is lost for good.
+    assert_eq!(wifi.radio().stage(), Standing::Lost);
+    let reason = alloc::string::String::from(wifi.lost().expect("lost for good"));
+    assert!(reason.contains("Pci"), "{reason}");
+    assert_eq!(
+        wifi.receive(),
+        Err(crate::LinkError::Adapter(reason.clone()))
+    );
+    assert_eq!(
+        wifi.transmit(&[1; 60]),
+        Err(crate::LinkError::Adapter(reason.clone()))
+    );
+    let notices: Vec<_> = core::iter::from_fn(|| wifi.take_diagnostic()).collect();
+    assert_eq!(
+        notices.iter().filter(|notice| **notice == reason).count(),
+        1
+    );
     assert!(native.domain.records.lock().unwrap().live.is_empty());
     assert_eq!(Arc::strong_count(&native.drops), retained_owners);
     assert_eq!(native.drops.load(Ordering::Relaxed), drops);

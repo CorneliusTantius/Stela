@@ -393,6 +393,9 @@ pub struct Wifi<Q: BootIo, B: BiosIo> {
     error: Option<Error>,
     /// Whether the link reported the bring-up failure.
     reported: bool,
+    /// The function stopped for good, as iwlwifi gives up on a device it
+    /// cannot stop, reset or boot again.
+    gone: bool,
     /// Where this firmware keeps its error logs.
     tables: Tables,
     restart: Restart<Q, B>,
@@ -500,6 +503,7 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
             address: Mac::default(),
             error: None,
             reported: false,
+            gone: false,
             tables: Tables::default(),
             restart,
             degraded: Vec::new(),
@@ -529,13 +533,21 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
     /// firmware left, free it and boot the function again, for the keeper to
     /// join from nothing. Whether the function is booting.
     fn restart(&mut self) -> bool {
-        if !self.error.as_ref().is_some_and(Error::restartable)
-            || !self.restart.attempts.allow(self.clock.now_us())
-            || !self
-                .stage
-                .owner()
-                .is_some_and(|owner| owner.stop_function())
+        // What no other boot can help, and a function that does not stop,
+        // end it for good; a list that ran out waits for its delay.
+        if !self.error.as_ref().is_some_and(Error::restartable) {
+            self.gone |= self.error.is_some();
+            return false;
+        }
+        if !self.restart.attempts.allow(self.clock.now_us()) {
+            return false;
+        }
+        if !self
+            .stage
+            .owner()
+            .is_some_and(|owner| owner.stop_function())
         {
+            self.gone = true;
             return false;
         }
         let stopped = core::mem::replace(&mut self.stage, Stage::Moving);
@@ -546,6 +558,7 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
                 Err(error) => {
                     self.error = Some(Error::Pci(error));
                     self.reported = false;
+                    self.gone = true;
                     self.stage = Stage::Failed {
                         owner: Box::new(stopped),
                     };
@@ -597,6 +610,7 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
                     error => Error::Restart(format!("{error}")),
                 });
                 self.reported = false;
+                self.gone = true;
                 self.stage = Stage::Failed {
                     owner: Box::new(()),
                 };

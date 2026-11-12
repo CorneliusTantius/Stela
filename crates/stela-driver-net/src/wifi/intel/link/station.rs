@@ -2252,7 +2252,8 @@ impl<Q: BootIo, B: BiosIo> Radio for Wifi<Q, B> {
         }
         self.reported = !restarted;
         self.client.events.push_back(keeper::Event::FirmwareLost);
-        Err(error)
+        // A restart that failed names its own cause.
+        Err(self.error.clone().unwrap_or(error))
     }
 
     fn take_event(&mut self) -> Option<keeper::Event> {
@@ -2260,6 +2261,9 @@ impl<Q: BootIo, B: BiosIo> Radio for Wifi<Q, B> {
     }
 
     fn stage(&self) -> Standing {
+        if self.gone {
+            return Standing::Lost;
+        }
         match &self.stage {
             Stage::Scan(_) if self.client.left => Standing::NeedsDrain,
             Stage::Scan(scan) => match scan.phase() {
