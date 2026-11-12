@@ -4,6 +4,7 @@
 //! the shared layers read instead of naming a chip. A chip's own operations
 //! (rtw88's `rtw_chip_ops`) sit in the modules [`Spec::rtw88`] names.
 use super::{identity::Chip, power::Step};
+pub mod rtl8821c;
 
 /// `rtw_chip_info`, as far as this driver reads it.
 #[derive(Debug)]
@@ -45,6 +46,12 @@ pub struct Rtw88 {
     /// `pwr_on_seq` and `pwr_off_seq`.
     pub power_on: [&'static [Step]; 2],
     pub power_off: [&'static [Step]; 2],
+    /// `rtw_pci_interface_cfg`: the cut from which `REG_HCI_MIX_CFG` takes
+    /// `BIT_PCIE_EMAC_PDN_AUX_TO_FAST_CLK`, on a chip that sets it.
+    pub pcie_aux_clock_cut: Option<u8>,
+    /// The radios `rf_tbl` loads: two on the RTL8822C, path A alone on the
+    /// RTL8821C.
+    pub rf_paths: u8,
 }
 
 /// Efuse sizes in bytes.
@@ -117,6 +124,44 @@ pub static RTL8822C: Spec = Spec {
         sys_func_en: 0xd8,
         power_on: super::power::tables::ON_8822C,
         power_off: super::power::tables::OFF_8822C,
+        pcie_aux_clock_cut: Some(3),
+        rf_paths: 2,
+    }),
+};
+
+/// `rtw8821c_hw_spec`.
+pub static RTL8821C: Spec = Spec {
+    chip: Chip::Rtl8821C,
+    devices: &[0xb821, 0xc821],
+    binding: "pci:10ec:c821",
+    firmware: "rtw88/rtw8821c_fw.bin",
+    firmware_minimum: 64,
+    refuses_test_chip: true,
+    rtw88: Some(Rtw88 {
+        efuse: EfuseSize {
+            physical: 512,
+            protected: 96,
+            logical: 512,
+        },
+        // `REG_LDO_EFUSE_CTRL + 3`'s `BIT_LDO25_EN`.
+        ldo25: (super::registers::REG_LDO_EFUSE_CTRL + 3, 1 << 7),
+        txff_bytes: 65_536,
+        rxff_bytes: 16_384,
+        driver_pages: 8,
+        csi_pages: 0,
+        page_table: PageTable {
+            high: 16,
+            normal: 16,
+            low: 16,
+            extra: 14,
+            gap: 1,
+        },
+        queue_map: QUEUE_MAP,
+        sys_func_en: 0xd8,
+        power_on: super::power::tables::ON_8821C,
+        power_off: super::power::tables::OFF_8821C,
+        pcie_aux_clock_cut: None,
+        rf_paths: 1,
     }),
 };
 
@@ -132,12 +177,13 @@ pub static RTL8852B: Spec = Spec {
 };
 
 /// Every chip, in the order PCI IDs are matched.
-pub static SPECS: [&Spec; 2] = [&RTL8822C, &RTL8852B];
+pub static SPECS: [&Spec; 3] = [&RTL8822C, &RTL8821C, &RTL8852B];
 
 impl Chip {
     pub fn spec(self) -> &'static Spec {
         match self {
             Chip::Rtl8822C => &RTL8822C,
+            Chip::Rtl8821C => &RTL8821C,
             Chip::Rtl8852B => &RTL8852B,
         }
     }
@@ -170,7 +216,9 @@ mod tests {
     #[test]
     fn the_pcie_queue_map_is_rtw88s() {
         // VO and VI normal, BE and BK low, MG extra, HI high.
-        let map = RTL8822C.rtw88.as_ref().unwrap().queue_map_register();
-        assert_eq!(map, 3 << 14 | 1 << 10 | 1 << 8 | 2 << 6 | 2 << 4);
+        for spec in [&RTL8822C, &RTL8821C] {
+            let map = spec.rtw88.as_ref().unwrap().queue_map_register();
+            assert_eq!(map, 3 << 14 | 1 << 10 | 1 << 8 | 2 << 6 | 2 << 4);
+        }
     }
 }

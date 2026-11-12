@@ -11,6 +11,7 @@ use alloc::{format, string::String};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Chip {
     Rtl8822C,
+    Rtl8821C,
     Rtl8852B,
 }
 
@@ -212,7 +213,7 @@ pub(crate) mod tests {
     }
     #[test]
     fn exact_pci_cut_and_raw_identity_are_not_replaced_by_a_marketing_name() {
-        for device in [0xc822, 0xc82f, 0xb852, 0xb85b] {
+        for device in [0xc822, 0xc82f, 0xb821, 0xc821, 0xb852, 0xb85b] {
             for cut in 0..16 {
                 let o = observed(device, cut);
                 let p = Profile::select(o).unwrap();
@@ -223,7 +224,7 @@ pub(crate) mod tests {
             }
         }
         let mut o = observed(0xb852, 1);
-        for device in [0x8852, 0xc821, 0xb822, 0xffff] {
+        for device in [0x8852, 0x8821, 0xb822, 0xffff] {
             o.device = device;
             assert_eq!(Profile::select(o), Err(IdentityError::UnsupportedPci));
         }
@@ -327,6 +328,14 @@ pub(crate) mod tests {
                 assert_eq!(staged.image.target(), chip);
                 assert!(profile.binds(&staged.image));
             }
+        }
+        // Both RTL8821CE IDs are the RTL8821C, with its own image.
+        for device in [0xb821, 0xc821] {
+            let rtl8821c = Profile::select(observed(device, 1)).unwrap();
+            assert_eq!(rtl8821c.chip(), Chip::Rtl8821C);
+            assert_eq!(rtl8821c.chip_target().hardware, "pci:10ec:c821");
+            assert_eq!(rtl8821c.firmware_name(), "rtw88/rtw8821c_fw.bin");
+            assert!(rtl8821c.stage(&catalog).is_err());
         }
         // RTL8852B's chip is another chip.
         let rtl8852b = Profile::select(observed(0xb852, 1)).unwrap();

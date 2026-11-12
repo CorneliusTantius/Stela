@@ -395,6 +395,38 @@ mod tests {
         assert_eq!(m.quarantines, 0);
     }
     #[test]
+    fn an_rtl8821c_reserves_its_own_smaller_fifo() {
+        let mut m = Model::new(0xa5);
+        let mut o = m.profile.observed();
+        o.device = 0xc821;
+        m.profile = Profile::select(o).unwrap();
+        let head_upper = m.get(REG_H2C_HEAD, 4) & 0xfffc_0000;
+        // SAFETY: the model device belongs to this test alone.
+        let g = unsafe { configure(&mut m) }.unwrap();
+        // 64 KiB of TX pages less 8 driver, 24 + 8 + 8 H2C and 4 firmware
+        // pages, and no CSI buffer.
+        assert_eq!(g.pages(), 512);
+        assert_eq!(g.reserved(), 52);
+        assert_eq!(g.csi_page(), 512);
+        assert_eq!(g.firmware_tx_page(), 508);
+        assert_eq!(g.h2c_queue_page(), 500);
+        assert_eq!(g.h2c_static_page(), 492);
+        assert_eq!(g.h2c_extra_page(), 468);
+        assert_eq!(g.boundary(), 460);
+        assert_eq!(m.get(REG_TXDMA_PQ_MAP, 2), 0xc5a0);
+        // page_table_8821c's PCIe row: high, low, normal and extra.
+        assert_eq!(m.get(REG_FIFOPAGE_INFO_1, 2), 16);
+        assert_eq!(m.get(REG_FIFOPAGE_INFO_2, 2), 16);
+        assert_eq!(m.get(REG_FIFOPAGE_INFO_3, 2), 16);
+        assert_eq!(m.get(REG_FIFOPAGE_INFO_4, 2), 14);
+        assert_eq!(m.get(REG_FIFOPAGE_INFO_5, 2), 512 - 52 - 16 * 3 - 14 - 1);
+        assert_eq!(m.get(REG_RXFF_BNDY, 4), 16384 - 256 - 1);
+        assert_eq!(m.get(REG_H2C_HEAD, 4), head_upper | 500 << 7);
+        assert_eq!(m.get(REG_H2C_TAIL, 4) & 0x3ffff, 508 << 7);
+        assert_eq!(m.get(REG_FIFOPAGE_CTRL_2, 2), 460);
+        assert_eq!(m.quarantines, 0);
+    }
+    #[test]
     fn every_uncertain_register_operation_quarantines_without_later_success() {
         let mut baseline = Model::new(11);
         // SAFETY: the model device, its pages and its domain belong to this test alone; no other

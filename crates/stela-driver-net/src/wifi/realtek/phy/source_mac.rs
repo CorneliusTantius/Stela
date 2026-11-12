@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // Copyright(c) 2018-2019 Realtek Corporation
-//! Concrete source post-download FIFO/MAC protocol/driver-info/PCI setup.
-//! Must precede the source PHY table sequence; no radio or TX admission.
+//! Concrete source post-download FIFO/MAC protocol/driver-info/PCI setup:
+//! `rtw_mac_init` with the chip's own `mac_init`. Must precede the source PHY
+//! table sequence; no radio or TX admission.
 mod data;
-use super::super::{fifo, identity::Chip};
+use super::super::{chip::rtl8821c, fifo, identity::Chip};
 use super::{Attempt, Error, Io, Report};
 use data::*;
 #[derive(Debug)]
@@ -39,14 +40,15 @@ impl Initialized {
 /// owner, policy service or IRQ framework is created by this function.
 pub unsafe fn initialize<I: Io>(io: &mut I, report: &Report) -> Result<Initialized, Error> {
     let profile = io.profile();
-    if profile.chip() != Chip::Rtl8822C || report.profile() != profile {
+    if profile.rtw88().is_none() || report.profile() != profile {
         return Err(Error::WrongProfile);
     }
     if profile.cut() > 6 {
         return Err(Error::UnsupportedCut(profile.cut()));
     }
     let cap = report.capabilities();
-    if cap.rf_phys != 2 || cap.rf_paths != 2 {
+    let paths = super::rf_paths(profile);
+    if cap.rf_phys != paths || cap.rf_paths != paths {
         return Err(Error::UnsupportedRfLayout);
     }
     // SAFETY: caller supplies the native HCI/rings/domain and
@@ -76,9 +78,33 @@ fn update32<I: Io>(a: &mut Attempt<'_, I>, r: u32, set: u32, clear: u32) -> Resu
     a.io.write32(r, (v & !clear) | set)?;
     Ok(())
 }
-/// Exact chip MAC body followed by source driver-info and PCI interface phases.
-/// The prior FIFO/HCI ordering is established by initialize, not here.
+/// The chip's MAC body followed by source driver-info and PCI interface
+/// phases. The prior FIFO/HCI ordering is established by initialize, not here.
 pub(super) fn protocol<I: Io>(a: &mut Attempt<'_, I>) -> Result<u16, Error> {
+    let filter = match a.profile.chip() {
+        Chip::Rtl8822C => mac_init_8822c(a)?,
+        Chip::Rtl8821C => {
+            rtl8821c::mac_init(a.io)?;
+            rtl8821c::RX_FILTER1
+        }
+        Chip::Rtl8852B => return Err(Error::WrongProfile),
+    };
+    // rtw_drv_info_cfg on a 3081 CPU chip.
+    a.io.write8(REG_RX_DRVINFO_SZ, 4)?;
+    let old = a.io.read8(REG_TRXFF_BNDY + 1)?;
+    a.io.write8(REG_TRXFF_BNDY + 1, (old & 0xf0) | 0xf)?;
+    update32(a, REG_RCR, BIT_APP_PHYSTS, 0)?;
+    update32(a, REG_WMAC_OPTION_FUNCTION + 4, 0, (1 << 8) | (1 << 9))?;
+    // rtw_pci_interface_cfg.
+    let cut = a.profile.rtw88().and_then(|spec| spec.pcie_aux_clock_cut);
+    if cut.is_some_and(|cut| a.profile.cut() >= cut) {
+        a.modify32(REG_HCI_MIX_CFG, BIT_PCIE_EMAC_PDN_AUX_TO_FAST_CLK, 1)?;
+    }
+    Ok(filter)
+}
+
+/// `rtw8822c_mac_init`.
+fn mac_init_8822c<I: Io>(a: &mut Attempt<'_, I>) -> Result<u16, Error> {
     macro_rules! w8 {
         ($r:expr,$v:expr) => {
             a.io.write8($r, ($v) as u8)?
@@ -232,14 +258,5 @@ pub(super) fn protocol<I: Io>(a: &mut Attempt<'_, I>) -> Result<u16, Error> {
     );
     update8(a, REG_SND_PTCL_CTRL, BIT_DIS_CHK_VHTSIGB_CRC, 0)?;
     w32!(REG_INT_MIG, WLAN_MAC_INT_MIG_CFG);
-    // 3081 chip driver-info phase after protocol, before interface setup.
-    w8!(REG_RX_DRVINFO_SZ, 4);
-    let old = a.io.read8(REG_TRXFF_BNDY + 1)?;
-    w8!(REG_TRXFF_BNDY + 1, (old & 0xf0) | 0xf);
-    update32(a, REG_RCR, BIT_APP_PHYSTS, 0)?;
-    update32(a, REG_WMAC_OPTION_FUNCTION + 4, 0, (1 << 8) | (1 << 9))?;
-    if a.profile.cut() >= 3 {
-        a.modify32(REG_HCI_MIX_CFG, BIT_PCIE_EMAC_PDN_AUX_TO_FAST_CLK, 1)?;
-    }
     Ok(WLAN_RX_FILTER1 as u16)
 }

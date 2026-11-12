@@ -375,6 +375,30 @@ mod tests {
         }
     }
     #[test]
+    fn an_rtl8821c_runs_its_own_power_flows() {
+        for device in [0xb821, 0xc821] {
+            for powered in [false, true] {
+                let mut m = Model::new(1, powered, false);
+                let mut o = m.profile.observed();
+                o.device = device;
+                m.profile = Profile::select(o).unwrap();
+                let untouched = m.get(0x1045, 1);
+                // SAFETY: the model device belongs to this test alone.
+                block_on(unsafe { on(&mut m) }).unwrap();
+                assert_eq!(m.get(REG_CR, 1), 0);
+                // trans_carddis_to_cardemu_8821c clears 0x300 and 0x301, and
+                // trans_cardemu_to_act_8821c sets 0x20 bit 3 and clears 0x7c bit 1.
+                assert_eq!(m.get(0x300, 2), 0);
+                assert_eq!(m.get(0x20, 1) & 8, 8);
+                assert_eq!(m.get(0x7c, 1) & 2, 0);
+                // The RTL8822C's own row (0x1045 bit 4) is not this chip's.
+                assert_eq!(m.get(0x1045, 1), untouched);
+                assert_eq!(m.get(REG_SYS_FUNC_EN + 1, 1) & 0xd8, 0xd8);
+                assert_eq!(m.quarantines, 0);
+            }
+        }
+    }
+    #[test]
     fn unsupported_cut_and_chip_have_no_successful_skipped_sequence() {
         for cut in 7..16 {
             let mut m = Model::new(cut, false, false);

@@ -652,6 +652,11 @@ pub async unsafe fn initialize<I: Io>(
     })
 }
 
+/// The radios of `profile`'s chip; none for a chip rtw88 does not drive.
+pub(super) fn rf_paths(profile: Profile) -> u8 {
+    profile.rtw88().map_or(0, |spec| spec.rf_paths)
+}
+
 #[cfg(test)]
 pub(super) fn control_fixture() -> (PhyInitialized, Report) {
     tests::control_fixture()
