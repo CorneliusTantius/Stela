@@ -213,7 +213,7 @@ fn phydm_and_iqk_complete_on_fresh_status() {
     drop(io);
 }
 #[test]
-fn stale_iqk_zero_publication_timeout_unwind_and_packet_failure_quarantine_both_owners() {
+fn a_stale_or_late_iqk_goes_on_and_publication_or_unwind_failures_quarantine_both_owners() {
     use super::super::firmware_control::{Control, Error as FwError, tests::bus};
     for mode in 0..4 {
         let (_, report) = super::super::phy::control_fixture();
@@ -237,17 +237,17 @@ fn stale_iqk_zero_publication_timeout_unwind_and_packet_failure_quarantine_both_
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
             control.iqk(&mut rings, &Source)
         }));
-        if mode == 0 {
-            assert_eq!(result.unwrap().unwrap_err(), FwError::StaleIqk);
-            assert_eq!(rings.pending(), 0);
-            assert!(device.lock().unwrap().packets.is_empty());
-        } else if mode == 1 {
-            assert_eq!(
-                result.unwrap().unwrap_err(),
-                FwError::Timeout { register: 0x2d9c }
-            );
+        if mode < 2 {
+            // rtw8822c_do_iqk: a done status left from an earlier IQK ends
+            // the wait at once, and a wait that runs out is only warned of.
+            let observed = result.unwrap().unwrap();
+            assert_eq!(observed.completed(), mode == 0);
+            assert_eq!(observed.baseline(), if mode == 0 { 0xaa } else { 0 });
             assert_eq!(rings.pending(), 1);
             assert_eq!(fw.lock().unwrap().get(REG_IQKSTAT, 1), 0);
+            assert!(!control.quarantined());
+            assert!(!rings.quarantined());
+            continue;
         } else if mode == 2 {
             assert_eq!(
                 result.unwrap().unwrap_err(),
@@ -352,7 +352,7 @@ fn every_iqk_control_failure_late_reset_and_regressed_clock_keep_both_owners() {
 #[test]
 #[ignore = "oracle: STELA_REALTEK_WIFI_FIRMWARE_CONTROL_ORACLE"]
 fn full_phydm_iqk_packets_and_iqk_ready_deadlines_match_unchanged_source() {
-    use super::super::firmware_control::{Control, Error as FwError, tests::bus};
+    use super::super::firmware_control::{Control, tests::bus};
     let dir = std::path::PathBuf::from(
         std::env::var("STELA_REALTEK_WIFI_FIRMWARE_CONTROL_ORACLE").unwrap(),
     );
@@ -400,10 +400,7 @@ fn full_phydm_iqk_packets_and_iqk_ready_deadlines_match_unchanged_source() {
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
         // other driver, worker or DMA touches them.
         let result = unsafe { control.iqk(&mut rings, &Source) };
-        assert_eq!(result.is_ok(), h[0] <= 16, "IQK {}", h[0]);
-        if h[0] > 16 {
-            assert_eq!(result.unwrap_err(), FwError::Timeout { register: 0x2d9c });
-        }
+        assert_eq!(result.unwrap().completed(), h[0] <= 16, "IQK {}", h[0]);
         assert_eq!(&device.lock().unwrap().packets[0][48..80], packet);
         let mut actual: Vec<_> = fw
             .lock()

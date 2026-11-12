@@ -28,7 +28,6 @@ pub enum Error {
     MailboxTimeout { mailbox: u8 },
     Timeout { register: u32 },
     StaleRfk,
-    StaleIqk,
     Clock,
 }
 impl From<io::Error> for Error {
@@ -67,12 +66,14 @@ impl RfkFinishObservation {
         self.status
     }
 }
-/// Cold initial IQK's new AA observation after a non-AA baseline and real DMA
-/// command publication. Firmware DMA/key/radio/policy retirement is separate.
+/// What `rtw8822c_do_iqk` saw of one IQK after its command's publication:
+/// the status before, and whether firmware reported done within 300 ms.
+/// Firmware DMA/key/radio/policy retirement is separate.
 #[derive(Debug)]
 pub struct InitialIqkObservation {
     baseline: u8,
     status: u8,
+    completed: bool,
 }
 impl InitialIqkObservation {
     pub fn baseline(&self) -> u8 {
@@ -80,6 +81,10 @@ impl InitialIqkObservation {
     }
     pub fn status(&self) -> u8 {
         self.status
+    }
+    /// False where rtw88 warns "failed to poll iqk status bit" and goes on.
+    pub fn completed(&self) -> bool {
+        self.completed
     }
 }
 /// Same kept native Io, moved here after bootstrap; no second BAR/config,
@@ -336,9 +341,10 @@ impl<I: Io> Control<I> {
         })();
         self.finish(result)
     }
-    /// Publish and observe the one cold initial source clear=1/segment=0 IQK.
-    /// Requires a non-AA baseline; no prior completion or DMA consumer index
-    /// can satisfy this command. A post-expiry final fresh AA is source-valid.
+    /// `rtw8822c_do_iqk`: publish the clear=1/segment=0 IQK and wait up to
+    /// 300 ms for firmware's done status. As in rtw88, a status still done
+    /// from an earlier IQK satisfies the wait, and a wait that runs out is a
+    /// shortfall the caller reports, not a failure of the device.
     ///
     /// # Safety
     /// Rings and this control are the same requester/firmware epoch,
@@ -366,24 +372,27 @@ impl<I: Io> Control<I> {
         let result = (|| {
             self.verify()?;
             let baseline = self.io()?.read8(REG_RPT_CIP)?;
-            if baseline == 0xaa {
-                return Err(Error::StaleIqk);
-            }
             // SAFETY: caller holds real same native rings/control/permission;
             // status was sampled before this exact command publication.
             unsafe { packet.rings.initial_iqk_command(source) }?;
             self.published = true;
+            let mut status = baseline;
             let poll = self.poll(REG_RPT_CIP, 300000, 20000, |io| {
-                Ok(io.read8(REG_RPT_CIP)? == 0xaa)
+                status = io.read8(REG_RPT_CIP)?;
+                Ok(status == 0xaa)
             });
             // Source clears REG_IQKSTAT after the poll even for a pure timeout.
-            // Any error remains terminal; this is never rollback/stop proof.
             self.io()?.write8(REG_IQKSTAT, 0)?;
-            poll?;
+            let completed = match poll {
+                Ok(()) => true,
+                Err(Error::Timeout { .. }) => false,
+                Err(error) => return Err(error),
+            };
             self.verify()?;
             Ok(InitialIqkObservation {
                 baseline,
-                status: 0xaa,
+                status,
+                completed,
             })
         })();
         packet.done = result.is_ok();
