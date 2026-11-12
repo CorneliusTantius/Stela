@@ -52,7 +52,7 @@ use crate::{
     },
 };
 use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
-use core::fmt;
+use core::{fmt, task::Poll};
 use stela_driver_base::{entropy::Entropy, stepped::Stepped};
 
 mod station;
@@ -147,8 +147,11 @@ type Booting<Q> = Stepped<'static, Result<RomBoot<'static, Q>, attach::AttachErr
 pub(super) enum Recovering<Q: BootIo> {
     /// The failed firmware's function is still to be stopped.
     Stop,
-    /// The stopped function wakes and its ROM starts.
-    Boot(Booting<Q>),
+    /// The stopped function resets, its owner kept until the reset ends.
+    Reset(Stepped<'static, Result<bool, crate::block::BlockError>>),
+    /// The stopped function wakes and its ROM starts; whether the boot is
+    /// the first without the reset it asked for.
+    Boot(Booting<Q>, bool),
     /// The new firmware comes up, pass by pass.
     Bringing,
 }
@@ -239,11 +242,18 @@ trait Kept {
     /// Stop the device under this owner, which then holds nothing the device
     /// can reach. Whether it stopped.
     fn stop_function(&mut self) -> bool;
+    /// The stop's master stop and reset a step a call, its settle a minimum
+    /// interval, for [`Self::stop_function`] to finish without waiting.
+    /// Whether the function went quiet, once it did or failed to.
+    fn quiesce_step(&mut self) -> Poll<bool>;
 }
 
 impl Kept for () {
     fn stop_function(&mut self) -> bool {
         false
+    }
+    fn quiesce_step(&mut self) -> Poll<bool> {
+        Poll::Ready(false)
     }
 }
 
@@ -251,11 +261,17 @@ impl<T: Kept> Kept for Box<T> {
     fn stop_function(&mut self) -> bool {
         self.as_mut().stop_function()
     }
+    fn quiesce_step(&mut self) -> Poll<bool> {
+        self.as_mut().quiesce_step()
+    }
 }
 
 impl<T: Kept, U> Kept for (T, U) {
     fn stop_function(&mut self) -> bool {
         self.0.stop_function()
+    }
+    fn quiesce_step(&mut self) -> Poll<bool> {
+        self.0.quiesce_step()
     }
 }
 
@@ -264,6 +280,11 @@ macro_rules! kept {
         impl<$($bounds)*> Kept for $owner {
             fn stop_function(&mut self) -> bool {
                 self.stop().is_ok()
+            }
+            fn quiesce_step(&mut self) -> Poll<bool> {
+                // An owner whose ROM boot moved on stops it whole.
+                self.rom_mut()
+                    .map_or(Poll::Ready(true), |rom| rom.quiesce_step().map(|quiet| quiet.is_ok()))
             }
         }
     )+};
@@ -292,6 +313,10 @@ kept!(
 impl<Q: BootIo, B: BiosIo> Kept for Stage<Q, B> {
     fn stop_function(&mut self) -> bool {
         self.owner().is_some_and(|owner| owner.stop_function())
+    }
+    fn quiesce_step(&mut self) -> Poll<bool> {
+        self.owner()
+            .map_or(Poll::Ready(false), |owner| owner.quiesce_step())
     }
 }
 
@@ -337,6 +362,16 @@ impl Attempts {
     /// same.
     fn resets(&self) -> bool {
         self.count > 3
+    }
+
+    /// Spend a recovery's attempt at `now`, which the keeper paces: only the
+    /// count [`Self::resets`] reads.
+    fn spend(&mut self, now: u64) {
+        if now.saturating_sub(self.last_us) >= RESTART_OK_US {
+            self.count = 0;
+        }
+        self.count += 1;
+        self.last_us = now;
     }
 
     /// Whether to boot again at `now`, spending an attempt.
@@ -414,6 +449,8 @@ pub struct Wifi<Q: BootIo, B: BiosIo> {
     gone: bool,
     /// A recovery under way, once the guest runs.
     pub(super) recovery: Option<Recovering<Q>>,
+    /// A radio switched off whose stop is settling, a step a poll.
+    pub(super) switching_off: bool,
     /// Where this firmware keeps its error logs.
     tables: Tables,
     restart: Restart<Q, B>,
@@ -523,6 +560,7 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
             reported: false,
             gone: false,
             recovery: None,
+            switching_off: false,
             tables: Tables::default(),
             restart,
             degraded: Vec::new(),
@@ -697,47 +735,102 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
         self.error = None;
         self.reported = false;
         self.client = station::Client::new(unassigned());
+        // Said with the boot's other degradations, once the NVM names the
+        // station that reports them.
+        self.degraded.clear();
         if no_reset {
-            self.client
-                .unsupported("a reset of this function: it boots again without one");
+            self.degraded
+                .push("a reset of this function: it boots again without one");
         }
         true
     }
 
-    /// A recovery's stop: the failed firmware's function stops, freeing
-    /// what it held, as the first part of `iwl_trans_restart_wk`, and its
-    /// boot is ready to step. A function that does not stop is lost for
-    /// good; one already stopped, or switched off, has nothing to stop.
+    /// A recovery's stop, a step a call: the failed firmware's function
+    /// quiesces, its reset's settle a minimum interval, then stops, freeing
+    /// what it held, as the first part of `iwl_trans_restart_wk`. A function
+    /// that does not stop is lost for good; one already stopped, or switched
+    /// off, has nothing to stop. Then the function resets when the list or
+    /// a TOP fatal error asks for it, as [`Self::restart`] does.
     fn recovery_stop(&mut self) -> Result<(), String> {
-        if let Some(owner) = self.stage.owner()
-            && !owner.stop_function()
-        {
-            self.gone = true;
-            self.recovery = None;
-            return Err(String::from("the function did not stop"));
+        let failed = if let Some(owner) = self.stage.owner() {
+            let Poll::Ready(quiet) = owner.quiesce_step() else {
+                return Ok(());
+            };
+            if !(quiet && owner.stop_function()) {
+                self.gone = true;
+                self.recovery = None;
+                return Err(String::from("the function did not stop"));
+            }
+            true
+        } else {
+            false
+        };
+        // A radio switched on again spends no attempt of the list.
+        if failed {
+            self.restart.attempts.spend(self.clock.now_us());
         }
-        self.stage = Stage::Moving;
-        self.recovery = Some(Recovering::Boot(self.booting()));
+        let wanted = (failed && self.restart.attempts.resets())
+            || core::mem::take(&mut self.restart.top_failed);
+        match wanted
+            .then(|| self.restart.io.reset_function_in_steps())
+            .flatten()
+        {
+            Some(reset) => self.recovery = Some(Recovering::Reset(Stepped::new(reset))),
+            None => self.boot_next(wanted),
+        }
         Ok(())
     }
 
-    /// One step of a recovery's wake and ROM start. Booting again needs no
-    /// function reset: one a TOP fatal error asked for is left out, said
-    /// once. A failed boot holds no firmware: the next attempt boots again.
+    /// The stopped function's boot is next; `no_reset` when it goes without
+    /// the reset it asked for.
+    fn boot_next(&mut self, no_reset: bool) {
+        let first = no_reset && !core::mem::replace(&mut self.restart.no_reset, true);
+        self.stage = Stage::Moving;
+        self.recovery = Some(Recovering::Boot(self.booting(), first));
+    }
+
+    /// One step of a recovery's function reset. A function without one
+    /// boots again, saying so once; a reset that fails leaves the function
+    /// lost for good, its stopped owner kept.
+    fn recovery_reset(&mut self) -> Result<(), String> {
+        let Some(Recovering::Reset(reset)) = &mut self.recovery else {
+            return Ok(());
+        };
+        let Poll::Ready(reset) = reset.step() else {
+            return Ok(());
+        };
+        match reset {
+            Ok(did_reset) => {
+                self.boot_next(!did_reset);
+                Ok(())
+            }
+            Err(error) => {
+                let stopped = core::mem::replace(&mut self.stage, Stage::Moving);
+                self.stage = Stage::Failed {
+                    owner: Box::new(stopped),
+                };
+                self.gone = true;
+                self.recovery = None;
+                Err(format!("{}", Error::Pci(error)))
+            }
+        }
+    }
+
+    /// One step of a recovery's wake and ROM start. A failed boot holds no
+    /// firmware: the next attempt boots again.
     fn recovery_boot(&mut self) -> Result<bool, String> {
-        let Some(Recovering::Boot(booting)) = &mut self.recovery else {
+        let Some(Recovering::Boot(booting, first)) = &mut self.recovery else {
             return Ok(false);
         };
-        let core::task::Poll::Ready(boot) = booting.step() else {
+        let first = *first;
+        let Poll::Ready(boot) = booting.step() else {
             return Ok(false);
         };
-        let wanted = core::mem::take(&mut self.restart.top_failed);
-        let first = wanted && !core::mem::replace(&mut self.restart.no_reset, true);
         if self.booted(boot, first) {
             self.recovery = Some(Recovering::Bringing);
             return Ok(true);
         }
-        self.recovery = Some(Recovering::Boot(self.booting()));
+        self.recovery = Some(Recovering::Boot(self.booting(), first));
         self.gone = false;
         self.reported = false;
         let error = self.error.take();
@@ -764,16 +857,26 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
     /// the switch's. Whether the radio went off now.
     fn switched_off(&mut self) -> bool {
         // A failure already reported is left as it is, read no more.
-        if matches!(
-            self.stage,
-            Stage::Rom(_) | Stage::Pnvm(_) | Stage::SwitchedOff | Stage::Moving
-        ) || (self.reported && matches!(self.stage, Stage::Failed { .. }))
-            || self.switch() != Some(false)
-            || !self
-                .stage
-                .owner()
-                .is_some_and(|owner| owner.stop_function())
+        if !self.switching_off
+            && (matches!(
+                self.stage,
+                Stage::Rom(_) | Stage::Pnvm(_) | Stage::SwitchedOff | Stage::Moving
+            ) || (self.reported && matches!(self.stage, Stage::Failed { .. }))
+                || self.switch() != Some(false))
         {
+            return false;
+        }
+        // The stop steps: nothing else reaches the function while it settles.
+        self.switching_off = true;
+        let Some(owner) = self.stage.owner() else {
+            self.switching_off = false;
+            return false;
+        };
+        let Poll::Ready(quiet) = owner.quiesce_step() else {
+            return false;
+        };
+        self.switching_off = false;
+        if !(quiet && owner.stop_function()) {
             return false;
         }
         self.stage = Stage::SwitchedOff;
@@ -861,9 +964,13 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
         self.phase()
     }
 
-    /// The ROM boot the current owner nests, for device models.
+    /// The ROM boot the current owner nests, for device models; none while
+    /// a recovery holds a stopped owner through its stop and reset.
     #[cfg(test)]
     pub(crate) fn rom(&self) -> Option<&RomBoot<'static, Q>> {
+        if matches!(self.recovery, Some(Recovering::Stop | Recovering::Reset(_))) {
+            return None;
+        }
         match &self.stage {
             Stage::Rom(owner) | Stage::Pnvm(owner) => owner.rom(),
             Stage::Nvm(owner) => owner.rom(),
@@ -915,7 +1022,7 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
                     // SAFETY: forwarded from `poll`.
                     let begun = unsafe { boot.begin_pnvm(self.firmware, self.observations, pages) };
                     if begun.is_ok() {
-                        self.degraded = degraded(&boot);
+                        self.degraded.extend(degraded(&boot));
                     }
                     match begun {
                         Ok(PnvmProgress::Skipped | PnvmProgress::Observed) => Ok(self.nvm(*boot)),

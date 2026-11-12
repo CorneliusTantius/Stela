@@ -42,6 +42,9 @@ pub(super) struct ModelState {
     /// Bits of a register that never take a write, as a function that
     /// stopped answering leaves them.
     pub(super) stuck: Option<(u32, u32)>,
+    /// The function gives a stepped reset: [`BootIo::reset_function`] after
+    /// a 100 ms minimum interval.
+    pub(super) stepped_reset: bool,
 }
 impl Default for ModelState {
     fn default() -> Self {
@@ -57,6 +60,7 @@ impl Default for ModelState {
             reset_error: None,
             timed: false,
             stuck: None,
+            stepped_reset: false,
         }
     }
 }
@@ -171,5 +175,30 @@ unsafe impl BootIo for Model {
             return Err(error.clone());
         }
         Ok(!state.no_reset)
+    }
+    fn reset_function_in_steps(&mut self) -> Option<ResetSteps> {
+        if !self.state.lock().unwrap().stepped_reset {
+            return None;
+        }
+        let mut model = self.clone();
+        Some(alloc::boxed::Box::pin(async move {
+            let unavailable = |_| {
+                crate::block::BlockError::Config(crate::bus::pci::ConfigError::before_effect(
+                    crate::bus::pci::ConfigFailure::UnqualifiedControl,
+                ))
+            };
+            match Csr::begin_interval(&mut model, 100_000).map_err(unavailable)? {
+                Some(interval) => {
+                    while !interval
+                        .elapsed()
+                        .map_err(crate::block::BlockError::PciPower)?
+                    {
+                        stela_driver_base::stepped::yield_now().await;
+                    }
+                }
+                None => Csr::delay_us(&mut model, 100_000).map_err(unavailable)?,
+            }
+            model.reset_function()
+        }))
     }
 }

@@ -3423,9 +3423,9 @@ fn starting() -> stela_driver_base::budget::Budget {
 /// the next, as between two polls.
 fn bounded_pass(wifi: &mut Station<Model, ClockBios>) {
     use crate::wifi::connection::keeper::RECOVERY_STEP_US;
-    // With minimum intervals, no wait of the wake or the ROM start blocks a
-    // pass; the stop's 5 ms settle is the longest left.
-    const LONGEST_WAIT_US: u64 = 6_000;
+    // With minimum intervals, no wait of the stop, the reset, the wake or
+    // the ROM start blocks a pass.
+    const LONGEST_WAIT_US: u64 = 1_000;
     const { assert!(LONGEST_WAIT_US < RECOVERY_STEP_US) };
     let start = Clock::ticks();
     wifi.carrier();
@@ -3514,6 +3514,53 @@ fn a_firmware_error_after_the_start_recovers_in_bounded_steps() {
         "no function reset"
     );
 }
+/// Once the guest runs and the list asks for a function reset, the reset
+/// runs in the keeper's bounded steps between the stop and the boot, its
+/// waits and the stop's settle minimum intervals; a function without a
+/// stepped reset boots again without one, said once.
+#[test]
+fn a_recovery_the_list_asks_to_reset_resets_the_function_in_bounded_steps() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    let recover = |stepped_reset: bool| {
+        let native = Native::default();
+        native.state.lock().unwrap().stepped_reset = stepped_reset;
+        let (mut wifi, mut device) = connect(&native, false);
+        wifi.radio_mut().spend_restarts(3);
+        let _clock = crate::test_clock::virtualize();
+        native.state.lock().unwrap().timed = true;
+        native.state.lock().unwrap().registers.insert(8, 1 << 25);
+        let operations = native.state.lock().unwrap().ops.len();
+        assert!(!wifi.carrier());
+        assert!(
+            recovered(&native, &mut wifi, &mut device),
+            "{:?} {:?}",
+            wifi.radio().phase(),
+            wifi.radio().error()
+        );
+        assert_eq!(wifi.lost(), None);
+        // The keeper takes the radio's events on its next pass.
+        wifi.carrier();
+        let notices: Vec<_> = core::iter::from_fn(|| wifi.take_diagnostic()).collect();
+        let without = notices
+            .iter()
+            .filter(|notice| notice.contains("it boots again without one"))
+            .count();
+        let state = native.state.lock().unwrap();
+        let ops = &state.ops[operations..];
+        let resets = ops.iter().filter(|op| matches!(op, Op::Reset)).count();
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, Op::Delay(5000) | Op::Delay(100_000))),
+            "the settles are intervals"
+        );
+        (resets, without)
+    };
+    assert_eq!(recover(true), (1, 0));
+    assert_eq!(recover(false), (0, 1));
+}
+
 #[test]
 fn only_the_last_restarts_reset_the_function_and_one_without_a_reset_still_boots() {
     if crate::test_process::isolate_model() {

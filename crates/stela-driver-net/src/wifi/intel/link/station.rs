@@ -2238,12 +2238,22 @@ impl<Q: BootIo, B: BiosIo> Radio for Wifi<Q, B> {
     }
 
     fn service(&mut self) -> Result<(), Error> {
-        // A recovery's stop and boot run in its own steps.
+        // A recovery's stop, reset and boot run in its own steps.
         if matches!(
             self.recovery,
-            Some(super::Recovering::Stop | super::Recovering::Boot(_))
+            Some(
+                super::Recovering::Stop | super::Recovering::Reset(_) | super::Recovering::Boot(..)
+            )
         ) {
             return Ok(());
+        }
+        // A switched-off radio's stop settling is left alone until it ends.
+        if self.switching_off {
+            if !self.switched_off() {
+                return Ok(());
+            }
+            self.client.events.push_back(keeper::Event::FirmwareLost);
+            return Err(Error::SwitchedOff);
         }
         if self.error.is_none() && self.died() {
             let log = self.tables.read(&self.restart.io, self.family);
@@ -2291,7 +2301,8 @@ impl<Q: BootIo, B: BiosIo> Radio for Wifi<Q, B> {
         match &self.recovery {
             None => return Err(String::from("iwlwifi: no recovery under way")),
             Some(Recovering::Stop) => self.recovery_stop()?,
-            Some(Recovering::Boot(_)) => {
+            Some(Recovering::Reset(_)) => self.recovery_reset()?,
+            Some(Recovering::Boot(..)) => {
                 self.recovery_boot()?;
             }
             Some(Recovering::Bringing) => {

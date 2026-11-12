@@ -69,6 +69,8 @@ const LTR_LAST_MESSAGE: u32 = 0xdc;
 const FUNC_SCRATCH: u32 = 0x2c;
 const FUNC_SCRATCH_INIT: u32 = 0x01010101;
 const ROM_START: u32 = 1 << 7;
+/// `iwl_trans_pcie_sw_reset`'s settle after the reset.
+const SETTLE_US: u32 = 5000;
 const HBUS_TARG_WRPTR: u32 = 0x460;
 use super::interrupts::{self, HW_CAUSES as MSIX_HW_CAUSES};
 const IML_CAUSE: u32 = 1 << 1;
@@ -104,11 +106,27 @@ pub unsafe trait BootIo: Csr + Clone + 'static {
     /// no reset; `Err` preserves access/ownership failure and never authorizes
     /// another boot or an unchanged-state retry.
     fn reset_function(&mut self) -> Result<bool, crate::block::BlockError>;
+    /// [`Self::reset_function`] as stepped work, for a reset while the guest
+    /// runs. `None` when this function has none to give, and is then booted
+    /// again without it.
+    fn reset_function_in_steps(&mut self) -> Option<ResetSteps> {
+        None
+    }
 }
+/// A function reset run a step per poll; its output is
+/// [`BootIo::reset_function`]'s.
+pub type ResetSteps = core::pin::Pin<
+    alloc::boxed::Box<dyn core::future::Future<Output = Result<bool, crate::block::BlockError>>>,
+>;
 /// What keeps the PCI function behind [`NativeBootIo`].
 pub trait FunctionOwner {
     /// [`BootIo::reset_function`], the claim and BAR mapping kept throughout.
     fn reset(&self) -> Result<bool, crate::block::BlockError>;
+    /// [`Self::reset`] a step at a time, holding the owner until it ends.
+    /// `None`, the default, when the owner has no stepped reset.
+    fn reset_in_steps(self: Rc<Self>) -> Option<ResetSteps> {
+        None
+    }
 }
 #[derive(Clone)]
 pub struct NativeBootIo {
@@ -186,6 +204,9 @@ unsafe impl BootIo for NativeBootIo {
     }
     fn reset_function(&mut self) -> Result<bool, crate::block::BlockError> {
         self.owner.reset()
+    }
+    fn reset_function_in_steps(&mut self) -> Option<ResetSteps> {
+        self.owner.clone().reset_in_steps()
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -377,6 +398,8 @@ pub struct RomBoot<'a, Q: BootIo> {
     /// Each wait of the ROM start is a minimum interval polled a step at a
     /// time, when the delay source gives one.
     stepped: bool,
+    /// The stop's settle after the reset, while [`Self::quiesce_step`] waits.
+    settling: Option<alloc::boxed::Box<dyn crate::bus::pci::power::Interval>>,
 }
 struct Ax210Memory<'a> {
     scratch: Chunk,
@@ -690,6 +713,7 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
             coexistence: coexistence::Coexistence::new(),
             state: State::Prepared,
             stepped,
+            settling: None,
         };
         boot.publish().await?;
         boot.stepped = false;
@@ -1336,23 +1360,64 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
     /// Source bus-master stop acknowledgement plus reset, followed by
     /// invalidations. Failed acknowledgements never free device-visible pages;
     /// failed invalidations remain retryable with the owner kept.
+    /// [`Self::stop`]'s master stop and reset a step at a time: the settle
+    /// after the reset is a minimum interval each call polls, when the delay
+    /// source gives one. Ready once the function is quiescent, for
+    /// [`Self::stop`] to free what it held without waiting again.
+    pub fn quiesce_step(&mut self) -> core::task::Poll<Result<(), Error>> {
+        use core::task::Poll;
+        if matches!(self.state, State::Quiescent | State::Stopped) {
+            return Poll::Ready(Ok(()));
+        }
+        let begun = match self.settling.take() {
+            Some(interval) => Ok(Some(interval)),
+            None => self
+                .reset_master()
+                .and_then(|()| self.io().begin_interval(SETTLE_US).map_err(Error::Access)),
+        };
+        let settled = match begun {
+            Err(error) => Err(error),
+            Ok(None) => self.io().delay_us(SETTLE_US).map_err(Error::Access),
+            Ok(Some(interval)) => match interval.elapsed() {
+                Ok(true) => Ok(()),
+                Ok(false) => {
+                    self.settling = Some(interval);
+                    return Poll::Pending;
+                }
+                Err(error) => Err(Error::Access(power::AccessError::Minimum(error))),
+            },
+        };
+        Poll::Ready(settled.and_then(|()| self.settled()))
+    }
+    /// `iwl_pcie_apm_stop_master` and `iwl_trans_pcie_sw_reset`: interrupts
+    /// off, bus mastering stopped and acknowledged, then the reset, whose
+    /// settle the caller waits.
+    fn reset_master(&mut self) -> Result<(), Error> {
+        self.state = State::Poisoned;
+        self.write(12, 0)?;
+        if self.read_register(12)? != 0 {
+            return Err(Error::Rejected { register: 12 });
+        }
+        self.set(0x20, 0x200)?;
+        self.poll_register(0x20, 0x100, 0x100, 100)?;
+        self.set(0x20, 0x80)
+    }
+    /// After the reset settled: INIT_DONE cleared, the function quiescent.
+    fn settled(&mut self) -> Result<(), Error> {
+        let gp = self.read_register(0x24)?;
+        self.write(0x24, gp & !4)?;
+        self.state = State::Quiescent;
+        Ok(())
+    }
     pub fn stop(&mut self) -> Result<(), Error> {
         if self.state == State::Stopped {
             return Err(Error::State);
         }
         if self.state != State::Quiescent {
-            self.state = State::Poisoned;
-            self.write(12, 0)?;
-            if self.read_register(12)? != 0 {
-                return Err(Error::Rejected { register: 12 });
-            }
-            self.set(0x20, 0x200)?;
-            self.poll_register(0x20, 0x100, 0x100, 100)?;
-            self.set(0x20, 0x80)?;
-            self.io().delay_us(5000)?;
-            let gp = self.read_register(0x24)?;
-            self.write(0x24, gp & !4)?;
-            self.state = State::Quiescent;
+            self.settling = None;
+            self.reset_master()?;
+            self.io().delay_us(SETTLE_US)?;
+            self.settled()?;
         }
         // SAFETY: an interrupt only wakes a core, the exclusive polling owner
         // has no queued workers and master-disable/reset acknowledged all DMA.
@@ -1484,6 +1549,98 @@ mod rom {
     impl<'a, Q: BootIo, B: BiosIo, O: CountryIo + OsPolicy> Ax200Coexistence<'a, Q, B, O> {
         pub(crate) fn rom(&self) -> Option<&RomBoot<'a, Q>> {
             self.queue.rom()
+        }
+    }
+}
+
+/// The ROM boot every owner nests, which a stepped stop quiesces before the
+/// owner stops.
+mod rom_mut {
+    use super::*;
+    use crate::wifi::{intel::radio::bios::service::BiosIo, regulatory::OsPolicy};
+    impl<'a, Q: BootIo> RomBoot<'a, Q> {
+        pub(crate) fn rom_mut(&mut self) -> Option<&mut RomBoot<'a, Q>> {
+            Some(self)
+        }
+    }
+    impl<'a, Q: BootIo> UnifiedNvm<'a, Q> {
+        pub(crate) fn rom_mut(&mut self) -> Option<&mut RomBoot<'a, Q>> {
+            Some(&mut self.boot)
+        }
+    }
+    impl<'a, Q: BootIo> ColdRadio<'a, Q> {
+        pub(crate) fn rom_mut(&mut self) -> Option<&mut RomBoot<'a, Q>> {
+            self.initialized.rom_mut()
+        }
+    }
+    impl<'a, Q: BootIo, B: BiosIo> LariRadio<'a, Q, B> {
+        pub(crate) fn rom_mut(&mut self) -> Option<&mut RomBoot<'a, Q>> {
+            self.radio.rom_mut()
+        }
+    }
+    impl<'a, Q: BootIo, B: BiosIo> Ax200Setup<'a, Q, B> {
+        pub(crate) fn rom_mut(&mut self) -> Option<&mut RomBoot<'a, Q>> {
+            self.lari.rom_mut()
+        }
+    }
+    impl<'a, Q: BootIo, B: BiosIo> Ax200Mcc<'a, Q, B> {
+        pub(crate) fn rom_mut(&mut self) -> Option<&mut RomBoot<'a, Q>> {
+            self.setup.rom_mut()
+        }
+    }
+    impl<'a, Q: BootIo, B: BiosIo> Ax200ScanConfiguration<'a, Q, B> {
+        pub(crate) fn rom_mut(&mut self) -> Option<&mut RomBoot<'a, Q>> {
+            self.mcc.rom_mut()
+        }
+    }
+    impl<'a, Q: BootIo, B: BiosIo> Ax200BoardPolicy<'a, Q, B> {
+        pub(crate) fn rom_mut(&mut self) -> Option<&mut RomBoot<'a, Q>> {
+            self.scan.rom_mut()
+        }
+    }
+    impl<'a, Q: BootIo, B: BiosIo, O: CountryIo> Ax200Country<'a, Q, B, O> {
+        pub(crate) fn rom_mut(&mut self) -> Option<&mut RomBoot<'a, Q>> {
+            self.board.rom_mut()
+        }
+    }
+    impl<'a, Q: BootIo, B: BiosIo, O: CountryIo> Ax200Mac<'a, Q, B, O> {
+        pub(crate) fn rom_mut(&mut self) -> Option<&mut RomBoot<'a, Q>> {
+            self.country.rom_mut()
+        }
+    }
+    impl<'a, Q: BootIo, B: BiosIo, O: CountryIo + OsPolicy> Ax200Scan<'a, Q, B, O> {
+        pub(crate) fn rom_mut(&mut self) -> Option<&mut RomBoot<'a, Q>> {
+            self.mac.rom_mut()
+        }
+    }
+    impl<'a, Q: BootIo, B: BiosIo, O: CountryIo + OsPolicy> Ax200Phy<'a, Q, B, O> {
+        pub(crate) fn rom_mut(&mut self) -> Option<&mut RomBoot<'a, Q>> {
+            self.scan.rom_mut()
+        }
+    }
+    impl<'a, Q: BootIo, B: BiosIo, O: CountryIo + OsPolicy> Ax200TransmitPower<'a, Q, B, O> {
+        pub(crate) fn rom_mut(&mut self) -> Option<&mut RomBoot<'a, Q>> {
+            self.phy.rom_mut()
+        }
+    }
+    impl<'a, Q: BootIo, B: BiosIo, O: CountryIo + OsPolicy> Ax200Binding<'a, Q, B, O> {
+        pub(crate) fn rom_mut(&mut self) -> Option<&mut RomBoot<'a, Q>> {
+            self.power.rom_mut()
+        }
+    }
+    impl<'a, Q: BootIo, B: BiosIo, O: CountryIo + OsPolicy> Ax200LegacyPeer<'a, Q, B, O> {
+        pub(crate) fn rom_mut(&mut self) -> Option<&mut RomBoot<'a, Q>> {
+            self.binding.rom_mut()
+        }
+    }
+    impl<'a, Q: BootIo, B: BiosIo, O: CountryIo + OsPolicy> Ax200ManagementQueue<'a, Q, B, O> {
+        pub(crate) fn rom_mut(&mut self) -> Option<&mut RomBoot<'a, Q>> {
+            self.peer.as_mut()?.rom_mut()
+        }
+    }
+    impl<'a, Q: BootIo, B: BiosIo, O: CountryIo + OsPolicy> Ax200Coexistence<'a, Q, B, O> {
+        pub(crate) fn rom_mut(&mut self) -> Option<&mut RomBoot<'a, Q>> {
+            self.queue.rom_mut()
         }
     }
 }
