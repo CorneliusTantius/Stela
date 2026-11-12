@@ -495,6 +495,48 @@ pub fn claims_identity(function: &crate::bus::pci::Identity) -> bool {
         || usb::handoff::Kind::of(function.class).is_some()
 }
 
+/// The driver a start of `function` runs, as a stop names it: the first
+/// [`claims_identity`] match, then a native attachment's.
+pub fn driver_name(function: &crate::bus::pci::Identity) -> &'static str {
+    if virtio::matches_identity(function) {
+        "virtio-blk"
+    } else if input::virtio::matches_identity(function) {
+        "virtio-input"
+    } else if net::virtio::matches_identity(function) {
+        "virtio-net"
+    } else if net::igc::matches_identity(function) {
+        "igc"
+    } else if net::e1000e::matches_identity(function) || pch::matches_identity(function) {
+        "e1000e"
+    } else if net::igb::matches_identity(function) {
+        "igb"
+    } else if net::alx::matches_identity(function) {
+        "alx"
+    } else if net::atl1c::matches_identity(function) {
+        "atl1c"
+    } else if realtek::matches_identity(function) {
+        "realtek"
+    } else if crate::audio::hda::pci::identify_identity(function).is_ok() {
+        "HD Audio"
+    } else if function.class == nvme::CLASS {
+        "NVMe"
+    } else if ahci::matches_identity(function) {
+        "AHCI"
+    } else if sdhci::matches_identity(function) {
+        "SDHCI"
+    } else if rtsx::matches_identity(function) {
+        "rtsx"
+    } else if function.class == xhci::CLASS {
+        "xHCI"
+    } else if usb::handoff::Kind::of(function.class).is_some() {
+        "USB legacy handoff"
+    } else if let Some(kind) = native::Kind::of_identity(function) {
+        kind.driver()
+    } else {
+        "PCI function"
+    }
+}
+
 /// Why the disks behind storage controller `function` are out of reach of
 /// Stela's drivers, for the disk chooser to refuse them before boot
 /// services end rather than the boot failing after; `None` when a driver
@@ -1442,6 +1484,10 @@ pub trait Observer {
     fn starting(&mut self, _function: &crate::bus::pci::Identity) -> Start {
         Start::Run
     }
+    /// Once the start [`Self::starting`] let run has ended, before anything
+    /// else runs: before the next function's claim, [`Self::first_started`]
+    /// or the end of the scan.
+    fn ended(&mut self) {}
 }
 
 /// Whether a function's driver runs, as [`Observer::starting`] decides.
@@ -1560,8 +1606,13 @@ pub unsafe fn probe_observed(
     let mut claimed = Claimed::default();
     let (scanned, mut first_pending) = first_of(scanned, observer.first());
     let mut seen = 0usize;
+    // Whether a start the observer let run has not been told ended.
+    let mut running = false;
     for found in scanned {
         for mut function in found {
+            if core::mem::take(&mut running) {
+                observer.ended();
+            }
             claimed.settle(recorded!(), &mut devices.failures);
             if seen > 0 && core::mem::take(&mut first_pending) {
                 observer.first_started(&mut devices);
@@ -1656,6 +1707,7 @@ pub unsafe fn probe_observed(
                 devices.unsupported.push((address, function.class, why));
                 continue;
             }
+            running = true;
             let start = DeviceStart::begin(address, handoff.clock, &mut abandoned);
             #[cfg(feature = "native-acpi")]
             if smbus::matches(&function) {
@@ -1998,6 +2050,9 @@ pub unsafe fn probe_observed(
                 Err(error) => devices.failures.push((address, error.into())),
             }
         }
+    }
+    if running {
+        observer.ended();
     }
     claimed.settle(recorded!(), &mut devices.failures);
     if first_pending {
@@ -3082,6 +3137,9 @@ mod tests {
                     Start::Run
                 }
             }
+            fn ended(&mut self) {
+                self.events.push(("ended", 0xff));
+            }
         }
         let mut ecam = alloc::vec![u32::MAX; (1 << 20) / 4];
         for (device, class) in [(0, 0x0108_0200), (1, 0x0200_0000), (2, 0x0c03_3000)] {
@@ -3118,19 +3176,35 @@ mod tests {
                 Some(address(2)),
                 alloc::vec![
                     ("starting", 2),
+                    ("ended", 0xff),
                     ("first started", 0xff),
                     ("starting", 0),
+                    ("ended", 0xff),
                     ("starting", 1)
                 ],
             ),
-            // A first function the scan did not find changes nothing.
+            // A first function the scan did not find changes nothing. A
+            // skipped start is never told ended; every other is, before
+            // the next is named and at the end of the scan.
             (
                 Some(address(9)),
-                alloc::vec![("starting", 0), ("starting", 1), ("starting", 2)],
+                alloc::vec![
+                    ("starting", 0),
+                    ("ended", 0xff),
+                    ("starting", 1),
+                    ("starting", 2),
+                    ("ended", 0xff)
+                ],
             ),
             (
                 None,
-                alloc::vec![("starting", 0), ("starting", 1), ("starting", 2)],
+                alloc::vec![
+                    ("starting", 0),
+                    ("ended", 0xff),
+                    ("starting", 1),
+                    ("starting", 2),
+                    ("ended", 0xff)
+                ],
             ),
         ] {
             let services = services::tests::Refusing::minimum_only();
