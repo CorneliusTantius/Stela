@@ -375,10 +375,13 @@ fn an_rtl8821c_reset_runs_the_whole_bring_up_within_the_recovery_step() {
     // PCIe's gen 1 parameter through MDIO.
     assert_ne!(m.get(0x2800 + 0x18 * 4, 4) & 0xfffff, 0);
     assert_eq!(m.get(0x3f4, 2), 0x6380);
-    // Once firmware runs, its mailbox first tells Bluetooth to recover.
-    let mailbox = |e: &&[u32; 4]| e[0] == 1 && (0x1d0..0x1e0).contains(&e[1]);
-    let first = m.events.iter().find(mailbox).unwrap();
-    assert_eq!(first[3], 0x1d1);
+    // Once firmware runs, its mailbox first tells Bluetooth to recover,
+    // before the efuse is read, as rtw_download_firmware's last step.
+    let mailbox = |e: &[u32; 4]| e[0] == 1 && (0x1d0..0x1e0).contains(&e[1]);
+    let first = m.events.iter().position(mailbox).unwrap();
+    assert_eq!(m.events[first][3], 0x1d1);
+    let efuse = m.events.iter().position(|e| e[0] == 1 && e[1] == 0x30);
+    assert!(first < efuse.unwrap(), "the efuse read came first");
 }
 
 #[test]

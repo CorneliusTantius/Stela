@@ -349,18 +349,32 @@ pub(super) async unsafe fn boot<I: Io, R: Rings<I>>(
         .await
         .map_err(at("hardware report"))?;
     drop(download);
+    let spec = profile
+        .rtw88()
+        .ok_or_else(|| at("pcie link")("no rtw88 chip"))?;
+    // SAFETY: firmware booted once on this requester, with its mailbox
+    // unused. The rest of the boot reaches the registers through this owner.
+    let mut control = unsafe { Control::new(io, &report) }.map_err(at("mailbox"))?;
+    // rtw_download_firmware's last step, straight after the download.
+    if spec.recover_bluetooth {
+        control
+            .command(commands::recover_bluetooth())
+            .map_err(at("bluetooth recovery"))?;
+        yield_now().await;
+    }
+    let io = control.io().map_err(at("mailbox"))?;
     // SAFETY: firmware is running and nothing else touches the requester.
-    let physical = unsafe { efuse::read(&mut io) }.await.map_err(at("efuse"))?;
+    let physical = unsafe { efuse::read(io) }.await.map_err(at("efuse"))?;
     let board = physical.logical().map_err(at("efuse map"))?.board();
     let mac = Mac(board.valid_mac().map_err(at("mac address"))?);
     // SAFETY: the MAC, tables, paths and calibrations of one uninterrupted
     // boot, in `rtw_mac_init` and the chip's `phy_set_param` order, each on
     // the state the one before it left.
     let (mac_state, phy) = unsafe {
-        let mac_state = source_mac::initialize(&mut io, &report).map_err(at("mac init"))?;
+        let mac_state = source_mac::initialize(io, &report).map_err(at("mac init"))?;
         yield_now().await;
         if profile.chip() == Chip::Rtl8821C {
-            let phy = phy::rtl8821c::phy_set_param(&mut io, &board, &report)
+            let phy = phy::rtl8821c::phy_set_param(io, &board, &report)
                 .await
                 .map_err(at("phy tables"))?;
             (
@@ -368,25 +382,25 @@ pub(super) async unsafe fn boot<I: Io, R: Rings<I>>(
                 Initialized::Rtl8821C(alloc::boxed::Box::new(phy)),
             )
         } else {
-            let loaded = phy::initialize(&mut io, &board, &report)
+            let loaded = phy::initialize(io, &board, &report)
                 .await
                 .map_err(at("phy tables"))?;
             let paths = loaded
-                .configure_paths(&mut io, &report)
+                .configure_paths(io, &report)
                 .map_err(at("phy paths"))?;
             yield_now().await;
             let initial = paths
-                .initialize_dynamic(&mut io, &report)
+                .initialize_dynamic(io, &report)
                 .map_err(at("phy dynamics"))?;
             yield_now().await;
             let phy = initial
-                .calibrate_dac(&mut io, &report)
+                .calibrate_dac(io, &report)
                 .await
                 .map_err(at("dac calibration"))?
-                .initialize_factory(&mut io, &report, &physical)
+                .initialize_factory(io, &report, &physical)
                 .await
                 .map_err(at("factory trim"))?
-                .finish_initial_phy(&mut io, &report)
+                .finish_initial_phy(io, &report)
                 .map_err(at("phy tail"))?;
             (
                 mac_state,
@@ -397,11 +411,8 @@ pub(super) async unsafe fn boot<I: Io, R: Rings<I>>(
     yield_now().await;
     let geometry = mac_state.fifo();
     let disabled = Disabled::load(firmware);
-    let spec = profile
-        .rtw88()
-        .ok_or_else(|| at("pcie link")("no rtw88 chip"))?;
     let link = Link::configure(
-        &mut io,
+        io,
         spec,
         profile.cut(),
         board.raw().rfe_raw,
@@ -413,10 +424,10 @@ pub(super) async unsafe fn boot<I: Io, R: Rings<I>>(
     unsafe { rings.inform(geometry, &phy, &report) }?;
     yield_now().await;
     let mut coex = Coex::new(&board);
-    coex.power_on(&mut io).map_err(at("coex power on"))?;
+    coex.power_on(io).map_err(at("coex power on"))?;
     yield_now().await;
     // SAFETY: firmware runs, the PHY is loaded and nothing transmits yet.
-    let run = unsafe { coex.init(&mut io, &report) }.map_err(at("coex"))?;
+    let run = unsafe { coex.init(io, &report) }.map_err(at("coex"))?;
     // Past the bring-up, the arbiter's waits are bounded per call.
     coex.bound_waits();
     yield_now().await;
@@ -428,17 +439,7 @@ pub(super) async unsafe fn boot<I: Io, R: Rings<I>>(
         io.write16(REG_SECURITY, security | SECURITY_ENGINE)?;
         io.write32(REG_RCR, RECEIVE_FILTER)
     };
-    enable(&mut io).map_err(at("security engine"))?;
-    // SAFETY: firmware booted once on this requester, with its mailbox unused.
-    let mut control = unsafe { Control::new(io, &report) }.map_err(at("mailbox"))?;
-    // rtw_download_firmware's last step, as the mailbox's first command:
-    // nothing here reaches the mailbox before it.
-    if spec.recover_bluetooth {
-        control
-            .command(commands::recover_bluetooth())
-            .map_err(at("bluetooth recovery"))?;
-        yield_now().await;
-    }
+    enable(io).map_err(at("security engine"))?;
     for order in run.orders {
         // A chip starting up has no power save to leave.
         if let Order::Command(command) = order {
