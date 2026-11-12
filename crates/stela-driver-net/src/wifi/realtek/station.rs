@@ -574,6 +574,8 @@ pub struct Rtl8822c<D: Device> {
     departing: Option<Ticket>,
     left: bool,
     reported: Vec<&'static str>,
+    /// Frames and reports refused and dropped, as mac80211 counts `rx_dropped`.
+    dropped: u64,
 }
 
 impl<D: Device> Rtl8822c<D> {
@@ -621,6 +623,7 @@ impl<D: Device> Rtl8822c<D> {
             departing: None,
             left: false,
             reported: Vec::new(),
+            dropped: 0,
         })
     }
 
@@ -1264,52 +1267,71 @@ impl<D: Device> Rtl8822c<D> {
         self.rate_amsdu = bit_rate::max_amsdu(bit_rate::bit_rate(rate, short_gi, width));
     }
 
+    /// Frames and reports refused since attach, which mac80211 drops.
+    pub fn dropped(&self) -> u64 {
+        self.dropped
+    }
+
+    /// Everything the device received in one look. As mac80211 does, a frame
+    /// or report the station refuses is dropped and counted, and the rest of
+    /// the look goes on; only the device failing ends it, after the frames
+    /// already taken from the ring are handled.
     fn take_incoming(&mut self, now: u64) -> Result<(), Error> {
         let mut incoming = Vec::new();
         Self::hardware(self.device.receive(&mut |item| incoming.push(item)))?;
         while let Some(limitation) = self.device.limitation() {
             self.unsupported(limitation);
         }
+        let mut failure = None;
         for item in incoming {
-            match item {
-                Incoming::Report(Report::Transmitted {
-                    number,
-                    acknowledged,
-                }) => {
-                    if self.reporting == Some(number) {
-                        self.reporting = None;
-                        self.station
-                            .management_status(acknowledged, now)
-                            .map_err(Error::Station)?;
-                    }
-                    if let Some(following) = &mut self.following {
-                        following.reported(number, acknowledged, now);
-                    }
+            match self.take(item, now) {
+                Ok(()) => {}
+                Err(error @ (Error::Hardware(_) | Error::Pending)) => {
+                    failure.get_or_insert(error);
                 }
-                Incoming::Report(Report::Rate {
-                    mac_id: MAC_ID,
-                    rate,
-                    short_gi,
-                    width,
-                }) => self.rate_reported(rate, short_gi, width),
-                Incoming::Report(_) => {}
-                Incoming::Frame(frame) => {
-                    if let Some(mpdu) = self.mpdu(frame)
-                        && let Err(error) = self.frame(mpdu, now)
-                    {
-                        match error {
-                            // mac80211 drops a frame the station cannot use;
-                            // the exchange it answers retries or times out.
-                            Error::Station(_) => {
-                                self.unsupported("a management frame the station refuses");
-                            }
-                            error => return Err(error),
-                        }
-                    }
-                }
+                // Counted only: a note would reach the keeper as a failure.
+                Err(_) => self.dropped = self.dropped.saturating_add(1),
             }
         }
-        Ok(())
+        failure.map_or(Ok(()), Err)
+    }
+
+    fn take(&mut self, item: Incoming, now: u64) -> Result<(), Error> {
+        match item {
+            Incoming::Report(Report::Transmitted {
+                number,
+                acknowledged,
+            }) => {
+                if let Some(following) = &mut self.following {
+                    following.reported(number, acknowledged, now);
+                }
+                if self.reporting == Some(number) {
+                    self.reporting = None;
+                    self.station
+                        .management_status(acknowledged, now)
+                        .map_err(Error::Station)?;
+                }
+                Ok(())
+            }
+            Incoming::Report(Report::Rate {
+                mac_id: MAC_ID,
+                rate,
+                short_gi,
+                width,
+            }) => {
+                self.rate_reported(rate, short_gi, width);
+                Ok(())
+            }
+            Incoming::Report(_) => Ok(()),
+            // Nothing is heard before the radio first tunes.
+            Incoming::Frame(_) if self.tuned.is_none() => Ok(()),
+            Incoming::Frame(frame) => match self.mpdu(frame) {
+                Some(mpdu) => self.frame(mpdu, now),
+                // `ieee80211_rx_monitor`/`__ieee80211_rx_handle_packet`: a
+                // frame too short or of an unknown version is dropped.
+                None => Err(Error::Refused("a malformed frame")),
+            },
+        }
     }
 
     /// The frame `received` holds, on the channel the radio stands on.

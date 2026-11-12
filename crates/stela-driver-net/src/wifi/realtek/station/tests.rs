@@ -767,6 +767,37 @@ fn received_data_passes_its_replay_and_integrity_checks() {
     assert_eq!(delivered(&mut wifi), [0x45]);
 }
 
+#[test]
+fn a_refused_frame_between_good_ones_is_dropped_and_counted_and_the_rest_arrive() {
+    let (mut wifi, model) = connected();
+    let body = [0x45; 46];
+    let frame = |sequence, key| data(LOCAL, sequence, [8, 0], &body, Some(key));
+    let before = wifi.radio().dropped();
+    {
+        let mut air = model.0.borrow_mut();
+        air.hear(frame(20, (0, 1)), true);
+        // Too short for any 802.11 header, and a version mac80211 drops.
+        air.hear(vec![0x88, 0x02, 0], false);
+        let mut version = frame(21, (0, 2));
+        version[0] |= 1;
+        air.hear(version, true);
+        // An authentication frame the associated station has no use for.
+        air.hear(management(0xb0, &[0, 0, 9, 0, 1, 0]), false);
+        air.hear(frame(22, (0, 3)), true);
+    }
+    // One look takes all of them: the link reports no error, and both good
+    // frames reach the network.
+    let mut values = Vec::new();
+    for _ in 0..2 {
+        while let Some(ethernet) = wifi.receive().expect("a refused frame is no link error") {
+            values.push(ethernet[14]);
+        }
+    }
+    assert_eq!(values, [0x45, 0x45]);
+    assert!(wifi.radio().dropped() > before);
+    assert!(wifi.carrier());
+}
+
 /// Fragment `number` of frame `sequence` under the pairwise key at packet
 /// number `pn`, with `more` to follow.
 fn fragment(sequence: u16, number: u8, more: bool, pn: u8, payload: &[u8]) -> Vec<u8> {
