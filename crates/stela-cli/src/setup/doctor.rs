@@ -153,6 +153,36 @@ impl Report {
     }
 }
 
+/// The Wi-Fi network the boot joins and what it joins with. A network with
+/// a passphrase whose key file is gone is not joined, so it is a problem; an
+/// open network has no key file.
+fn wifi_status(record: &Record, report: &mut Report) {
+    let Some(network) = &record.wifi else {
+        return;
+    };
+    report.line(
+        "Wi-Fi",
+        format!(
+            "\"{}\", {}",
+            network.ssid,
+            super::wifi::secret(network, &record.esp)
+        ),
+    );
+    let key = record.esp.join(super::wifi::KEY_PATH);
+    if !network.open && !key.is_file() {
+        let fix = report.fix(&format!(
+            "configure --wifi {}",
+            super::quoted(&network.ssid)
+        ));
+        report.problem(format!(
+            "the Wi-Fi network \"{}\" has no key file {}, so the boot does not join it; {fix} \
+             asks for its passphrase, or offers it as an open network",
+            network.ssid,
+            key.display()
+        ));
+    }
+}
+
 /// The translation store's packs, and what `repair` would fix.
 fn translations_status(record: &Record, report: &mut Report) {
     let Some(store) = &record.translations else {
@@ -693,6 +723,7 @@ pub(super) fn status(environment: &Environment<'_>, usb: &Path) -> Result<String
         );
     }
     translations_status(&record, &mut report);
+    wifi_status(&record, &mut report);
     for install in &record.installs {
         install_status(environment, &record, install, &mut report);
     }

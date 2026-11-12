@@ -613,8 +613,8 @@ pub(super) struct Plan {
     /// The install medium.
     pub(super) install: InstallPlan,
     pub(super) notes: Vec<String>,
-    /// The key file's passphrase, for `--wifi`.
-    pub(super) wifi_passphrase: Option<String>,
+    /// The key file's passphrase, or the open network, for `--wifi`.
+    pub(super) wifi_key: Option<wifi::Key>,
     /// The bundles an older stela prepared for the interrupted setup this
     /// one resumes, which its own replace.
     pub(super) stale_bundles: Vec<bundle::Bundle>,
@@ -767,10 +767,7 @@ pub(super) fn plan(
         replacing: None,
         medium_checked: None,
         translations: None,
-        wifi: command.wifi.clone().map(|ssid| wifi::Network {
-            ssid,
-            country: command.wifi_country.clone(),
-        }),
+        wifi: command.wifi_network(),
         usb4_approved: command.usb4_approve.clone(),
         addresses: super::addresses::Addresses::requested(command)?,
     };
@@ -864,7 +861,7 @@ pub(super) fn plan(
         installed,
         install,
         notes,
-        wifi_passphrase: command.wifi_passphrase.clone(),
+        wifi_key: command.wifi_key.clone(),
         stale_bundles,
     })
 }
@@ -968,7 +965,7 @@ pub(super) fn state_line(disk: &installed::InstalledDisk) -> String {
 pub(super) fn setup(environment: &Environment<'_>, mut command: Request) -> Result<String> {
     let host = environment.host;
     // Before anything is erased.
-    command.read_wifi_passphrase()?;
+    command.read_wifi_key()?;
     if command.fetch {
         builds::find_in(environment.builds, &command.build)?;
     }
@@ -1327,8 +1324,8 @@ pub(super) fn apply(environment: &Environment<'_>, plan: Plan) -> Result<()> {
     if let Some(nor) = &checked.nor_image {
         installed::initialize_nor(environment.host, &checked.disk, nor)?;
     }
-    if let Some(passphrase) = &plan.wifi_passphrase {
-        wifi::write_key(&esp, passphrase)?;
+    if let Some(key) = &plan.wifi_key {
+        wifi::write_key(&esp, key)?;
     }
     efi::add_mount(&esp, &plan.efi_image, None, Some(&record.options))?;
     publish(&mut record)?;

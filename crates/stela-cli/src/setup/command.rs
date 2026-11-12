@@ -190,6 +190,10 @@ struct Wifi {
     /// from this file instead of asking.
     #[arg(long, value_name = "FILE", requires = "wifi")]
     wifi_passphrase_file: Option<PathBuf>,
+    /// The Wi-Fi network is open, with no passphrase: Stela then joins only
+    /// an AP of that name without protection.
+    #[arg(long, requires = "wifi", conflicts_with = "wifi_passphrase_file")]
+    wifi_open: bool,
     /// The country whose Wi-Fi rules apply, as an ISO 3166 code such as US
     /// or DE.
     #[arg(long, value_name = "CODE", requires = "wifi", value_parser = wifi::country)]
@@ -200,6 +204,7 @@ impl Wifi {
     fn apply(self, request: &mut Request) {
         request.wifi = self.wifi;
         request.wifi_passphrase_file = self.wifi_passphrase_file;
+        request.wifi_open = self.wifi_open;
         request.wifi_country = self.wifi_country;
     }
 }

@@ -1,6 +1,7 @@
 //! The Wi-Fi network `stela.efi` joins for a network install (`--wifi`):
 //! its name and country go in `stela.cfg`, and its passphrase in the key
-//! file beside it, `EFI/stela/wifi.key`, in plaintext.
+//! file beside it, `EFI/stela/wifi.key`, in plaintext. An open network is
+//! a setting of `stela.cfg` (`--wifi-open`) and has no key file.
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path};
@@ -16,6 +17,26 @@ pub(super) struct Network {
     /// The ISO 3166 alpha-2 country whose radio rules apply.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) country: Option<String>,
+    /// The network is open: no passphrase, and no key file.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(super) open: bool,
+}
+
+/// What a network is joined with: the key file's passphrase or PSK, or
+/// nothing for an open network.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) enum Key {
+    Passphrase(String),
+    Open,
+}
+
+impl std::fmt::Debug for Key {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Passphrase(_) => "Passphrase(..)",
+            Self::Open => "Open",
+        })
+    }
 }
 
 /// A network name of 1 to 32 bytes.
@@ -58,30 +79,58 @@ pub(super) fn read_passphrase(file: &Path) -> Result<String> {
     Ok(passphrase)
 }
 
-/// Ask for the passphrase without echoing it.
-pub(super) fn ask_passphrase(ssid: &str) -> Result<String> {
+/// Ask for the passphrase without echoing it, or take the network as open
+/// when that is chosen instead.
+pub(super) fn ask_key(ssid: &str) -> Result<Key> {
     use std::io::IsTerminal;
     ensure!(
         std::io::stdin().is_terminal(),
-        "--wifi needs the passphrase typed at a terminal, or --wifi-passphrase-file FILE"
+        "--wifi needs the passphrase typed at a terminal, --wifi-passphrase-file FILE, or \
+         --wifi-open for an open network"
     );
-    Ok(cliclack::password(format!("Passphrase for {ssid}"))
-        .mask('•')
-        .validate(|text: &String| check_passphrase(text))
-        .interact()?)
+    let open = cliclack::select(format!("Passphrase for {ssid}"))
+        .item(false, "Type the passphrase", "WPA2 or WPA3 Personal")
+        .item(
+            true,
+            "No passphrase (open network)",
+            "Joins only an AP of this name without protection",
+        )
+        .initial_value(false)
+        .interact()?;
+    if open {
+        return Ok(Key::Open);
+    }
+    cliclack::log::warning("The passphrase is stored in plaintext on the USB.")?;
+    Ok(Key::Passphrase(
+        cliclack::password(format!("Passphrase for {ssid}"))
+            .mask('•')
+            .validate(|text: &String| check_passphrase(text))
+            .interact()?,
+    ))
 }
 
-/// Write the key file onto the ESP at `esp`.
-pub(super) fn write_key(esp: &Path, passphrase: &str) -> Result<()> {
+/// Write `key` onto the ESP at `esp`: a passphrase's key file, or for an
+/// open network none, removing an earlier network's.
+pub(super) fn write_key(esp: &Path, key: &Key) -> Result<()> {
     let path = esp.join(KEY_PATH);
-    fs::create_dir_all(path.parent().unwrap())?;
-    fs::write(&path, passphrase).with_context(|| format!("writing {}", path.display()))
+    match key {
+        Key::Passphrase(passphrase) => {
+            fs::create_dir_all(path.parent().unwrap())?;
+            fs::write(&path, passphrase).with_context(|| format!("writing {}", path.display()))
+        }
+        Key::Open => match fs::remove_file(&path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                Err(error).with_context(|| format!("removing {}", path.display()))
+            }
+            _ => Ok(()),
+        },
+    }
 }
 
 /// The plan's line for the network, after its two spaces.
 pub(super) fn describe(network: &Network, esp: &Path) -> String {
     format!(
-        "{:<14} joins \"{}\"{}; its passphrase is in {} in plaintext",
+        "{:<14} joins \"{}\"{}; {}",
         "Wi-Fi",
         network.ssid,
         network
@@ -89,8 +138,20 @@ pub(super) fn describe(network: &Network, esp: &Path) -> String {
             .as_ref()
             .map(|country| format!(" under {country}'s rules"))
             .unwrap_or_default(),
-        esp.join(KEY_PATH).display()
+        secret(network, esp)
     )
+}
+
+/// What a network is joined with, as a plan or status names it.
+pub(super) fn secret(network: &Network, esp: &Path) -> String {
+    if network.open {
+        "an open network, with no passphrase".into()
+    } else {
+        format!(
+            "its passphrase is in {} in plaintext",
+            esp.join(KEY_PATH).display()
+        )
+    }
 }
 
 /// The networks this computer sees or knows, strongest first where the

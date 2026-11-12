@@ -317,11 +317,12 @@ fn command(f: &Fixture, usb: &Path) -> Request {
         confirmed: false,
         wifi: None,
         wifi_passphrase_file: None,
+        wifi_open: false,
         wifi_country: None,
         no_wifi: false,
         usb4_approve: Vec::new(),
         no_usb4_approve: false,
-        wifi_passphrase: None,
+        wifi_key: None,
         ipv4: None,
         ipv4_gateway: None,
         dns: None,
@@ -4718,7 +4719,7 @@ fn wifi_configuration_applies_to_all_boot_choices() {
     let mut joined = command(&f, &f.esp);
     joined.wifi = Some("Home Net".into());
     joined.wifi_country = Some("DE".into());
-    joined.wifi_passphrase = Some("correct horse".into());
+    joined.wifi_key = Some(wifi::Key::Passphrase("correct horse".into()));
     let report = setup(&environment(&f.host), joined).unwrap();
     assert!(
         report.contains("joins \"Home Net\" under DE's rules"),
@@ -4748,13 +4749,113 @@ fn wifi_configuration_applies_to_all_boot_choices() {
     rerun(&f, |c| {
         c.action = Action::Configure;
         c.wifi = Some("Office".into());
-        c.wifi_passphrase = Some("0123456789".into());
+        c.wifi_key = Some(wifi::Key::Passphrase("0123456789".into()));
     })
     .unwrap();
     assert_eq!(fs::read_to_string(&key).unwrap(), "0123456789");
     assert!(options().contains("--wifi Office"), "{}", options());
     uninstall(&environment(&f.host), &f.esp, false).unwrap();
     assert!(!key.exists());
+}
+
+#[test]
+fn an_open_network_is_a_setting_with_no_key_file_and_status_names_it() {
+    use clap::Parser as _;
+    let parse = |words: &[&str]| {
+        crate::Cli::try_parse_from(
+            ["stela", "setup", "configure", "--usb", "/Volumes/EFI"]
+                .iter()
+                .chain(words),
+        )
+        .map(|cli| {
+            let crate::Command::Setup(setup) = cli.command else {
+                panic!("not a setup");
+            };
+            setup.request().wifi_open
+        })
+    };
+    assert!(parse(&["--wifi", "Cafe", "--wifi-open"]).unwrap());
+    assert!(!parse(&["--wifi", "Cafe"]).unwrap());
+    assert!(
+        parse(&["--wifi-open"]).is_err(),
+        "it names a --wifi network"
+    );
+    assert!(
+        parse(&[
+            "--wifi",
+            "Cafe",
+            "--wifi-open",
+            "--wifi-passphrase-file",
+            "k"
+        ])
+        .is_err(),
+        "an open network has no passphrase"
+    );
+    let mut f = fixture(64 * GIB, false);
+    add_stela(&mut f);
+    let mut joined = command(&f, &f.esp);
+    joined.wifi = Some("Cafe".into());
+    joined.wifi_open = true;
+    let report = setup(&environment(&f.host), joined).unwrap();
+    assert!(
+        report.contains("joins \"Cafe\"; an open network, with no passphrase"),
+        "{report}"
+    );
+    let key = f.esp.join(wifi::KEY_PATH);
+    let options = || fs::read_to_string(f.esp.join("EFI/stela/stela.cfg")).unwrap();
+    assert!(!key.exists(), "an open network has no key file");
+    assert!(
+        options().contains("--wifi Cafe --wifi-open"),
+        "{}",
+        options()
+    );
+    assert!(!options().contains("--wifi-key"), "{}", options());
+    let status = rerun(&f, |c| c.action = Action::Status).unwrap();
+    assert!(
+        status.contains("Wi-Fi          \"Cafe\", an open network, with no passphrase"),
+        "{status}"
+    );
+    // A passphrase for another network replaces the setting with a key file.
+    rerun(&f, |c| {
+        c.action = Action::Configure;
+        c.wifi = Some("Office".into());
+        c.wifi_key = Some(wifi::Key::Passphrase("0123456789".into()));
+    })
+    .unwrap();
+    assert_eq!(fs::read_to_string(&key).unwrap(), "0123456789");
+    assert!(!options().contains("--wifi-open"), "{}", options());
+    let status = rerun(&f, |c| c.action = Action::Status).unwrap();
+    assert!(
+        status.contains("Wi-Fi          \"Office\", its passphrase is in"),
+        "{status}"
+    );
+    // A network with a passphrase whose key file is gone is not joined:
+    // status names it as a problem, and an empty file is no open network.
+    fs::remove_file(&key).unwrap();
+    let status = format!(
+        "{:#}",
+        rerun(&f, |c| c.action = Action::Status).unwrap_err()
+    );
+    assert!(
+        status.contains("the Wi-Fi network \"Office\" has no key file"),
+        "{status}"
+    );
+    assert!(!options().contains("--wifi-open"), "{}", options());
+    // Open again: the earlier key file goes.
+    fs::write(&key, "0123456789").unwrap();
+    rerun(&f, |c| {
+        c.action = Action::Configure;
+        c.wifi = Some("Cafe".into());
+        c.wifi_open = true;
+    })
+    .unwrap();
+    assert!(!key.exists());
+    assert!(
+        options().contains("--wifi Cafe --wifi-open"),
+        "{}",
+        options()
+    );
+    rerun(&f, |c| c.action = Action::Status).unwrap();
 }
 
 #[test]

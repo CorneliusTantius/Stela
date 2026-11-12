@@ -223,8 +223,9 @@ impl Record {
             .map(|bundle| bundle.processors)
             .find(|&processors| processors != 0);
         system.profile = self.profile;
-        // The key file is `--wifi`'s default one.
+        // The key file is `--wifi`'s default one; an open network has none.
         system.ssid = self.wifi.as_ref().map(|network| network.ssid.clone());
+        system.wifi_open = self.wifi.as_ref().is_some_and(|network| network.open);
         system.wifi_country = self
             .wifi
             .as_ref()

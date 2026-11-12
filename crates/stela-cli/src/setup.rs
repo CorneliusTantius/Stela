@@ -204,6 +204,9 @@ fn rerun(record: &Record, usb: &Path) -> String {
     }
     if let Some(network) = &record.wifi {
         let _ = write!(words, " --wifi {}", quoted(&network.ssid));
+        if network.open {
+            words.push_str(" --wifi-open");
+        }
         if let Some(country) = &network.country {
             let _ = write!(words, " --wifi-country {country}");
         }
@@ -421,12 +424,14 @@ struct Request {
     confirmed: bool,
     wifi: Option<String>,
     wifi_passphrase_file: Option<PathBuf>,
+    /// `--wifi-open`: the network has no passphrase.
+    wifi_open: bool,
     wifi_country: Option<String>,
     no_wifi: bool,
     usb4_approve: Vec<String>,
     no_usb4_approve: bool,
-    /// `--wifi`'s passphrase, once read or typed.
-    wifi_passphrase: Option<String>,
+    /// `--wifi`'s passphrase, or its open network, once read or chosen.
+    wifi_key: Option<wifi::Key>,
     ipv4: Option<stela_boot_core::options::StaticIpv4>,
     ipv4_gateway: Option<std::net::Ipv4Addr>,
     dns: Option<Vec<std::net::IpAddr>>,
@@ -947,7 +952,7 @@ impl Request {
             }
             Action::NextBoot(next) => self.next_boot(environment, &record, next),
             Action::Configure => {
-                self.read_wifi_passphrase()?;
+                self.read_wifi_key()?;
                 machines::configure(environment, &self)
             }
             Action::HostFirmwareInstall(source) => {
@@ -1054,20 +1059,31 @@ impl Request {
     }
 
     /// Read `--wifi`'s passphrase: the wizard's, `--wifi-passphrase-file`'s,
-    /// or one typed at a prompt, which a dry run skips.
-    fn read_wifi_passphrase(&mut self) -> Result<()> {
+    /// none for `--wifi-open`, or one typed or declined at a prompt, which a
+    /// dry run skips.
+    fn read_wifi_key(&mut self) -> Result<()> {
         let Some(ssid) = &self.wifi else {
             return Ok(());
         };
-        if self.wifi_passphrase.is_some() {
+        if self.wifi_key.is_some() {
             return Ok(());
         }
-        self.wifi_passphrase = match &self.wifi_passphrase_file {
-            Some(file) => Some(wifi::read_passphrase(file)?),
+        self.wifi_key = match &self.wifi_passphrase_file {
+            _ if self.wifi_open => Some(wifi::Key::Open),
+            Some(file) => Some(wifi::Key::Passphrase(wifi::read_passphrase(file)?)),
             None if self.dry_run => None,
-            None => Some(wifi::ask_passphrase(ssid)?),
+            None => Some(wifi::ask_key(ssid)?),
         };
         Ok(())
+    }
+
+    /// The network `--wifi` names, as the record keeps it.
+    fn wifi_network(&self) -> Option<wifi::Network> {
+        Some(wifi::Network {
+            ssid: self.wifi.clone()?,
+            country: self.wifi_country.clone(),
+            open: self.wifi_key == Some(wifi::Key::Open),
+        })
     }
 
     /// `nvram next-boot`.

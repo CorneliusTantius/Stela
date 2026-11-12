@@ -426,11 +426,7 @@ pub(super) fn configure(environment: &Environment<'_>, command: &Request) -> Res
         }
         None => {}
     }
-    if let Some(ssid) = &command.wifi {
-        let network = super::wifi::Network {
-            ssid: ssid.clone(),
-            country: command.wifi_country.clone(),
-        };
+    if let Some(network) = command.wifi_network() {
         writeln!(text, "  {}", super::wifi::describe(&network, &record.esp))?;
         record.wifi = Some(network);
     }
@@ -474,8 +470,8 @@ pub(super) fn configure(environment: &Environment<'_>, command: &Request) -> Res
         text.push_str("Dry run: nothing was changed.\n");
         return Ok(text);
     }
-    if let Some(passphrase) = &command.wifi_passphrase {
-        super::wifi::write_key(&record.esp, passphrase)?;
+    if let Some(key) = &command.wifi_key {
+        super::wifi::write_key(&record.esp, key)?;
     }
     publish(&mut record)?;
     write_record(&record.esp.clone(), &record)?;

@@ -164,6 +164,7 @@ pub(super) fn resume(command: &mut Request, esp: PathBuf, record: &Record) {
         .wifi
         .as_ref()
         .and_then(|network| network.country.clone());
+    command.wifi_open = record.wifi.as_ref().is_some_and(|network| network.open);
     command.ipv4 = record
         .addresses
         .ipv4
@@ -254,11 +255,8 @@ fn configure_inner(command: &mut Request, host: &dyn Host) -> Result<bool> {
                 .interact()?;
             if choice == 0 {
                 resume(command, esp, &record);
-                if command.wifi.is_some() {
-                    cliclack::log::warning("The passphrase is stored in plaintext on the USB.")?;
-                    let ssid = command.wifi.clone().unwrap_or_default();
-                    command.wifi_passphrase = Some(wifi::ask_passphrase(&ssid)?);
-                }
+                // An open network needs nothing typed.
+                command.read_wifi_key()?;
                 return Ok(true);
             }
         }
@@ -335,13 +333,16 @@ fn configure_inner(command: &mut Request, host: &dyn Host) -> Result<bool> {
             format!(
                 "{}{}",
                 match &command.wifi {
+                    Some(ssid) if command.wifi_open => {
+                        format!("Wi-Fi      {ssid}, open network\n")
+                    }
                     Some(ssid) => format!("Wi-Fi      {ssid}\n"),
                     None => "Wi-Fi      None (Ethernet)\n".into(),
                 },
                 super::addresses::review(command)
             )
         } else {
-            (command.wifi, command.wifi_passphrase) = (None, None);
+            (command.wifi, command.wifi_key, command.wifi_open) = (None, None, false);
             (command.ipv4, command.ipv4_gateway, command.dns) = (None, None, None);
             String::new()
         };
@@ -494,7 +495,7 @@ fn choose_wifi(command: &mut Request) -> Result<()> {
         .interact()?;
     let ssid = match choice {
         ETHERNET => {
-            (command.wifi, command.wifi_passphrase) = (None, None);
+            (command.wifi, command.wifi_key, command.wifi_open) = (None, None, false);
             return Ok(());
         }
         TYPED => cliclack::input("Network name")
@@ -503,8 +504,9 @@ fn choose_wifi(command: &mut Request) -> Result<()> {
             .interact()?,
         index => networks[index].clone(),
     };
-    cliclack::log::warning("The passphrase is stored in plaintext on the USB.")?;
-    command.wifi_passphrase = Some(wifi::ask_passphrase(&ssid)?);
+    let key = wifi::ask_key(&ssid)?;
+    command.wifi_open = key == wifi::Key::Open;
+    command.wifi_key = Some(key);
     command.wifi = Some(ssid);
     Ok(())
 }
