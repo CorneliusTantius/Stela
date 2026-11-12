@@ -8,6 +8,7 @@ use crate::wifi::realtek::{
 use alloc::{rc::Rc, vec::Vec};
 use core::cell::RefCell;
 use sha2::{Digest, Sha256};
+use stela_driver_base::stepped::block_on;
 
 struct Model {
     profile: Profile,
@@ -178,7 +179,10 @@ unsafe impl Io for ModelIo {
     }
 }
 fn catalog(bytes: Vec<u8>) -> Catalog {
-    let p = profile();
+    catalog_for(profile(), bytes)
+}
+/// A catalog holding `bytes` as `p`'s firmware.
+pub(in crate::wifi::realtek) fn catalog_for(p: Profile, bytes: Vec<u8>) -> Catalog {
     Catalog::from_handoff(vec![Resource {
         name: p.firmware_name(),
         target: Target {
@@ -214,12 +218,12 @@ fn feature_request_is_fresh_and_report_stays_bound_to_same_download() {
     ];
     model.borrow_mut().feature_reply = Some(raw);
     model.borrow_mut().set(REG_C2HEVT, 1, 0x19); // Stale prior-boot ID.
-    download.start_with_hardware_features(&staged).unwrap();
+    block_on(download.start_with_hardware_features(&staged)).unwrap();
     assert!(matches!(
         download.after_firmware_ready(),
         Err(Error::InvalidState)
     ));
-    let report = download.hardware_features().unwrap();
+    let report = block_on(download.hardware_features()).unwrap();
     assert_eq!(report.profile(), profile());
     assert_eq!(report.raw(), &raw);
     assert_eq!(
@@ -229,7 +233,7 @@ fn feature_request_is_fresh_and_report_stays_bound_to_same_download() {
     assert_eq!(model.borrow().get(REG_C2HEVT, 1), 0);
     assert!(download.after_firmware_ready().is_ok());
     assert!(matches!(
-        download.hardware_features(),
+        block_on(download.hardware_features()),
         Err(Error::InvalidState)
     ));
     assert_eq!(model.borrow().quarantined, 0);
@@ -248,20 +252,23 @@ fn feature_exchange_faults_never_reuse_stale_or_partial_report() {
     let staged = profile().stage(&c).unwrap();
     let (good, mut d) = setup();
     good.borrow_mut().feature_reply = Some([0xff; 13]);
-    d.start_with_hardware_features(&staged).unwrap();
-    d.hardware_features().unwrap(); // All-ones payload is raw data, not a removal probe.
+    block_on(d.start_with_hardware_features(&staged)).unwrap();
+    block_on(d.hardware_features()).unwrap(); // All-ones payload is raw data, not a removal probe.
     let operations = good.borrow().operations;
     for at in 0..operations {
         let (m, mut d) = setup();
         m.borrow_mut().feature_reply = Some([0x55; 13]);
         m.borrow_mut().fail_at = Some(at);
-        let failed =
-            d.start_with_hardware_features(&staged).is_err() || d.hardware_features().is_err();
+        let failed = block_on(d.start_with_hardware_features(&staged)).is_err()
+            || block_on(d.hardware_features()).is_err();
         assert!(failed, "operation {at}");
         assert_eq!(d.state(), State::Quarantined, "operation {at}");
         assert_eq!(m.borrow().quarantined, 1);
         assert!(matches!(d.after_firmware_ready(), Err(Error::InvalidState)));
-        assert!(matches!(d.hardware_features(), Err(Error::InvalidState)));
+        assert!(matches!(
+            block_on(d.hardware_features()),
+            Err(Error::InvalidState)
+        ));
         drop(d);
         assert_eq!(m.borrow().quarantined, 2);
     }
@@ -276,10 +283,10 @@ fn feature_exchange_faults_never_reuse_stale_or_partial_report() {
             _ => (),
         }
         if mode < 2 {
-            assert!(d.start_with_hardware_features(&staged).is_err());
+            assert!(block_on(d.start_with_hardware_features(&staged)).is_err());
             assert!(m.borrow().submitted.is_empty());
         } else {
-            d.start_with_hardware_features(&staged).unwrap();
+            block_on(d.start_with_hardware_features(&staged)).unwrap();
             match mode {
                 3 => m.borrow_mut().set(REG_SYS_CFG1, 4, 0x2000),
                 4 => m.borrow_mut().set(REG_MCUFW_CTRL, 2, 0xffff),
@@ -288,7 +295,7 @@ fn feature_exchange_faults_never_reuse_stale_or_partial_report() {
                 7 => m.borrow_mut().set(REG_MCUFW_CTRL, 2, 0),
                 _ => (),
             }
-            assert!(d.hardware_features().is_err(), "mode {mode}");
+            assert!(block_on(d.hardware_features()).is_err(), "mode {mode}");
         }
         assert_eq!(d.state(), State::Quarantined);
         assert_eq!(m.borrow().quarantined, 1);
@@ -299,11 +306,17 @@ fn unrequested_features_and_rebound_image_do_not_touch_hardware() {
     let c = catalog(super::super::firmware::tests::legacy_fixture());
     let mut staged = profile().stage(&c).unwrap();
     let (m, mut d) = setup();
-    assert!(matches!(d.hardware_features(), Err(Error::InvalidState)));
+    assert!(matches!(
+        block_on(d.hardware_features()),
+        Err(Error::InvalidState)
+    ));
     assert_eq!(m.borrow().operations, 0);
-    d.start(&staged).unwrap();
+    block_on(d.start(&staged)).unwrap();
     let before = m.borrow().operations;
-    assert!(matches!(d.hardware_features(), Err(Error::InvalidState)));
+    assert!(matches!(
+        block_on(d.hardware_features()),
+        Err(Error::InvalidState)
+    ));
     assert_eq!(m.borrow().operations, before);
     let mut actual = profile().observed();
     actual.subsystem_device ^= 1;
@@ -312,7 +325,7 @@ fn unrequested_features_and_rebound_image_do_not_touch_hardware() {
     model.borrow_mut().profile = staged.profile;
     let mut d = Download::new(ModelIo(model.clone()), 0x700).unwrap();
     assert!(matches!(
-        d.start_with_hardware_features(&staged),
+        block_on(d.start_with_hardware_features(&staged)),
         Err(StartError::Hardware(Error::WrongFirmwareTarget))
     ));
     assert_eq!(d.state(), State::Idle);
@@ -328,7 +341,7 @@ fn real_ready_requires_all_transfers_and_source_ordered_register_restoration() {
         Err(Error::InvalidState)
     ));
     let before = model.borrow().registers.clone();
-    download.start(&staged).unwrap();
+    block_on(download.start(&staged)).unwrap();
     assert_eq!(download.state(), State::FirmwareReady);
     assert!(download.after_firmware_ready().is_ok());
     let m = model.borrow();
@@ -358,7 +371,7 @@ fn real_ready_requires_all_transfers_and_source_ordered_register_restoration() {
     assert_eq!(m.quarantined, 0);
     drop(m);
     assert!(matches!(
-        download.start(&staged),
+        block_on(download.start(&staged)),
         Err(StartError::Hardware(Error::InvalidState))
     ));
 }
@@ -367,17 +380,17 @@ fn every_uncertain_operation_is_terminal_and_keeps_submitted_memory_quarantined(
     let c = catalog(super::super::firmware::tests::legacy_fixture());
     let staged = profile().stage(&c).unwrap();
     let (reference, mut ok) = setup();
-    ok.start(&staged).unwrap();
+    block_on(ok.start(&staged)).unwrap();
     let operations = reference.borrow().operations;
     for at in 0..operations {
         let (m, mut d) = setup();
         m.borrow_mut().fail_at = Some(at);
-        assert!(d.start(&staged).is_err(), "operation {at}");
+        assert!(block_on(d.start(&staged)).is_err(), "operation {at}");
         assert_eq!(d.state(), State::Quarantined, "operation {at}");
         assert_eq!(m.borrow().quarantined, 1);
         let submitted = m.borrow().submitted.clone();
         assert!(matches!(
-            d.start(&staged),
+            block_on(d.start(&staged)),
             Err(StartError::Hardware(Error::InvalidState))
         ));
         drop(d);
@@ -403,7 +416,7 @@ fn descriptor_failures_are_distinct_and_bounded() {
             5 => m.borrow_mut().all_ones = Some(REG_WL2LTECOEX_INDIRECT_ACCESS_CTRL_V1),
             _ => m.borrow_mut().all_ones = Some(REG_DDMA_CH0CTRL),
         }
-        let Err(StartError::Hardware(error)) = d.start(&staged) else {
+        let Err(StartError::Hardware(error)) = block_on(d.start(&staged)) else {
             panic!("mode {mode}");
         };
         assert_eq!(
@@ -439,7 +452,7 @@ fn a_different_exact_provider_target_cannot_be_uploaded_to_this_requester() {
     staged.profile = Profile::select(changed).unwrap();
     let (m, mut d) = setup();
     assert!(matches!(
-        d.start(&staged),
+        block_on(d.start(&staged)),
         Err(StartError::Hardware(Error::WrongChip))
     ));
     assert_eq!(d.state(), State::Idle);
@@ -468,7 +481,7 @@ fn forged_diagnostic_profile_cannot_rebind_another_requesters_provider_image() {
         let (m, mut d) = setup();
         m.borrow_mut().profile = actual;
         assert!(matches!(
-            d.start(&staged),
+            block_on(d.start(&staged)),
             Err(StartError::Hardware(Error::WrongFirmwareTarget))
         ));
         assert_eq!(d.state(), State::Idle);
@@ -485,7 +498,7 @@ fn firmware_download_register_and_packet_trace_matches_unchanged_c() {
         catalog(std::fs::read(std::path::Path::new(&root).join("rtw88/rtw8822c_fw.bin")).unwrap());
     let staged = profile().stage(&c).unwrap();
     let (m, mut d) = setup();
-    d.start(&staged).unwrap();
+    block_on(d.start(&staged)).unwrap();
     let trace =
         std::fs::read(std::env::var("STELA_REALTEK_WIFI_TRANSPORT_ORACLE").unwrap()).unwrap();
     assert_eq!(m.borrow().trace, trace);
@@ -556,7 +569,7 @@ fn download_uses_native_pinned_beacon_dma_with_each_new_completion() {
         0x700,
     )
     .unwrap();
-    d.start(&staged).unwrap();
+    block_on(d.start(&staged)).unwrap();
     let packets = d.io.queue.packets();
     assert_eq!(packets.len(), 51);
     assert_eq!(

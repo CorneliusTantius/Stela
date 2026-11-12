@@ -155,6 +155,20 @@ impl<'a, I: Io> Registers<'a, I> {
         })();
         self.finish(result)
     }
+    /// [`Self::table_delay_us`] as a wait that ends the step of stepped work.
+    pub(super) async fn table_wait_us(&mut self, microseconds: u64) -> Result<(), Error> {
+        if self.failed {
+            return Err(Error::InvalidState);
+        }
+        self.failed = true;
+        let result = async {
+            self.verify()?;
+            super::io::sleep(self.io, microseconds).await;
+            self.verify()
+        }
+        .await;
+        self.finish(result)
+    }
     pub fn read(&mut self, path: Path, address: u8, mask: u32) -> Result<u32, Error> {
         let path = self.validate(path, mask)?;
         self.failed = true;

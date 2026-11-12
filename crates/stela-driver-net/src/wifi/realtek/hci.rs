@@ -100,6 +100,14 @@ pub unsafe fn setup<B: beacon::Registers, R: receive::Registers, T: transmit::Re
     a.done = true;
     Ok(())
 }
+/// `rtw_pci_reset_buf_desc`'s index reset: every TX and RX read and write
+/// pointer, then the H2C queue's host and hardware indices.
+pub(super) fn reset_indices<I: Io>(io: &mut I) -> Result<(), Error> {
+    io.write32(RTK_PCI_TXBD_RWPTR_CLR, u32::MAX)?;
+    let v = read32(io, REG_H2CQ_CSR)?;
+    io.write32(REG_H2CQ_CSR, v | (1 << 16) | (1 << 8))?;
+    Ok(())
+}
 fn read32<I: Io>(io: &mut I, reg: u32) -> Result<u32, Error> {
     let v = io.read32(reg)?;
     if v == u32::MAX {
@@ -161,9 +169,7 @@ fn rebind<I: Io>(io: &mut I, beacon: u32, receive: u32, tx: [u32; 7]) -> Result<
         RTK_PCI_RXBD_DESA_MPDUQ,
         receive,
     )?;
-    io.write32(RTK_PCI_TXBD_RWPTR_CLR, u32::MAX)?;
-    let v = read32(io, REG_H2CQ_CSR)?;
-    io.write32(REG_H2CQ_CSR, v | (1 << 16) | (1 << 8))?;
+    reset_indices(io)?;
     let v = read32(io, RTK_PCI_CTRL)?;
     io.write32(RTK_PCI_CTRL, v | (1 << 20) | (1 << 15))?;
     Ok(())

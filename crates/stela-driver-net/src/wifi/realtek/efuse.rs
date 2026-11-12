@@ -4,14 +4,19 @@
 //! Raw OTP/regulatory/calibration fields do not attest calibrated radio policy.
 use super::{
     identity::{Chip, Profile},
-    io::{self, Io},
+    io::{self, Io, sleep},
     registers::*,
 };
+use stela_driver_base::stepped::yield_now;
 const PHYSICAL: usize = 512;
 const PROTECTED: usize = 124;
 const LOGICAL: usize = 768;
 const USABLE: usize = PHYSICAL - PROTECTED;
 const POLLS: usize = 1_000_000;
+/// Looks at one byte's read that wait in place, about a millisecond, before
+/// each further look ends the step; and the bytes read a step.
+const INLINE_POLLS: usize = 1000;
+const BYTES_A_STEP: usize = 16;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Hardware(io::Error),
@@ -159,7 +164,7 @@ impl Board {
 /// Unknown hardware, timeout/removal or uncertain I/O quarantines the real
 /// owner. This does not perform the separate firmware hardware-feature report,
 /// source PHY power-policy defaults, calibration, channel or station setup.
-pub unsafe fn read<I: Io>(io: &mut I) -> Result<Physical, Error> {
+pub async unsafe fn read<I: Io>(io: &mut I) -> Result<Physical, Error> {
     let profile = io.profile();
     if profile.chip() != Chip::Rtl8822C {
         return Err(Error::WrongChip);
@@ -180,11 +185,18 @@ pub unsafe fn read<I: Io>(io: &mut I) -> Result<Physical, Error> {
     let mut control = a.io.read32(REG_EFUSE_CTRL)?;
     let mut bytes = [0; PHYSICAL];
     for (address, byte) in bytes.iter_mut().enumerate() {
+        if address % BYTES_A_STEP == 0 {
+            yield_now().await;
+        }
         control = (control & !0x3ffff) | ((address as u32) << 8);
         a.io.write32(REG_EFUSE_CTRL, control & !BIT_EF_FLAG)?;
         let mut ready = false;
         for poll in 0..POLLS {
-            a.io.delay_us(1);
+            if poll < INLINE_POLLS {
+                a.io.delay_us(1);
+            } else {
+                sleep(a.io, 1).await;
+            }
             control = a.io.read32(REG_EFUSE_CTRL)?;
             // Source decrements/tests the bound before accepting completion,
             // so even ready on the final millionth observation times out.

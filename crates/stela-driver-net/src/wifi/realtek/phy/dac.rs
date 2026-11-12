@@ -4,7 +4,7 @@
 //! No cached restore, IQK/DPK, runtime tracking or TX admission. Factory RF
 //! trim has its own later consumed phase.
 mod trim;
-use super::{Attempt, Error, InitialPhy, Io, Path, Report, rf};
+use super::{Attempt, Error, InitialPhy, Io, Path, Report, rf, sleep};
 pub use trim::{FactoryBytes, FactoryInitialized, PhyInitialized, ThermalTracking};
 
 const BACKUP: [u32; 16] = [
@@ -52,7 +52,7 @@ impl InitialPhy {
     /// on this device; no raw OTP country or guessed policy suffices.
     /// Run once in exclusive initial process/deferred context. Uncertainty
     /// quarantines the real owner; no rollback or DMA-stop proof is implied.
-    pub unsafe fn calibrate_dac<I: Io>(
+    pub async unsafe fn calibrate_dac<I: Io>(
         self,
         io: &mut I,
         report: &Report,
@@ -88,9 +88,9 @@ impl InitialPhy {
             adck[n] = value;
             let mut converged = false;
             for _ in 0..10 {
-                a.dac_step1(p, value)?;
+                a.dac_step1(p, value).await?;
                 let compensation = a.dac_step2(report, p)?;
-                let offset = a.dac_step3(report, p, adc, compensation)?;
+                let offset = a.dac_step3(report, p, adc, compensation).await?;
                 residual[n] = offset;
                 if offset.into_iter().all(|v| magnitude(v) < 5) {
                     converged = true;
@@ -198,10 +198,10 @@ impl<I: Io> Attempt<'_, I> {
         // SAFETY: same owner/exclusive initial-phase contract.
         Ok(unsafe { rf::Registers::new(self.io, report) }?.write(p, reg, mask, value)?)
     }
-    fn dac_delay(&mut self, us: u64) {
-        self.io.delay_us(us);
+    async fn dac_delay(&mut self, us: u64) {
+        sleep(self.io, us).await;
     }
-    fn dac_ready(&mut self, reg: u32, mask: u32, target: u32) -> Result<(), Error> {
+    async fn dac_ready(&mut self, reg: u32, mask: u32, target: u32) -> Result<(), Error> {
         self.domain()?;
         for _ in 0..1000 {
             let raw = self.io.read32(reg)?;
@@ -212,7 +212,7 @@ impl<I: Io> Attempt<'_, I> {
                 self.domain()?;
                 return Ok(());
             }
-            self.dac_delay(10);
+            self.dac_delay(10).await;
         }
         Err(Error::DacReadyTimeout { register: reg })
     }
@@ -320,7 +320,7 @@ impl<I: Io> Attempt<'_, I> {
         self.dac_rf_write(report, p, 0x8f, 1 << 13, 1)?;
         Ok((adc, adck))
     }
-    fn dac_step1(&mut self, p: Path, adck: u32) -> Result<(), Error> {
+    async fn dac_step1(&mut self, p: Path, adck: u32) -> Result<(), Error> {
         let b = write_base(p);
         let r = read_base(p);
         self.io.write32(b + 0x68, adck)?;
@@ -342,19 +342,19 @@ impl<I: Io> Attempt<'_, I> {
         ] {
             self.io.write32(reg, value)?;
         }
-        self.dac_delay(2000);
+        self.dac_delay(2000).await;
         self.io.write32(b + 0xbc, 0x000aff8d)?;
-        self.dac_delay(2000);
+        self.dac_delay(2000).await;
         self.io.write32(b + 0xb0, 0x0a11fb89)?;
         self.io.write32(b + 0xcc, 0x0a11fb89)?;
-        self.dac_delay(1000);
+        self.dac_delay(1000).await;
         self.io.write32(b + 0xb8, 0x62000000)?;
         self.io.write32(b + 0xd4, 0x62000000)?;
-        self.dac_delay(20000);
-        self.dac_ready(r + 8, 0x7fff80, 0xffff)?;
-        self.dac_ready(r + 0x34, 0x7fff80, 0xffff)?;
+        self.dac_delay(20000).await;
+        self.dac_ready(r + 8, 0x7fff80, 0xffff).await?;
+        self.dac_ready(r + 0x34, 0x7fff80, 0xffff).await?;
         self.io.write32(b + 0xb8, 0x02000000)?;
-        self.dac_delay(1000);
+        self.dac_delay(1000).await;
         self.io.write32(b + 0xbc, 0x0008ff87)?;
         self.io.write32(0x9b4, 0xdb6db600)?;
         self.io.write32(b + 0x10, 0x02d508c5)?;
@@ -379,7 +379,7 @@ impl<I: Io> Attempt<'_, I> {
         self.io.write32(0x1c3c, 0x88103)?;
         Ok(self.dac_measure(report)?.map(compensation))
     }
-    fn dac_step3(
+    async fn dac_step3(
         &mut self,
         report: &Report,
         p: Path,
@@ -406,19 +406,19 @@ impl<I: Io> Attempt<'_, I> {
         self.modify32(b + 0xd8, 0xf0000000, iq[1] & 15)?;
         self.modify32(b + 0xdc, 15, (iq[1] & 0xf0) >> 4)?;
         self.io.write32(b + 0xb8, 0x60000000)?;
-        self.dac_delay(2000);
+        self.dac_delay(2000).await;
         self.modify32(b + 0xbc, 14, 6)?;
-        self.dac_delay(2000);
+        self.dac_delay(2000).await;
         self.io.write32(b + 0xb0, 0x0a11fb89)?;
         self.io.write32(b + 0xcc, 0x0a11fb89)?;
-        self.dac_delay(1000);
+        self.dac_delay(1000).await;
         self.io.write32(b + 0xb8, 0x62000000)?;
         self.io.write32(b + 0xd4, 0x62000000)?;
-        self.dac_delay(20000);
-        self.dac_ready(r + 0x24, 0x07f80000, iq[0])?;
-        self.dac_ready(r + 0x50, 0x07f80000, iq[1])?;
+        self.dac_delay(20000).await;
+        self.dac_ready(r + 0x24, 0x07f80000, iq[0]).await?;
+        self.dac_ready(r + 0x50, 0x07f80000, iq[1]).await?;
         self.io.write32(b + 0xb8, 0x02000000)?;
-        self.dac_delay(1000);
+        self.dac_delay(1000).await;
         self.modify32(b + 0xbc, 14, 3)?;
         self.io.write32(0x9b4, 0xdb6db600)?;
         let temp = ((adc[0] + 0x10) & 0x3ff) | (((adc[1] + 0x10) & 0x3ff) << 10);

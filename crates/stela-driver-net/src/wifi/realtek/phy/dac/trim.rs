@@ -3,7 +3,7 @@
 //! Source RF X2 and factory OTP trim effects.
 mod tail;
 use super::super::super::efuse::Physical;
-use super::{Attempt, DacCalibrated, Error, Io, Path, Report};
+use super::{Attempt, DacCalibrated, Error, Io, Path, Report, sleep};
 pub use tail::{PhyInitialized, ThermalTracking};
 
 const POWER_2G: [usize; 3] = [0x1d4, 0x1ee, 0x1d2];
@@ -78,7 +78,7 @@ impl DacCalibrated {
     /// repeated transport reads; it never admits caller-supplied raw bytes.
     /// This phase does not establish trusted OS/channel/power/adaptivity policy,
     /// analog lock, IQK/DPK, runtime tracking, radio or DMA-stop permission.
-    pub unsafe fn initialize_factory<I: Io>(
+    pub async unsafe fn initialize_factory<I: Io>(
         self,
         io: &mut I,
         report: &Report,
@@ -157,13 +157,13 @@ impl DacCalibrated {
             done: false,
         };
         a.domain()?;
-        a.io.delay_us(1000);
+        sleep(a.io, 1000).await;
         let x2_busy_observed = a.dac_rf_read_mask(report, Path::A, 0xb8, 1 << 15)? != 0;
         if x2_busy_observed {
             for (reg, value) in [(0xb8, 0xc4440), (0xba, 0x6840d), (0xb8, 0x80440)] {
                 a.dac_rf_write(report, Path::A, reg, 0xfffff, value)?;
             }
-            a.io.delay_us(1000);
+            sleep(a.io, 1000).await;
         }
         for (p, value) in [Path::A, Path::B].into_iter().zip(thermal) {
             if let Some(value) = value {

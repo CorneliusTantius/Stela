@@ -5,9 +5,23 @@
 //! firmware download needs; `Bar` is the plain BAR shared by the beacon, RX
 //! and TX register blocks.
 use super::identity::{Chip, Profile};
-use crate::{Clock, bus::mmio::Mmio};
+use crate::{Clock, Deadline, bus::mmio::Mmio};
 use alloc::sync::Arc;
 use core::ptr::NonNull;
+use stela_driver_base::stepped::{until, yield_now};
+
+/// A wait of `microseconds` in stepped work: the step ends, and the work goes
+/// on once the wait has passed on `io`'s clock. Registers without a clock
+/// delay in place and end the step after.
+pub async fn sleep<I: Io + ?Sized>(io: &mut I, microseconds: u64) {
+    match io.deadline(microseconds) {
+        Some(deadline) => until(deadline).await,
+        None => {
+            io.delay_us(microseconds);
+            yield_now().await;
+        }
+    }
+}
 
 /// Bytes of the BAR every RTL8822C register block reaches.
 pub const BAR_BYTES: usize = 0x170c;
@@ -78,6 +92,11 @@ pub unsafe trait Io {
     fn now_us(&mut self) -> Result<u64, Error> {
         Err(Error::InvalidClock)
     }
+    /// When a wait of `microseconds` from now ends, on the clock the delays
+    /// keep; `None` where [`Self::delay_us`] stands in for one.
+    fn deadline(&mut self, _microseconds: u64) -> Option<Deadline> {
+        None
+    }
     fn submit_beacon(&mut self, data: &[u8]) -> Result<(), Error>;
     /// # Safety
     /// Same new BCN_VALID completion proof as BeaconQueue::consumed.
@@ -113,6 +132,9 @@ unsafe impl<I: Io> Io for &mut I {
     }
     fn now_us(&mut self) -> Result<u64, Error> {
         (**self).now_us()
+    }
+    fn deadline(&mut self, microseconds: u64) -> Option<Deadline> {
+        (**self).deadline(microseconds)
     }
     fn submit_beacon(&mut self, data: &[u8]) -> Result<(), Error> {
         (**self).submit_beacon(data)
@@ -164,33 +186,31 @@ impl<Q: BeaconQueue> NativeIo<Q> {
         // this entry additionally requires completed prior MAC power setup.
         unsafe { Self::mapped(window, bytes, queue, owner, clock, profile) }
     }
-    /// Construct the real native interface and execute the source MAC power
-    /// sequence before firmware download. No FIFO/HCI/radio readiness implied.
+    /// Construct the real native interface for the source MAC power sequence
+    /// ([`super::power::on`]) before firmware download. No MAC power, FIFO,
+    /// HCI or radio readiness is implied.
     ///
     /// # Safety
     /// Same real UC BAR/requester/profile/clock ownership as `new`, except MAC
     /// power may be off or left on by prior firmware. All old DMA/IRQ workers
     /// are acknowledged stopped and drained; the native beacon queue is
     /// fresh/idle, its isolated domain owns all mappings and no competing
-    /// power/reset path exists. Caller keeps validated FIFO geometry for
-    /// the later source MAC configuration and download restore boundary.
-    /// After this sequence, HCI/beacon-base reconfiguration/readback
-    /// is required before Download or queue submission. The software queue's
-    /// configured flag is not evidence that its base survived a power cycle.
-    pub unsafe fn power_on_new(
+    /// power/reset path exists. Caller runs the power sequence first and
+    /// keeps validated FIFO geometry for the later source MAC configuration
+    /// and download restore boundary. After that sequence, HCI/beacon-base
+    /// reconfiguration/readback is required before Download or queue
+    /// submission. The software queue's configured flag is not evidence that
+    /// its base survived a power cycle.
+    pub unsafe fn unpowered(
         window: NonNull<u8>,
         bytes: usize,
         queue: Q,
         owner: Arc<dyn core::any::Any>,
         clock: Clock,
         profile: Profile,
-    ) -> Result<Self, super::power::Error> {
+    ) -> Result<Self, Error> {
         // SAFETY: caller supplies the exclusive mapped requester.
-        let mut io = unsafe { Self::mapped(window, bytes, queue, owner, clock, profile)? };
-        // SAFETY: entry contract requires independent stop/drain and fresh
-        // idle queue, not a manufactured reset/firmware completion proof.
-        unsafe { super::power::on(&mut io)? };
-        Ok(io)
+        unsafe { Self::mapped(window, bytes, queue, owner, clock, profile) }
     }
     /// # Safety
     /// Exclusive UC BAR, owned requester, calibrated clock and exact
@@ -272,6 +292,9 @@ unsafe impl<Q: BeaconQueue> Io for NativeIo<Q> {
     fn now_us(&mut self) -> Result<u64, Error> {
         self.owned.as_ref().ok_or(Error::InvalidState)?;
         Ok(self.clock.now_us())
+    }
+    fn deadline(&mut self, microseconds: u64) -> Option<Deadline> {
+        Some(self.clock.deadline(microseconds))
     }
     fn submit_beacon(&mut self, data: &[u8]) -> Result<(), Error> {
         self.owned

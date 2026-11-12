@@ -4,7 +4,7 @@
 //! power/reset registers and never grants RF/channel/Link readiness.
 use super::{
     identity::Chip,
-    io::{Error as HardwareError, Io},
+    io::{Error as HardwareError, Io, sleep},
     registers::*,
 };
 mod tables;
@@ -84,7 +84,7 @@ impl<I: Io> Drop for Attempt<'_, I> {
 /// queue is fresh/idle. Power transitions do not prove IOMMU invalidation or
 /// authorize releasing any queue/domain/pin. On error the I/O owner is
 /// quarantined, and no retry is allowed without independent reset/ownership.
-pub unsafe fn on<I: Io>(io: &mut I) -> Result<(), Error> {
+pub async unsafe fn on<I: Io>(io: &mut I) -> Result<(), Error> {
     let profile = io.profile();
     if profile.chip() != Chip::Rtl8822C {
         return Err(Error::UnsupportedChip);
@@ -96,21 +96,22 @@ pub unsafe fn on<I: Io>(io: &mut I) -> Result<(), Error> {
         io,
         complete: false,
     };
-    let result = (|| {
+    let result = async {
         let observed = attempt.io.read32(REG_SYS_CFG1)?;
         if observed != profile.observed().sys_cfg1 || observed == u32::MAX {
             return Err(Error::IdentityChanged);
         }
         pre_system(attempt.io)?;
-        if !switch(attempt.io, true)? {
-            switch(attempt.io, false)?;
+        if !switch(attempt.io, true).await? {
+            switch(attempt.io, false).await?;
             pre_system(attempt.io)?;
-            if !switch(attempt.io, true)? {
+            if !switch(attempt.io, true).await? {
                 return Err(Error::InvalidPowerState);
             }
         }
         system(attempt.io)
-    })();
+    }
+    .await;
     attempt.complete = result.is_ok();
     result
 }
@@ -143,7 +144,7 @@ pub unsafe fn off<I: Io>(io: &mut I) -> Result<(), Error> {
         for register in [REG_HIMR0, REG_HIMR1, REG_HIMR3] {
             attempt.io.write32(register, 0)?;
         }
-        switch(attempt.io, false).map(|_| ())
+        stela_driver_base::stepped::block_on(switch(attempt.io, false)).map(|_| ())
     })();
     attempt.complete = result.is_ok();
     result
@@ -181,7 +182,7 @@ fn system<I: Io>(io: &mut I) -> Result<(), Error> {
     }
     Ok(())
 }
-fn switch<I: Io>(io: &mut I, on: bool) -> Result<bool, Error> {
+async fn switch<I: Io>(io: &mut I, on: bool) -> Result<bool, Error> {
     let rpwm = io.read8(RPWM_PCIE)?;
     if io.read16(REG_MCUFW_CTRL)? == FW_READY {
         io.write8(RPWM_PCIE, (rpwm ^ BIT_RPWM_TOGGLE) & BIT_RPWM_TOGGLE)?;
@@ -197,20 +198,20 @@ fn switch<I: Io>(io: &mut I, on: bool) -> Result<bool, Error> {
         [TRANS_ACT_TO_CARDEMU_8822C, TRANS_CARDEMU_TO_CARDDIS_8822C]
     };
     for table in sequence {
-        run(io, table, cut_mask)?;
+        run(io, table, cut_mask).await?;
     }
     Ok(true)
 }
-fn poll<I: Io>(io: &mut I, register: u32, mask: u8, target: u8) -> Result<bool, Error> {
+async fn poll<I: Io>(io: &mut I, register: u32, mask: u8, target: u8) -> Result<bool, Error> {
     for _ in 0..POLLS {
         if io.read8(register)? & mask == target & mask {
             return Ok(true);
         }
-        io.delay_us(50);
+        sleep(io, 50).await;
     }
     Ok(false)
 }
-fn run<I: Io>(io: &mut I, table: &[Step], cut_mask: u8) -> Result<(), Error> {
+async fn run<I: Io>(io: &mut I, table: &[Step], cut_mask: u8) -> Result<(), Error> {
     for step in table {
         if step.command == 4 {
             return Ok(());
@@ -227,13 +228,13 @@ fn run<I: Io>(io: &mut I, table: &[Step], cut_mask: u8) -> Result<(), Error> {
         match step.command {
             1 => modify8(io, register, step.mask, step.value & step.mask)?,
             2 => {
-                if poll(io, register, step.mask, step.value)? {
+                if poll(io, register, step.mask, step.value).await? {
                     continue;
                 }
                 let power = io.read8(4)?;
                 io.write8(4, power | 8)?;
                 io.write8(4, power & !8)?;
-                if !poll(io, register, step.mask, step.value)? {
+                if !poll(io, register, step.mask, step.value).await? {
                     return Err(Error::PollTimeout {
                         register,
                         mask: step.mask,
@@ -241,8 +242,8 @@ fn run<I: Io>(io: &mut I, table: &[Step], cut_mask: u8) -> Result<(), Error> {
                     });
                 }
             }
-            3 if step.value == 0 => io.delay_us(register.into()),
-            3 if step.value == 1 => io.delay_us(u64::from(register) * 1000),
+            3 if step.value == 0 => sleep(io, register.into()).await,
+            3 if step.value == 1 => sleep(io, u64::from(register) * 1000).await,
             _ => return Err(Error::UnsupportedCommand(step.command)),
         }
     }
@@ -258,6 +259,7 @@ mod tests {
     };
     use super::*;
     use alloc::vec::Vec;
+    use stela_driver_base::stepped::block_on;
     struct Model {
         profile: Profile,
         bytes: Vec<u8>,
@@ -399,7 +401,7 @@ mod tests {
                 for flash in [false, true] {
                     let mut m = Model::new(cut, powered, flash);
                     // SAFETY: synchronous stopped virtual requester, no active queue.
-                    unsafe { on(&mut m) }.unwrap();
+                    block_on(unsafe { on(&mut m) }).unwrap();
                     assert_eq!(m.get(REG_CR, 1), 0);
                     assert_eq!(m.get(REG_CPU_DMEM_CON, 4) & 0x10100, 0x10100);
                     assert_eq!(m.get(REG_SYS_FUNC_EN + 1, 1) & 0xd8, 0xd8);
@@ -426,7 +428,7 @@ mod tests {
             assert_eq!(m.quarantines, 0);
             // A later power-on starts from the disabled card.
             // SAFETY: as above.
-            unsafe { on(&mut m) }.unwrap();
+            block_on(unsafe { on(&mut m) }).unwrap();
             assert_eq!(m.get(REG_CR, 1), 0);
         }
         let mut m = Model::new(1, false, false);
@@ -444,9 +446,12 @@ mod tests {
     fn unsupported_cut_and_chip_have_no_successful_skipped_sequence() {
         for cut in 7..16 {
             let mut m = Model::new(cut, false, false);
-            // SAFETY: the model device, its pages and its domain belong to this test alone; no
-            // other driver, worker or DMA touches them.
-            assert_eq!(unsafe { on(&mut m) }, Err(Error::UnsupportedCut(cut)));
+            assert_eq!(
+                // SAFETY: the model device, its pages and its domain belong to this test alone; no
+                // other driver, worker or DMA touches them.
+                block_on(unsafe { on(&mut m) }),
+                Err(Error::UnsupportedCut(cut))
+            );
             assert_eq!(m.operations, 0);
             assert_eq!(m.quarantines, 0);
         }
@@ -456,7 +461,7 @@ mod tests {
         m.profile = Profile::select(o).unwrap();
         // SAFETY: the model device, its pages and its domain belong to this test alone; no other
         // driver, worker or DMA touches them.
-        assert_eq!(unsafe { on(&mut m) }, Err(Error::UnsupportedChip));
+        assert_eq!(block_on(unsafe { on(&mut m) }), Err(Error::UnsupportedChip));
         assert_eq!(m.operations, 0);
     }
     #[test]
@@ -465,13 +470,16 @@ mod tests {
             let mut baseline = Model::new(1, powered, true);
             // SAFETY: the model device, its pages and its domain belong to this test alone; no
             // other driver, worker or DMA touches them.
-            unsafe { on(&mut baseline) }.unwrap();
+            block_on(unsafe { on(&mut baseline) }).unwrap();
             for at in 0..baseline.operations {
                 let mut m = Model::new(1, powered, true);
                 m.fail_at = Some(at);
-                // SAFETY: the model device, its pages and its domain belong to this test alone; no
-                // other driver, worker or DMA touches them.
-                assert!(unsafe { on(&mut m) }.is_err(), "on={powered} op={at}");
+                assert!(
+                    // SAFETY: the model device, its pages and its domain belong to this test alone; no
+                    // other driver, worker or DMA touches them.
+                    block_on(unsafe { on(&mut m) }).is_err(),
+                    "on={powered} op={at}"
+                );
                 assert_eq!(m.quarantines, 1);
             }
         }
@@ -479,7 +487,7 @@ mod tests {
         m.set(REG_SYS_CFG1, 4, u32::MAX);
         // SAFETY: the model device, its pages and its domain belong to this test alone; no other
         // driver, worker or DMA touches them.
-        assert_eq!(unsafe { on(&mut m) }, Err(Error::IdentityChanged));
+        assert_eq!(block_on(unsafe { on(&mut m) }), Err(Error::IdentityChanged));
         assert_eq!(m.operations, 1);
         assert_eq!(m.quarantines, 1);
     }
@@ -489,7 +497,7 @@ mod tests {
         m.recover = true;
         // SAFETY: the model device, its pages and its domain belong to this test alone; no other
         // driver, worker or DMA touches them.
-        unsafe { on(&mut m) }.unwrap();
+        block_on(unsafe { on(&mut m) }).unwrap();
         assert!(m.toggled);
         assert_eq!(m.quarantines, 0);
         let mut m = Model::new(1, false, false);
@@ -497,7 +505,7 @@ mod tests {
         assert_eq!(
             // SAFETY: the model device, its pages and its domain belong to this test alone; no
             // other driver, worker or DMA touches them.
-            unsafe { on(&mut m) },
+            block_on(unsafe { on(&mut m) }),
             Err(Error::PollTimeout {
                 register: 6,
                 mask: 2,
@@ -544,7 +552,7 @@ mod tests {
                     let mut m = Model::new(cut, powered, flash);
                     // SAFETY: the model device, its pages and its domain belong to this test alone;
                     // no other driver, worker or DMA touches them.
-                    unsafe { on(&mut m) }.unwrap();
+                    block_on(unsafe { on(&mut m) }).unwrap();
                     let length =
                         u32::from_le_bytes(trace[offset..offset + 4].try_into().unwrap()) as usize;
                     offset += 4;

@@ -16,9 +16,14 @@ use super::{
     efuse::Board,
     features::Report,
     identity::{Chip, Profile},
-    io::{self, Io},
+    io::{self, Io, sleep},
     rf::{self, Path},
 };
+use alloc::vec::Vec;
+use stela_driver_base::stepped::yield_now;
+
+/// Table writes between two steps of the bring-up.
+const ENTRIES_A_STEP: usize = 256;
 pub use dac::{DacCalibrated, FactoryBytes, FactoryInitialized, PhyInitialized, ThermalTracking};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -496,7 +501,9 @@ impl<I: Io> Attempt<'_, I> {
         }
         self.modify32(0x1c3c, 3, if pre { 0 } else { 3 })
     }
-    fn table(
+    /// Load one table: each delay entry a wait that ends the step, and
+    /// [`ENTRIES_A_STEP`] writes at most between two steps.
+    async fn table(
         &mut self,
         table: &[[u32; 2]],
         kind: Kind,
@@ -504,44 +511,55 @@ impl<I: Io> Attempt<'_, I> {
         report: &Report,
     ) -> Result<usize, Error> {
         self.verify()?;
-        let count = match kind {
+        let mut entries = Vec::new();
+        walk(condition, table, |address, value| {
+            entries.push((address, value));
+            Ok(())
+        })?;
+        match kind {
             Kind::Rf(path) => {
                 // SAFETY: outer initializer requires same requester,
                 // report boot epoch, kept full BAR/pins and exclusive
                 // source-phase ownership; domain enable was performed above.
                 let mut rf = unsafe { rf::Registers::new(self.io, report) }?;
-                walk(condition, table, |address, value| {
+                for (at, &(address, value)) in entries.iter().enumerate() {
                     match address {
-                        0xffe => rf.table_delay_us(50000)?,
-                        0xfe => rf.table_delay_us(100)?,
+                        0xffe => rf.table_wait_us(50000).await?,
+                        0xfe => rf.table_wait_us(100).await?,
                         _ => {
                             rf.write(path, address as u8, 0xfffff, value)?;
                             rf.table_delay_us(1)?;
+                            if at % ENTRIES_A_STEP == ENTRIES_A_STEP - 1 {
+                                yield_now().await;
+                            }
                         }
                     }
-                    Ok(())
-                })?
-            }
-            _ => walk(condition, table, |address, value| {
-                match kind {
-                    Kind::Mac => self.io.write8(address, value as u8)?,
-                    Kind::Agc => self.io.write32(address, value)?,
-                    Kind::Bb => match address {
-                        0xfe => self.io.delay_us(50000),
-                        0xfd => self.io.delay_us(5000),
-                        0xfc => self.io.delay_us(1000),
-                        0xfb => self.io.delay_us(50),
-                        0xfa => self.io.delay_us(5),
-                        0xf9 => self.io.delay_us(1),
-                        _ => self.io.write32(address, value)?,
-                    },
-                    Kind::Rf(_) => unreachable!(),
                 }
-                Ok(())
-            })?,
-        };
+            }
+            _ => {
+                for (at, &(address, value)) in entries.iter().enumerate() {
+                    match kind {
+                        Kind::Mac => self.io.write8(address, value as u8)?,
+                        Kind::Agc => self.io.write32(address, value)?,
+                        Kind::Bb => match address {
+                            0xfe => sleep(self.io, 50000).await,
+                            0xfd => sleep(self.io, 5000).await,
+                            0xfc => sleep(self.io, 1000).await,
+                            0xfb => sleep(self.io, 50).await,
+                            0xfa => sleep(self.io, 5).await,
+                            0xf9 => sleep(self.io, 1).await,
+                            _ => self.io.write32(address, value)?,
+                        },
+                        Kind::Rf(_) => unreachable!(),
+                    }
+                    if at % ENTRIES_A_STEP == ENTRIES_A_STEP - 1 {
+                        yield_now().await;
+                    }
+                }
+            }
+        }
         self.verify()?;
-        Ok(count)
+        Ok(entries.len())
     }
 }
 
@@ -560,7 +578,7 @@ impl<I: Io> Attempt<'_, I> {
 /// once in the initial source PHY phase per boot. Run in
 /// exclusive process/deferred context with calibrated real delays. Loaded is
 /// diagnostic data, never an alternative ownership or completed-radio proof.
-pub unsafe fn initialize<I: Io>(
+pub async unsafe fn initialize<I: Io>(
     io: &mut I,
     board: &Board,
     report: &Report,
@@ -617,7 +635,7 @@ pub unsafe fn initialize<I: Io>(
                 a.modify32(0x1cd0, 1 << bit, value)?;
             }
         }
-        let actual = a.table(table, kind, condition, report)?;
+        let actual = a.table(table, kind, condition, report).await?;
         debug_assert_eq!(actual, configured[i]);
     }
     let crystal = u32::from(board.raw().crystal_cap_raw & 0x7f);

@@ -2,6 +2,7 @@ extern crate std;
 use super::*;
 use alloc::{sync::Arc, vec, vec::Vec};
 use std::sync::Mutex;
+use stela_driver_base::stepped::block_on;
 
 struct Model {
     profile: Profile,
@@ -137,7 +138,7 @@ fn setup(one_path: bool) -> (Arc<Mutex<Model>>, ModelIo, Report) {
     // Internal modeled source report read constructs immutable capability
     // data; Download's separately tested fresh request/boot fence is not
     // bypassable through any public Report constructor.
-    let report = super::super::features::read(&mut io).unwrap();
+    let report = block_on(super::super::features::read(&mut io)).unwrap();
     model.lock().unwrap().calls = 0;
     (model, io, report)
 }
@@ -335,7 +336,7 @@ fn native_mmio_uses_real_rf_offsets_widths_and_keeps_uncertain_owner() {
         )
     }
     .unwrap();
-    let report = super::super::features::read(&mut io).unwrap();
+    let report = block_on(super::super::features::read(&mut io)).unwrap();
     bar.set(BASE[1] + 0x18 * 4, 0xf1234567);
     {
         // SAFETY: the model device, its pages and its domain belong to this test alone; no
