@@ -1240,30 +1240,53 @@ static REASON: Global<Option<alloc::string::String>> = Global(RefCell::new(None)
 fn outcome(code: u32) {
     let reason = REASON.0.try_borrow().ok();
     outcome_lines(
+        Ended::Stopped,
         code,
         reason.as_ref().and_then(|reason| reason.as_deref()),
         |line| arguments(format_args!("{line}")),
     );
 }
 
+/// How a boot ended, for its outcome block.
+#[derive(Clone, Copy)]
+pub enum Ended {
+    /// It stopped for good ([`terminate`]), in the step that runs.
+    Stopped,
+    /// The PC restarts, as macOS restarted the Mac.
+    Restarted,
+    /// The PC turns off, as macOS turned the Mac off.
+    TurnedOff,
+}
+
+/// End the boot's block in the log as the PC restarts or turns off: the
+/// outcome block, which the boot log keeps.
+pub fn ended(how: Ended, code: u32) {
+    outcome_lines(how, code, None, |line| arguments(format_args!("{line}")));
+}
+
 /// The outcome block's lines, given to `each` in pieces that end each line
 /// with its line feed, built without the heap for a panic's report.
-fn outcome_lines(code: u32, reason: Option<&str>, mut each: impl FnMut(&str)) {
+fn outcome_lines(how: Ended, code: u32, reason: Option<&str>, mut each: impl FnMut(&str)) {
     use stela_boot_core::log_style::{OUTCOME, RULE, THIN_RULE};
     let millis = match TSC_HZ.load(Ordering::Relaxed) {
         0 => 0,
         hz => rdtsc() / (hz / 1000).max(1),
     };
     let mut line = Text::<512>::default();
-    crate::status::current(|step| {
-        let _ = write!(
-            line,
-            "{OUTCOME}stopped in \"{}\" at {}.{} s, code {code:#x}",
-            step.unwrap_or("the start"),
-            millis / 1000,
-            millis % 1000 / 100,
-        );
-    });
+    let _ = line.write_str(OUTCOME);
+    let _ = match how {
+        Ended::Stopped => crate::status::current(|step| {
+            write!(line, "stopped in \"{}\"", step.unwrap_or("the start"))
+        }),
+        Ended::Restarted => line.write_str("restarted"),
+        Ended::TurnedOff => line.write_str("turned off"),
+    };
+    let _ = write!(
+        line,
+        " at {}.{} s, code {code:#x}",
+        millis / 1000,
+        millis % 1000 / 100
+    );
     if let Some(reason) = reason
         && write!(line, ": {reason}").is_err()
     {
@@ -1291,7 +1314,7 @@ pub(crate) fn at_panic(report: &str, reason: &str) -> Result<(), &'static str> {
     PANICKING.store(true, Ordering::Relaxed);
     let kept = record_only(report);
     release_held();
-    outcome_lines(0x11, Some(reason), |line| {
+    outcome_lines(Ended::Stopped, 0x11, Some(reason), |line| {
         let _ = Serial.write_str(line);
         record_only(line);
     });

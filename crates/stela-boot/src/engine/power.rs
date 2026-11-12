@@ -287,6 +287,7 @@ impl HostPowerControl {
 
     /// Restart the host machine.
     pub fn restart(&self) -> ! {
+        output::ended(output::Ended::Restarted, RESTART_CODE);
         output::arguments(format_args!("STELA RESTART code={RESTART_CODE:#x}\n"));
         output::close_logs();
         self.disks.shutdown(false);
@@ -324,6 +325,7 @@ impl HostPowerControl {
 
     /// Power the host machine off.
     pub fn power_off(&self) -> ! {
+        output::ended(output::Ended::TurnedOff, POWER_OFF_CODE);
         output::arguments(format_args!("STELA POWER-OFF code={POWER_OFF_CODE:#x}\n"));
         output::close_logs();
         self.disks.shutdown(true);

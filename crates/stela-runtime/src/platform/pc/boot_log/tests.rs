@@ -70,7 +70,7 @@ fn text(log: &Log) -> String {
 
 #[test]
 fn a_device_that_keeps_no_writes_fails_the_check() {
-    let mut disk = Recorder::new(HEADER_BYTES + 4096, 512);
+    let mut disk = Recorder::new(LAYOUT_BYTES + 4096, 512);
     let mut writer = Writer::open(&mut disk).unwrap();
     writer.flush(&mut disk).unwrap();
     assert_eq!(writer.verify(&mut disk), Ok(()));
@@ -84,7 +84,7 @@ fn a_device_that_keeps_no_writes_fails_the_check() {
             written: 0x1a
         })
     );
-    let mut blank = Recorder::new(HEADER_BYTES + 4096, 512);
+    let mut blank = Recorder::new(LAYOUT_BYTES + 4096, 512);
     blank.dropping = true;
     let mut writer = Writer::open(&mut blank).unwrap();
     writer.flush(&mut blank).unwrap();
@@ -96,7 +96,7 @@ fn a_device_that_keeps_no_writes_fails_the_check() {
 
 #[test]
 fn a_resumed_log_continues_the_same_boot() {
-    let mut disk = Recorder::new(HEADER_BYTES + 4 * 4096, 512);
+    let mut disk = Recorder::new(LAYOUT_BYTES + 4 * 4096, 512);
     let mut loader = Writer::open(&mut disk).unwrap();
     loader.append(b"before the takeover\n");
     loader.flush(&mut disk).unwrap();
@@ -115,7 +115,7 @@ fn a_resumed_log_continues_the_same_boot() {
 #[test]
 fn boots_append_markers_on_512_and_4096_byte_blocks() {
     for block in [512, 4096] {
-        let mut disk = Recorder::new(HEADER_BYTES + 4 * 4096, block);
+        let mut disk = Recorder::new(LAYOUT_BYTES + 4 * 4096, block);
         let mut writer = Writer::open(&mut disk).unwrap();
         assert_eq!(writer.fresh(), Some(&HeaderError::Blank));
         assert_eq!(writer.boots(), 1);
@@ -161,7 +161,7 @@ fn the_ring_wraps_and_the_reader_keeps_order() {
     for block in [512, 4096] {
         // A two-block ring.
         let ring = 2 * u64::from(block);
-        let mut disk = Recorder::new(HEADER_BYTES + ring, block);
+        let mut disk = Recorder::new(LAYOUT_BYTES + ring, block);
         let mut writer = Writer::open(&mut disk).unwrap();
         let mut stream: Vec<u8> = b"=== STELA BOOT 1 ===\n".to_vec();
         for line in 0..(3 * ring / 10) {
@@ -192,8 +192,9 @@ fn the_ring_wraps_and_the_reader_keeps_order() {
 #[test]
 fn the_reader_orders_a_wrapped_region() {
     let ring = 16u64;
-    let mut region = vec![0u8; (HEADER_BYTES + ring) as usize];
+    let mut region = vec![0u8; (LAYOUT_BYTES + ring) as usize];
     Header {
+        version: VERSION,
         head: ring + 5,
         boots: 3,
         ring_bytes: ring,
@@ -201,7 +202,7 @@ fn the_reader_orders_a_wrapped_region() {
     .encode(&mut region[..HEADER_BYTES as usize]);
     // Stream bytes 5..21: 16..21 wrapped to ring 0..5.
     for at in 5..ring + 5 {
-        region[(HEADER_BYTES + at % ring) as usize] = b'a' + at as u8;
+        region[(LAYOUT_BYTES + at % ring) as usize] = b'a' + at as u8;
     }
     let log = read(&region).unwrap();
     assert_eq!(log.boots, 3);
@@ -213,7 +214,7 @@ fn the_reader_orders_a_wrapped_region() {
 #[test]
 fn the_header_is_written_last_so_an_interrupted_flush_keeps_the_old_stream() {
     for block in [512, 4096] {
-        let mut disk = Recorder::new(HEADER_BYTES + 8 * 4096, block);
+        let mut disk = Recorder::new(LAYOUT_BYTES + 8 * 4096, block);
         let mut writer = Writer::open(&mut disk).unwrap();
         writer.append(b"kept\n");
         writer.flush(&mut disk).unwrap();
@@ -282,7 +283,7 @@ fn a_pending_overflow_is_reported_in_the_stream() {
     assert_eq!(copy(&pending, 10), (10, Vec::new()));
 
     // The writer's own buffer between flushes.
-    let mut disk = Recorder::new(HEADER_BYTES + 4 * 4096, 512);
+    let mut disk = Recorder::new(LAYOUT_BYTES + 4 * 4096, 512);
     let mut writer = Writer::with_pending(&mut disk, 64, true).unwrap();
     for line in 0..10 {
         writer.append(format!("line {line:02}\n").as_bytes());
@@ -298,7 +299,7 @@ fn a_pending_overflow_is_reported_in_the_stream() {
 
 #[test]
 fn a_blank_or_invalid_header_starts_a_fresh_log_and_the_reader_refuses_it() {
-    let mut disk = Recorder::new(HEADER_BYTES + 4096, 512);
+    let mut disk = Recorder::new(LAYOUT_BYTES + 4096, 512);
     assert_eq!(disk.log(), Err(HeaderError::Blank));
     let mut writer = Writer::open(&mut disk).unwrap();
     writer.append(b"old boot\n");
@@ -311,7 +312,7 @@ fn a_blank_or_invalid_header_starts_a_fresh_log_and_the_reader_refuses_it() {
         bytes
     };
     let mut wrong_version = good.clone();
-    wrong_version[8] = 2;
+    wrong_version[8] = 3;
     let digest = Sha256::digest(&wrong_version[..FIELDS]);
     wrong_version[FIELDS..RECORD].copy_from_slice(&digest);
     let mut other_ring = good.clone();
@@ -322,7 +323,7 @@ fn a_blank_or_invalid_header_starts_a_fresh_log_and_the_reader_refuses_it() {
         (damage(0), HeaderError::NotALog),
         (damage(16), HeaderError::Checksum),
         (damage(FIELDS + 3), HeaderError::Checksum),
-        (wrong_version, HeaderError::Version(2)),
+        (wrong_version, HeaderError::Version(3)),
         (
             other_ring,
             HeaderError::RingSize {
@@ -441,5 +442,122 @@ fn a_file_gives_the_block_runs_of_its_clusters_that_hold_the_layout() {
     assert_eq!(
         file_runs(&file(&[(0, LOG_BYTES)]), 512, LOG_BYTES),
         Ok(vec![(0, LOG_BYTES / 512)])
+    );
+}
+
+/// Boot `n`'s lines as a boot writes them: its header block, about
+/// `detail` bytes of other lines and, unless it `hangs`, its outcome block
+/// with the time column.
+fn boot_lines(n: u64, detail: usize, hangs: bool) -> String {
+    let mut text = format!("{RULE}\nSTELA   boot {n}\nPC      test CPU\n{THIN_RULE}\n");
+    for line in 0..detail / 16 {
+        text += &format!("detail {line:08}\n");
+    }
+    if !hangs {
+        text += &format!(
+            "{THIN_RULE}\n[ {n:4}.000] OUTCOME stopped in \"step {n}\" at {n}.0 s, code 0x11\n{RULE}\n"
+        );
+    }
+    text
+}
+
+fn kept_outcome(n: u64) -> Vec<u8> {
+    format!("[ {n:4}.000] OUTCOME stopped in \"step {n}\" at {n}.0 s, code 0x11\n").into_bytes()
+}
+
+#[test]
+fn a_ring_filled_by_many_boots_keeps_each_boots_header_and_outcome() {
+    for block in [512, 4096] {
+        let ring = 16 << 10;
+        let mut disk = Recorder::new(LAYOUT_BYTES + ring, block);
+        for n in 1..=100 {
+            let mut writer = Writer::open(&mut disk).unwrap();
+            // Every tenth boot hangs before its outcome.
+            writer.append(boot_lines(n, 2000, n % 10 == 0).as_bytes());
+            writer.flush(&mut disk).unwrap();
+        }
+        let log = disk.log().unwrap();
+        assert_eq!(log.boots, 100);
+        // The ring holds the newest few boots only.
+        assert!(!text(&log).contains("=== STELA BOOT 90 ==="));
+        assert!(text(&log).contains("=== STELA BOOT 100 ==="));
+        let boots: Vec<u64> = log.kept.iter().map(|kept| kept.boot).collect();
+        assert_eq!(boots, (37..=100).collect::<Vec<_>>(), "{block}-byte blocks");
+        for kept in &log.kept {
+            let n = kept.boot;
+            assert_eq!(
+                kept.header,
+                format!("STELA   boot {n}\nPC      test CPU\n").into_bytes()
+            );
+            let outcome = if n % 10 == 0 {
+                Vec::new()
+            } else {
+                kept_outcome(n)
+            };
+            assert_eq!(kept.outcome, outcome, "boot {n}");
+        }
+    }
+}
+
+#[test]
+fn a_resumed_boot_keeps_its_header_for_its_outcome() {
+    let mut disk = Recorder::new(LAYOUT_BYTES + 4 * 4096, 512);
+    let lines = boot_lines(1, 64, false);
+    let (header, rest) = lines.split_at(lines.find("detail").unwrap());
+    let mut loader = Writer::open(&mut disk).unwrap();
+    loader.append(header.as_bytes());
+    loader.flush(&mut disk).unwrap();
+    let mut engine = Writer::resume(&mut disk).unwrap();
+    engine.append(rest.as_bytes());
+    engine.flush(&mut disk).unwrap();
+    let log = disk.log().unwrap();
+    assert_eq!(
+        log.kept,
+        [Kept {
+            boot: 1,
+            header: b"STELA   boot 1\nPC      test CPU\n".to_vec(),
+            outcome: kept_outcome(1),
+        }]
+    );
+    // A boot keeps only its latest outcome block; an outcome block without
+    // a header is kept too.
+    let mut next = Writer::open(&mut disk).unwrap();
+    next.append(format!("{THIN_RULE}\nOUTCOME first\n{RULE}\n").as_bytes());
+    next.append(
+        format!("{THIN_RULE}\nnot an outcome\n{THIN_RULE}\nOUTCOME second\n{RULE}\n").as_bytes(),
+    );
+    next.flush(&mut disk).unwrap();
+    let log = disk.log().unwrap();
+    assert_eq!(log.kept.len(), 2);
+    assert_eq!(log.kept[1].header, b"");
+    assert_eq!(log.kept[1].outcome, b"OUTCOME second\n");
+}
+
+#[test]
+fn a_version_1_log_is_read_and_started_over() {
+    let region = LAYOUT_BYTES + 4096;
+    let mut disk = Recorder::new(region, 512);
+    Header {
+        version: 1,
+        head: 6,
+        boots: 7,
+        ring_bytes: region - HEADER_BYTES,
+    }
+    .encode(&mut disk.disk.bytes[..HEADER_BYTES as usize]);
+    disk.disk.bytes[HEADER_BYTES as usize..HEADER_BYTES as usize + 6].copy_from_slice(b"old 1\n");
+    let log = disk.log().unwrap();
+    assert_eq!((log.boots, log.stream.as_slice()), (7, &b"old 1\n"[..]));
+    assert!(log.kept.is_empty());
+    let mut writer = Writer::open(&mut disk).unwrap();
+    assert_eq!(writer.fresh(), Some(&HeaderError::Version(1)));
+    writer.flush(&mut disk).unwrap();
+    let log = disk.log().unwrap();
+    assert_eq!(text(&log), "=== STELA BOOT 1 ===\n");
+    // The old ring bytes in the kept blocks are cleared, not taken as slots.
+    assert!(log.kept.is_empty());
+    assert!(
+        disk.disk.bytes[HEADER_BYTES as usize..LAYOUT_BYTES as usize]
+            .iter()
+            .all(|&byte| byte == 0)
     );
 }

@@ -24,7 +24,7 @@ use std::{
 use stela_drivers::block::{BlockDevice, BlockError, Identity, Transport};
 use stela_formats::payload::ReadAt;
 use stela_runtime::pc::{
-    boot_log::{self, Log},
+    boot_log::{self, Kept, Log},
     fat32::Fat32,
     gpt::{self, Guid},
     machine_state,
@@ -302,14 +302,17 @@ pub(crate) fn outcome(text: &str) -> Outcome {
             recorded = Some(text.to_owned());
         }
     }
-    let failed = fatal.is_some() || failed_step || running.is_some();
     if let Some(text) = recorded {
+        // A boot that stopped failed; one macOS restarted or turned off
+        // ended, with the guest's step still running.
+        let ended = text.starts_with("restarted") || text.starts_with("turned off");
         return Outcome {
+            failed: fatal.is_some() || failed_step || !ended,
             text,
-            failed,
             recorded: true,
         };
     }
+    let failed = fatal.is_some() || failed_step || running.is_some();
     let text = match (&fatal, &running, &stop) {
         (Some(message), Some(step), _) => format!("stopped in \"{step}\": {message}"),
         (Some(message), None, _) => format!("stopped: {message}"),
@@ -344,44 +347,128 @@ fn strip_stamp(line: &str) -> &str {
     line
 }
 
+/// One boot `stela boot-log` prints: its lines the ring still holds, and
+/// its kept blocks once the ring has overwritten its start.
+struct Listed<'a> {
+    number: Option<u64>,
+    lines: &'a str,
+    kept: Option<&'a Kept>,
+    outcome: Outcome,
+}
+
+/// How a boot whose lines the ring overwrote ended, from its kept outcome
+/// block.
+fn kept_outcome(kept: &Kept) -> Outcome {
+    let block = String::from_utf8_lossy(&kept.outcome);
+    let found = outcome(&block);
+    if found.recorded {
+        return found;
+    }
+    Outcome {
+        text: String::from(
+            "no outcome kept: the boot hung, lost power, or stopped before its log was written \
+             again",
+        ),
+        failed: true,
+        recorded: false,
+    }
+}
+
 /// `log` as `stela boot-log` prints it: each boot `shown` under a title
 /// with its number and outcome, newest last, with private identifiers
 /// shortened, and an outcome block from the tool for a boot that wrote
-/// none.
+/// none. A boot the ring overwrote whole, or the start of, shows the
+/// header and outcome blocks the log kept for it.
 pub(crate) fn render(log: &Log, shown: Shown) -> String {
+    use stela_boot_core::log_style::{RULE, THIN_RULE, redact};
     let stream = String::from_utf8_lossy(&log.stream);
-    let mut boots: Vec<(Boot<'_>, Outcome)> = boots(&stream)
-        .into_iter()
-        .map(|boot| {
-            let outcome = outcome(boot.text);
-            (boot, outcome)
+    let mut parts = boots(&stream);
+    // The part before the first boot marker is the end of the boot before
+    // it, or of the newest boot when the ring holds no marker.
+    let first = parts.iter().find_map(|boot| boot.number);
+    if let Some(part) = parts.first_mut()
+        && part.number.is_none()
+    {
+        part.number = first.map_or(Some(log.boots), |first| first.checked_sub(1));
+    }
+    let oldest = parts.first().and_then(|boot| boot.number);
+    let kept_of = |number: Option<u64>| {
+        number.and_then(|number| log.kept.iter().find(|kept| kept.boot == number))
+    };
+    let mut boots: Vec<Listed<'_>> = log
+        .kept
+        .iter()
+        .filter(|kept| oldest.is_none_or(|oldest| kept.boot < oldest))
+        .map(|kept| Listed {
+            number: Some(kept.boot),
+            lines: "",
+            kept: Some(kept),
+            outcome: kept_outcome(kept),
         })
         .collect();
+    for (index, part) in parts.iter().enumerate() {
+        boots.push(Listed {
+            number: part.number,
+            lines: part.text,
+            kept: (index == 0 && first != part.number)
+                .then(|| kept_of(part.number))
+                .flatten()
+                .filter(|kept| !kept.header.is_empty()),
+            outcome: outcome(part.text),
+        });
+    }
     if shown.failed {
-        boots.retain(|(_, outcome)| outcome.failed);
+        boots.retain(|boot| boot.outcome.failed);
     }
     if shown.last && boots.len() > 1 {
         boots.drain(..boots.len() - 1);
     }
     let rule = "#".repeat(80);
     let mut text = String::new();
-    for (boot, outcome) in &boots {
+    for boot in &boots {
         let name = match boot.number {
             Some(number) => format!("Boot {number}"),
             None => String::from("Older boot, its start overwritten"),
         };
+        let outcome = &boot.outcome;
         let mark = if outcome.failed { "FAILED" } else { "ended" };
         let _ = writeln!(text, "{rule}\n# {name}: {mark}: {}\n{rule}", outcome.text);
-        for line in boot.text.lines() {
-            let _ = writeln!(text, "{}", stela_boot_core::log_style::redact(line));
-        }
-        if !outcome.recorded {
+        if let Some(kept) = boot.kept {
+            let which = if boot.lines.is_empty() {
+                "this boot's lines"
+            } else {
+                "the start of this boot"
+            };
             let _ = writeln!(
                 text,
-                "{}\nOUTCOME (from stela boot-log) {}\n{}",
-                "-".repeat(80),
-                outcome.text,
-                "=".repeat(80)
+                "(the log's ring has overwritten {which}; these are its kept header and outcome)\n\
+                 {RULE}"
+            );
+            for line in String::from_utf8_lossy(&kept.header).lines() {
+                let _ = writeln!(text, "{}", redact(line));
+            }
+            let _ = writeln!(text, "{THIN_RULE}");
+            if boot.lines.is_empty() {
+                for line in String::from_utf8_lossy(&kept.outcome).lines() {
+                    let _ = writeln!(text, "{}", redact(line));
+                }
+                if outcome.recorded {
+                    let _ = writeln!(text, "{RULE}");
+                }
+            }
+        }
+        for line in boot.lines.lines() {
+            let _ = writeln!(text, "{}", redact(line));
+        }
+        if !outcome.recorded {
+            // A kept boot's header block ended with the rule already.
+            if boot.kept.is_none() || !boot.lines.is_empty() {
+                let _ = writeln!(text, "{THIN_RULE}");
+            }
+            let _ = writeln!(
+                text,
+                "OUTCOME (from stela boot-log) {}\n{RULE}",
+                outcome.text
             );
         }
     }
@@ -1218,6 +1305,75 @@ pub(crate) mod tests {
          ended early\n\
          ================================================================================\n",
     ];
+
+    #[test]
+    fn boots_the_ring_overwrote_show_their_kept_blocks() {
+        use stela_boot_core::log_style::{RULE, THIN_RULE};
+        let kept = |boot: u64, outcome: &str| Kept {
+            boot,
+            header: format!(
+                "STELA   0.3.0, build b{boot}\nPC      CPU, disk serial=SERIAL{boot}wxyz\n"
+            )
+            .into_bytes(),
+            outcome: outcome.as_bytes().to_vec(),
+        };
+        let stream = format!(
+            "[  49.000] GUEST| bye\n{THIN_RULE}\n[  50.000] OUTCOME restarted at 50.0 s, code 0x12\n\
+             {RULE}\n=== STELA BOOT 4 ===\n[   1.000] STEP  A\n[   2.000] OK    A (1 ms)\n"
+        );
+        let log = Log {
+            boots: 4,
+            head: 1 << 30,
+            ring_bytes: stream.len() as u64,
+            stream: stream.into_bytes(),
+            kept: vec![
+                kept(
+                    1,
+                    "[   1.000] OUTCOME stopped in \"A\" at 1.0 s, code 0x11: broke\n",
+                ),
+                kept(2, ""),
+                kept(3, "[  50.000] OUTCOME restarted at 50.0 s, code 0x12\n"),
+                kept(4, ""),
+            ],
+        };
+        let rendered = render(&log, Shown::default());
+        let titles: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("# Boot "))
+            .collect();
+        assert_eq!(
+            titles,
+            [
+                "# Boot 1: FAILED: stopped in \"A\" at 1.0 s, code 0x11: broke",
+                "# Boot 2: FAILED: no outcome kept: the boot hung, lost power, or stopped before \
+                 its log was written again",
+                "# Boot 3: ended: restarted at 50.0 s, code 0x12",
+                "# Boot 4: ended: the log ends after \"A\" with no stop recorded",
+            ],
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("overwritten this boot's lines"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("overwritten the start of this boot"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("STELA   0.3.0, build b3\n"), "{rendered}");
+        // Boot 4's start is in the ring, so its kept header is not repeated.
+        assert!(!rendered.contains("build b4"), "{rendered}");
+        assert!(!rendered.contains("SERIAL"), "{rendered}");
+        assert!(rendered.contains("serial=..wxyz"), "{rendered}");
+        let failed = render(
+            &log,
+            Shown {
+                last: false,
+                failed: true,
+            },
+        );
+        assert_eq!(failed.matches("# Boot ").count(), 2, "{failed}");
+    }
 
     #[test]
     fn boots_are_numbered_with_their_outcomes() {
