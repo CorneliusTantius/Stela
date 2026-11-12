@@ -263,12 +263,19 @@ impl<I: Io> Control<I> {
     fn publish_rfk(&mut self, start: bool) -> Result<Published, Error> {
         self.publish(INFORM_RFK_STATUS | (u32::from(start) << 8), 0)
     }
-    /// Publish one of [`super::commands`]' mailbox commands. A mailbox that
-    /// stays busy means firmware stopped taking commands, which quarantines.
+    /// Publish one of [`super::commands`]' mailbox commands. As in
+    /// `rtw_fw_send_h2c_command`, a mailbox still busy after 3 ms drops the
+    /// command with [`Error::MailboxTimeout`]: nothing was written, the next
+    /// command tries the same mailbox, and the device stays usable. Any other
+    /// failure quarantines.
     pub fn command(&mut self, (message, extension): (u32, u32)) -> Result<(), Error> {
         self.ready()?;
         self.poisoned = true;
         let result = self.publish(message, extension);
+        if let Err(Error::MailboxTimeout { mailbox }) = result {
+            self.poisoned = false;
+            return Err(Error::MailboxTimeout { mailbox });
+        }
         self.finish(result).map(|_| ())
     }
     /// Begin source GAPK's RFK handshake from a non-set baseline.
