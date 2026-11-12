@@ -77,6 +77,13 @@ pub struct Logical {
     profile: Profile,
     bytes: [u8; LOGICAL],
 }
+#[cfg(test)]
+impl Logical {
+    /// A map of `profile`'s chip from its bytes, for tests of later phases.
+    pub(crate) fn of(profile: Profile, bytes: [u8; LOGICAL]) -> Self {
+        Self { profile, bytes }
+    }
+}
 impl Logical {
     pub fn profile(&self) -> Profile {
         self.profile

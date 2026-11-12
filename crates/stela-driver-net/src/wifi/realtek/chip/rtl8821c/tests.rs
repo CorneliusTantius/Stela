@@ -28,13 +28,29 @@ pub(crate) struct Regs {
 }
 
 impl Regs {
-    /// Every byte seeded so a set or clear of the wrong bits shows.
+    /// Every byte seeded so a set or clear of the wrong bits shows, with
+    /// the chip's identity in SYS_CFG1 and firmware ready.
     pub fn new(cut: u8) -> Self {
-        Self {
+        let mut r = Self {
             profile: profile(cut),
             bytes: (0..0x4000).map(|i| (i * 37 + 11) as u8).collect(),
             writes: vec![],
-        }
+        };
+        r.set(0xf0, 4, r.profile.observed().sys_cfg1);
+        r.set(0x80, 2, 0xc078);
+        r
+    }
+    /// RF register `address` of path A, as the direct window shows it.
+    pub fn rf(&self, address: u8) -> u32 {
+        self.get(0x2800 + u32::from(address) * 4, 4) & 0xfffff
+    }
+    /// The SIPI writes, as (RF address, data).
+    pub fn sipi(&self) -> Vec<(u8, u32)> {
+        self.writes
+            .iter()
+            .filter(|&&(width, register, _)| width == 4 && register == 0xc90)
+            .map(|&(_, _, v)| ((v >> 20) as u8, v & 0xfffff))
+            .collect()
     }
     pub fn get(&self, register: u32, width: usize) -> u32 {
         let mut b = [0; 4];
@@ -49,6 +65,12 @@ impl Regs {
     fn store(&mut self, register: u32, width: usize, value: u32) -> Result<(), io::Error> {
         self.writes.push((width as u8, register, value));
         self.set(register, width, value);
+        // A SIPI write lands in path A's direct RF window.
+        if register == 0xc90 && width == 4 {
+            let at = 0x2800 + ((value >> 20) & 0xff) * 4;
+            let old = self.get(at, 4);
+            self.set(at, 4, (old & !0xfffff) | (value & 0xfffff));
+        }
         Ok(())
     }
 }

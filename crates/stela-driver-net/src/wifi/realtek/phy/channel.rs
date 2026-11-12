@@ -272,7 +272,8 @@ fn bb<I: Io>(a: &mut Attempt<'_, I>, g: Geometry, index: u8) -> Result<(), Error
     }
     Ok(())
 }
-fn mac<I: Io>(a: &mut Attempt<'_, I>, g: Geometry, index: u8) -> Result<(), Error> {
+/// `rtw_set_channel_mac`.
+pub(super) fn mac<I: Io>(a: &mut Attempt<'_, I>, g: Geometry, index: u8) -> Result<(), Error> {
     let sub40 = if g.width() == Width::Mhz80 {
         if index == 1 || index == 3 { 9 } else { 10 }
     } else {

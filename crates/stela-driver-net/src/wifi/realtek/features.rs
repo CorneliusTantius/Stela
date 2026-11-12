@@ -56,6 +56,15 @@ impl Report {
             capabilities: decode(1 << 27, &raw),
         }
     }
+    /// What a one-path radio on `profile` reports.
+    pub(crate) fn of_one_path(profile: Profile) -> Self {
+        let raw = [0; LENGTH];
+        Self {
+            profile,
+            raw,
+            capabilities: decode(0, &raw),
+        }
+    }
 }
 impl Report {
     pub fn profile(&self) -> Profile {

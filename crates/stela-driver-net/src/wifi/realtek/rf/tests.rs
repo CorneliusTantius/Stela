@@ -4,6 +4,10 @@ use crate::wifi::stepped::block_on;
 use alloc::{sync::Arc, vec, vec::Vec};
 use std::sync::Mutex;
 
+/// The RTL8822C's RF windows and SIPI registers these tests model.
+const BASE: [u32; 2] = [0x3c00, 0x4c00];
+const SIPI: [u32; 2] = [0x1808, 0x4108];
+
 struct Model {
     profile: Profile,
     bytes: Vec<u8>,

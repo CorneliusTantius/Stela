@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // Copyright(c) 2018-2019 Realtek Corporation
-//! RTL8822C physical RF register access from pinned rtw88/phy.c. These are
-//! source direct reads and mixed direct/SIPI writes, not PHY calibration or
-//! table admission. No RF/air/radio readiness is inferred from a register store.
+//! Physical RF register access from pinned rtw88/phy.c: direct reads, and the
+//! chip's direct/SIPI writes. Not PHY calibration or table admission. No
+//! RF/air/radio readiness is inferred from a register store.
 use super::{
+    chip::{RfWrite, Rtw88},
     features::Report,
     identity::Profile,
     io::{self, Io},
@@ -11,8 +12,6 @@ use super::{
 };
 
 const RF_MASK: u32 = 0xfffff;
-const BASE: [u32; 2] = [0x3c00, 0x4c00];
-const SIPI: [u32; 2] = [0x1808, 0x4108];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Path {
@@ -52,6 +51,7 @@ impl From<io::Error> for Error {
 pub struct Registers<'a, I: Io> {
     io: &'a mut I,
     profile: Profile,
+    spec: &'static Rtw88,
     rf_phys: u8,
     failed: bool,
 }
@@ -68,12 +68,14 @@ impl<'a, I: Io> Registers<'a, I> {
     pub unsafe fn new(io: &'a mut I, report: &Report) -> Result<Self, Error> {
         let profile = io.profile();
         let rf_phys = report.capabilities().rf_phys;
-        if profile.rtw88().is_none() || report.profile() != profile || !(1..=2).contains(&rf_phys) {
+        let spec = profile.rtw88().ok_or(Error::WrongProfile)?;
+        if report.profile() != profile || !(1..=spec.rf_paths).contains(&rf_phys) {
             return Err(Error::WrongProfile);
         }
         let mut registers = Self {
             io,
             profile,
+            spec,
             rf_phys,
             failed: true,
         };
@@ -125,7 +127,7 @@ impl<'a, I: Io> Registers<'a, I> {
         result
     }
     fn direct_read(&mut self, path: usize, address: u8) -> Result<u32, Error> {
-        let register = BASE[path] + u32::from(address) * 4;
+        let register = self.spec.rf_base[path] + u32::from(address) * 4;
         let value = self.io.read32(register)?;
         // A whole all-ones RF window observation is ambiguous (removed or
         // unavailable RF) and is refused. Legitimate 20-bit all-ones data with
@@ -177,9 +179,10 @@ impl<'a, I: Io> Registers<'a, I> {
         })();
         self.finish(result)
     }
-    /// Source mixed write: address zero uses the SPI/serial path with a 13us
-    /// delay; every other address uses direct masked MMIO and a 1us delay.
-    /// Success records stores/delay only, never a completed PHY/air operation.
+    /// The chip's write: through the serial (SIPI) path with a 13us delay for
+    /// every address on a SIPI chip and for address zero on a mixed one; else
+    /// direct masked MMIO and a 1us delay. Success records stores/delay only,
+    /// never a completed PHY/air operation.
     pub fn write(&mut self, path: Path, address: u8, mask: u32, data: u32) -> Result<(), Error> {
         let path = self.validate(path, mask)?;
         let shift = mask.trailing_zeros();
@@ -189,16 +192,18 @@ impl<'a, I: Io> Registers<'a, I> {
         self.failed = true;
         let result = (|| {
             self.verify()?;
-            if address == 0 {
+            if address == 0 || self.spec.rf_write == RfWrite::Sipi {
                 let value = if mask == RF_MASK {
                     data
                 } else {
                     (self.direct_read(path, address)? & !mask) | (data << shift)
                 };
-                self.io.write32(SIPI[path], value & RF_MASK)?;
+                let serial = (u32::from(address) << 20) | (value & RF_MASK);
+                self.io
+                    .write32(self.spec.rf_sipi[path], serial & 0x0fff_ffff)?;
                 self.io.delay_us(13);
             } else {
-                let register = BASE[path] + u32::from(address) * 4;
+                let register = self.spec.rf_base[path] + u32::from(address) * 4;
                 let old = self.direct_read(path, address)?;
                 self.io
                     .write32(register, (old & !mask) | ((data << shift) & mask))?;

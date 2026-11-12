@@ -54,6 +54,20 @@ pub struct Rtw88 {
     pub rf_paths: u8,
     /// The RFE options `rfe_defs` defines, the boards the chip's tables know.
     pub rfe_options: &'static [u8],
+    /// `rf_base_addr` and `rf_sipi_addr` of paths A and B.
+    pub rf_base: [u32; 2],
+    pub rf_sipi: [u32; 2],
+    /// `write_rf`.
+    pub rf_write: RfWrite,
+}
+
+/// A chip's `write_rf`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RfWrite {
+    /// `rtw_phy_write_rf_reg_mix`: address 0 through SIPI, the rest direct.
+    Mix,
+    /// `rtw_phy_write_rf_reg_sipi`: every address through SIPI.
+    Sipi,
 }
 
 /// Efuse sizes in bytes.
@@ -129,6 +143,9 @@ pub static RTL8822C: Spec = Spec {
         pcie_aux_clock_cut: Some(3),
         rf_paths: 2,
         rfe_options: &[0, 1, 2, 3, 4, 5, 6],
+        rf_base: [0x3c00, 0x4c00],
+        rf_sipi: [0x1808, 0x4108],
+        rf_write: RfWrite::Mix,
     }),
 };
 
@@ -166,6 +183,9 @@ pub static RTL8821C: Spec = Spec {
         pcie_aux_clock_cut: None,
         rf_paths: 1,
         rfe_options: &[0, 2, 4, 6],
+        rf_base: [0x2800, 0x2c00],
+        rf_sipi: [0xc90, 0xe90],
+        rf_write: RfWrite::Sipi,
     }),
 };
 

@@ -66,14 +66,7 @@ impl FactoryInitialized {
             done: false,
         };
         a.domain()?;
-        let old = a.io.read32(0x14c0)?;
-        let value = ((old | 0x10000) & !(0xf000 | 0x80 | 0x3f)) | 0xa000;
-        a.io.write32(0x14c0, value)?;
-        a.io.write8(0x167c, 0x70)?;
-        a.io.write16(0x1680, 0)?;
-        a.modify32(0x42c, 1 << 30, 1)?;
-        a.io.write8(0x45f, 0x10)?;
-        a.modify32(0x6dc, 0x3f000000, 4)?;
+        a.beamforming_init()?;
         a.domain()?;
         a.done = true;
         let reference = self.thermal_reference;

@@ -12,6 +12,7 @@ pub mod source_mac;
 pub use board_power::Error as BoardPowerError;
 pub use board_power::{FactoryBand, FactoryPower, FactorySheet, GainDelta, QuarterDbmReference};
 mod data;
+pub mod rtl8821c;
 use super::{
     efuse::Board,
     features::Report,
@@ -480,6 +481,18 @@ impl<I: Io> Attempt<'_, I> {
         self.modify32(0x1d70, 0x7f, igi)?;
         self.modify32(0x1d70, 0x7f00, igi)?;
         Ok(igi as u8)
+    }
+    /// `rtw_bf_phy_init`: MU retry limit 10 with MU-MIMO off until sounding,
+    /// the MU ACK policy, NDPA at its own parameters and rate, and CSI at 6M.
+    fn beamforming_init(&mut self) -> Result<(), Error> {
+        let old = self.io.read32(0x14c0)?;
+        let value = ((old | 0x10000) & !(0xf000 | 0x80 | 0x3f)) | 0xa000;
+        self.io.write32(0x14c0, value)?;
+        self.io.write8(0x167c, 0x70)?;
+        self.io.write16(0x1680, 0)?;
+        self.modify32(0x42c, 1 << 30, 1)?;
+        self.io.write8(0x45f, 0x10)?;
+        self.modify32(0x6dc, 0x3f000000, 4)
     }
     fn modify8(&mut self, address: u32, set: u8) -> Result<(), Error> {
         let old = self.io.read8(address)?;

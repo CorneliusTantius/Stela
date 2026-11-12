@@ -66,6 +66,25 @@ subprocess.run(['rustfmt','--edition','2024',str(generated)],check=True)
 native=pathlib.Path(__file__).resolve().parents[3]/'stela-driver-net/src/wifi/realtek/phy/data.rs'
 assert generated.read_bytes()==native.read_bytes(), 'committed native table bytes differ from complete pinned source export'
 manifest.append(dict(native_table_bytes=native.stat().st_size,native_table_sha256=hashlib.sha256(native.read_bytes()).hexdigest(),complete_pairs=46215))
+# The RTL8821C's register tables, exported the same way to its own module.
+source_8821c=(reference/'rtw88/rtw8821c_table.c').read_text()
+assert hashlib.sha256(source_8821c.encode()).hexdigest()=='ebc2547ddd66b7df434e0ef91319eddf5565c452863c4a0fd64660839d3e9a0c'
+rust=['// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause','// Copyright(c) 2018-2019 Realtek Corporation','// RTL8821C register-initialization values from the licensed driver source.','// Source: Linux rtw88/rtw8821c_table.c.','// Full donor SHA256 ebc2547ddd66b7df434e0ef91319eddf5565c452863c4a0fd64660839d3e9a0c.','//! RTL8821C register-initialization tables from rtw8821c_table.c.']
+pairs_8821c=0
+for rust_name,name in [('MAC','rtw8821c_mac'),('AGC','rtw8821c_agc'),('AGC_BTG_TYPE2','rtw8821c_agc_btg_type2'),('BB','rtw8821c_bb'),('RF_A','rtw8821c_rf_a')]:
+    match=re.search(r'static const u32 '+name+r'\[\] = \{(.*?)\n};',source_8821c,re.S)
+    body=re.sub(r'/\*.*?\*/|//[^\n]*','',match.group(1),flags=re.S)
+    assert not re.sub(r'0x[0-9a-fA-F]+|[\s,]','',body)
+    values=[int(v,16) for v in re.findall('0x[0-9a-fA-F]+',body)]
+    assert len(values)%2==0
+    pairs=list(zip(values[::2],values[1::2]));pairs_8821c+=len(pairs)
+    digest=hashlib.sha256(match.group().encode()).hexdigest()
+    rust+=['',f'// {name}: {len(pairs)} complete pairs; source declaration SHA256 {digest}.',f'pub(super) static {rust_name}: &[[u32; 2]] = &[']+[f'    [0x{a:08x}, 0x{v:08x}],' for a,v in pairs]+['];']
+generated=out/'data_8821c.rs';generated.write_text('\n'.join(rust)+'\n')
+subprocess.run(['rustfmt','--edition','2024',str(generated)],check=True)
+native=pathlib.Path(__file__).resolve().parents[3]/'stela-driver-net/src/wifi/realtek/phy/rtl8821c/data.rs'
+assert generated.read_bytes()==native.read_bytes(), 'committed RTL8821C table bytes differ from complete pinned source export'
+manifest.append(dict(native_8821c_table_bytes=native.stat().st_size,native_8821c_table_sha256=hashlib.sha256(native.read_bytes()).hexdigest(),complete_8821c_pairs=pairs_8821c))
 ph=(reference/'rtw88/phy.h').read_text();table_macros=ph[ph.index('#define RTW_DECL_TABLE_PHY_COND_CORE'):ph.index('#define RTW_DECL_TABLE_BB_PG')]
 manifest.append(dict(path='rtw88/phy.h',symbol='source table declaration macros',sha256=hashlib.sha256(table_macros.encode()).hexdigest()))
 chip=(reference/'rtw88/rtw8822c.c').read_text();chip_fields=[]
