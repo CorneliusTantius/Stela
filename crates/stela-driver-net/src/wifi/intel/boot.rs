@@ -138,7 +138,9 @@ impl NativeBootIo {
         Ok(Self {
             // SAFETY: covered by this function's own safety contract.
             registers: unsafe { Mmio::new(window.as_ptr().cast::<u8>() as u64, 16384) },
-            minimum,
+            // Each wait fails once an armed budget passed: a recovery's
+            // bounded slice, as the probe's start.
+            minimum: Rc::new(stela_driver_base::budget::Bounded(minimum)),
             owner,
         })
     }
@@ -160,6 +162,15 @@ impl Csr for NativeBootIo {
     fn delay_us(&mut self, microseconds: u32) -> Result<(), power::AccessError> {
         self.minimum
             .wait_us(u64::from(microseconds))
+            .map_err(power::AccessError::Minimum)
+    }
+    fn begin_interval(
+        &mut self,
+        microseconds: u32,
+    ) -> Result<Option<alloc::boxed::Box<dyn crate::bus::pci::power::Interval>>, power::AccessError>
+    {
+        self.minimum
+            .begin_interval(u64::from(microseconds))
             .map_err(power::AccessError::Minimum)
     }
 }

@@ -11,6 +11,8 @@ use crate::{
     Handoff,
     bus::{mmio::Mmio, pci::Bar},
 };
+use alloc::boxed::Box;
+use stela_driver_base::stepped::{block_on, yield_now};
 
 const HW_IF: u32 = 0;
 const INT: u32 = 8;
@@ -90,6 +92,14 @@ pub trait Csr {
     fn read32(&mut self, register: u32) -> Result<u32, AccessError>;
     fn write32(&mut self, register: u32, value: u32) -> Result<(), AccessError>;
     fn delay_us(&mut self, microseconds: u32) -> Result<(), AccessError>;
+    /// A nonblocking minimum interval of the same source as
+    /// [`Self::delay_us`], when it can give one.
+    fn begin_interval(
+        &mut self,
+        _microseconds: u32,
+    ) -> Result<Option<Box<dyn crate::bus::pci::power::Interval>>, AccessError> {
+        Ok(None)
+    }
 }
 
 /// Direct access to an already mapped BAR. This does not manufacture an
@@ -156,6 +166,14 @@ impl Csr for NativeCsr {
     fn delay_us(&mut self, microseconds: u32) -> Result<(), AccessError> {
         self.minimum
             .wait_us(u64::from(microseconds))
+            .map_err(AccessError::Minimum)
+    }
+    fn begin_interval(
+        &mut self,
+        microseconds: u32,
+    ) -> Result<Option<Box<dyn crate::bus::pci::power::Interval>>, AccessError> {
+        self.minimum
+            .begin_interval(u64::from(microseconds))
             .map_err(AccessError::Minimum)
     }
 }
@@ -270,19 +288,17 @@ pub(super) fn read_memory<C: Csr, const N: usize>(
     family: Family,
     address: u32,
 ) -> Result<[u32; N], Error> {
-    let mut nic = Nic {
-        io,
-        family,
-        bisr: false,
-    };
-    nic.grab()?;
-    nic.write(MEM_RADDR, address)?;
-    let mut words = [0; N];
-    for word in &mut words {
-        *word = nic.io.read32(MEM_RDATA)?;
-    }
-    nic.release()?;
-    Ok(words)
+    block_on(async move {
+        let mut nic = Nic::new(io, family, false);
+        nic.grab().await?;
+        nic.write(MEM_RADDR, address)?;
+        let mut words = [0; N];
+        for word in &mut words {
+            *word = nic.io.read32(MEM_RDATA)?;
+        }
+        nic.release()?;
+        Ok(words)
+    })
 }
 
 /// The registers every step of waking a function touches.
@@ -290,9 +306,42 @@ struct Nic<C: Csr> {
     io: C,
     family: Family,
     bisr: bool,
+    /// Each wait is a minimum interval polled a step at a time, when the
+    /// delay source gives one, instead of a delay inside the step.
+    stepped: bool,
 }
 
 impl<C: Csr> Nic<C> {
+    fn new(io: C, family: Family, bisr: bool) -> Self {
+        Self {
+            io,
+            family,
+            bisr,
+            stepped: false,
+        }
+    }
+    /// Wait `microseconds` at least. Stepped, each step polls the interval
+    /// once; a source without intervals waits in the step, which then ends,
+    /// so no step holds more than one wait (25 ms at most). Otherwise the
+    /// wait is in the step.
+    async fn wait(&mut self, microseconds: u32) -> Result<(), Error> {
+        if !self.stepped {
+            self.io.delay_us(microseconds)?;
+            return Ok(());
+        }
+        match self.io.begin_interval(microseconds)? {
+            Some(interval) => {
+                while !interval.elapsed().map_err(AccessError::Minimum)? {
+                    yield_now().await;
+                }
+            }
+            None => {
+                self.io.delay_us(microseconds)?;
+                yield_now().await;
+            }
+        }
+        Ok(())
+    }
     fn read(&mut self, register: u32) -> Result<u32, Error> {
         let value = self.io.read32(register)?;
         if value == u32::MAX || is_hardware_error(value) {
@@ -308,24 +357,24 @@ impl<C: Csr> Nic<C> {
         let value = self.read(register)?;
         self.write(register, value | mask)
     }
-    fn poll(&mut self, register: u32, mask: u32, microseconds: u32) -> Result<(), Error> {
+    async fn poll(&mut self, register: u32, mask: u32, microseconds: u32) -> Result<(), Error> {
         // Same 10us interval/strict deadline as iwl_poll_bits_mask. A failed
         // register read is never a successful set-bit observation.
         for _ in 0..microseconds.div_ceil(10) {
             if self.read(register)? & mask == mask {
                 return Ok(());
             }
-            self.io.delay_us(10)?;
+            self.wait(10).await?;
         }
         Err(Error::Timeout { register, mask })
     }
-    fn ready(&mut self) -> Result<(), Error> {
+    async fn ready(&mut self) -> Result<(), Error> {
         self.set(HW_IF, OWN)?;
-        self.poll(HW_IF, OWN, 50)?;
+        self.poll(HW_IF, OWN, 50).await?;
         self.set(MAILBOX, 1 << 5)
     }
-    fn ownership(&mut self, management: ManagementSession) -> Result<(), Error> {
-        match self.ready() {
+    async fn ownership(&mut self, management: ManagementSession) -> Result<(), Error> {
+        match self.ready().await {
             Ok(()) => return Ok(()),
             Err(Error::Timeout { .. }) => {}
             Err(e) => return Err(e),
@@ -333,11 +382,11 @@ impl<C: Csr> Nic<C> {
         // As `iwl_pcie_prepare_card_hw`, a set without a read back: the
         // ownership poll that follows is the check.
         self.set(LINK_PWR, 1 << 31)?;
-        self.io.delay_us(1000)?;
+        self.wait(1000).await?;
         for _ in 0..10 {
             self.set(HW_IF, WAKE_ME)?;
             for _ in 0..750 {
-                match self.ready() {
+                match self.ready().await {
                     Ok(()) => return Ok(()),
                     Err(Error::Timeout { .. }) => {}
                     Err(e) => return Err(e),
@@ -347,9 +396,9 @@ impl<C: Csr> Nic<C> {
                     ManagementSession::Unknown => return Err(Error::ManagementUnknown),
                     ManagementSession::NotConnected => {}
                 }
-                self.io.delay_us(200)?;
+                self.wait(200).await?;
             }
-            self.io.delay_us(25000)?;
+            self.wait(25000).await?;
         }
         Err(Error::Timeout {
             register: HW_IF,
@@ -375,15 +424,15 @@ impl<C: Csr> Nic<C> {
         self.write(PRPH_WDATA, value)
     }
     /// `__iwl_trans_pcie_grab_nic_access`.
-    fn grab(&mut self) -> Result<(), Error> {
+    async fn grab(&mut self) -> Result<(), Error> {
         let access = NicAccess::of(self.family);
         self.set(GP, access.request)?;
-        self.io.delay_us(2)?;
+        self.wait(2).await?;
         for _ in 0..1500 {
             if self.read(GP)? & access.mask == access.ready {
                 return Ok(());
             }
-            self.io.delay_us(10)?;
+            self.wait(10).await?;
         }
         Err(Error::Timeout {
             register: GP,
@@ -395,38 +444,38 @@ impl<C: Csr> Nic<C> {
         self.write(GP, gp & !NicAccess::of(self.family).request)
     }
     /// `iwl_set_bits_prph` and `iwl_clear_bits_prph` under NIC access.
-    fn update_prph(&mut self, address: u32, clear: u32, set: u32) -> Result<(), Error> {
-        self.grab()?;
+    async fn update_prph(&mut self, address: u32, clear: u32, set: u32) -> Result<(), Error> {
+        self.grab().await?;
         let value = self.read_prph(address)?;
         self.write_prph(address, (value & !clear) | set)?;
         self.release()
     }
     /// `iwl_trans_pcie_sw_reset`.
-    fn reset(&mut self, management: ManagementSession) -> Result<(), Error> {
+    async fn reset(&mut self, management: ManagementSession) -> Result<(), Error> {
         if self.family >= Family::Bz {
             self.set(GP, SW_RESET)?;
-            self.io.delay_us(10000)?;
+            self.wait(10000).await?;
         } else {
             self.set(RESET, 0x80)?;
-            self.io.delay_us(5000)?;
+            self.wait(5000).await?;
         }
-        self.ownership(management)
+        self.ownership(management).await
     }
     /// `iwl_pcie_gen1_2_activate_nic`.
-    fn activate(&mut self) -> Result<(), Error> {
+    async fn activate(&mut self) -> Result<(), Error> {
         if self.bisr {
-            self.io.delay_us(2000)?;
+            self.wait(2000).await?;
         }
         // The clock poll, not a read back of the request, says it woke.
         let wake = if self.family >= Family::Bz {
             self.set(GP, BZ_MAC_ACCESS | MAC_INIT)?;
-            self.poll(GP, MAC_STATUS, 25000)
+            self.poll(GP, MAC_STATUS, 25000).await
         } else {
             self.set(GP, 4)?;
-            self.poll(GP, MAC_CLOCK, 25000)
+            self.poll(GP, MAC_CLOCK, 25000).await
         };
         if self.bisr {
-            self.io.delay_us(200)?;
+            self.wait(200).await?;
         }
         wake
     }
@@ -440,7 +489,7 @@ impl<C: Csr> Nic<C> {
         }
     }
     /// `get_crf_id`, under the NIC access its caller holds.
-    fn silicon(&mut self) -> Result<Silicon, Error> {
+    async fn silicon(&mut self) -> Result<Silicon, Error> {
         if self.family == Family::Sc {
             let request = self.umac(WFPM_RSRCS_REQUEST);
             if self.read_prph(request)? & CNVR_TOP == 0 {
@@ -451,7 +500,7 @@ impl<C: Csr> Nic<C> {
                 if self.read_prph(acknowledge)? & CNVR_TOP != 0 {
                     break;
                 }
-                self.io.delay_us(10)?;
+                self.wait(10).await?;
             }
         }
         let control = self.umac(WFPM_CTRL);
@@ -480,6 +529,12 @@ impl<C: Csr> Csr for &mut C {
     fn delay_us(&mut self, microseconds: u32) -> Result<(), AccessError> {
         (**self).delay_us(microseconds)
     }
+    fn begin_interval(
+        &mut self,
+        microseconds: u32,
+    ) -> Result<Option<Box<dyn crate::bus::pci::power::Interval>>, AccessError> {
+        (**self).begin_interval(microseconds)
+    }
 }
 
 /// Stop a function whatever its last owner left running, as
@@ -491,22 +546,18 @@ impl<C: Csr> Csr for &mut C {
 /// not report stopped within 100 us is no failure: the reset follows and
 /// stops it. Bus mastering stays off at the PCI level throughout.
 pub fn stop<C: Csr>(io: &mut C, family: Family) -> Result<(), Error> {
-    let mut nic = Nic {
-        io,
-        family,
-        bisr: false,
-    };
+    let mut nic = Nic::new(io, family, false);
     nic.write(INT_MASK, 0)?;
     nic.write(INT, u32::MAX)?;
     nic.write(FH_INT, u32::MAX)?;
     let master = if family >= Family::Bz {
         nic.set(GP, BUS_MASTER_DISABLE_REQUEST)?;
-        let stopped = nic.poll(GP, BUS_MASTER_DISABLED, 100);
+        let stopped = block_on(nic.poll(GP, BUS_MASTER_DISABLED, 100));
         nic.io.delay_us(10000)?;
         stopped
     } else {
         nic.set(RESET, STOP_MASTER)?;
-        nic.poll(RESET, MASTER_DISABLED, 100)
+        block_on(nic.poll(RESET, MASTER_DISABLED, 100))
     };
     match master {
         Ok(()) | Err(Error::Timeout { .. }) => {}
@@ -536,13 +587,15 @@ pub fn read_silicon<C: Csr>(
     bisr: bool,
     management: ManagementSession,
 ) -> Result<Silicon, Error> {
-    let mut nic = Nic { io, family, bisr };
-    nic.ownership(management)?;
-    nic.activate()?;
-    nic.grab()?;
-    let silicon = nic.silicon()?;
-    nic.release()?;
-    Ok(silicon)
+    block_on(async move {
+        let mut nic = Nic::new(io, family, bisr);
+        nic.ownership(management).await?;
+        nic.activate().await?;
+        nic.grab().await?;
+        let silicon = nic.silicon().await?;
+        nic.release()?;
+        Ok(silicon)
+    })
 }
 
 /// The rest of what `_iwl_pci_probe` reads to choose a configuration after
@@ -568,11 +621,7 @@ pub struct Power<C: Csr> {
 impl<C: Csr> Power<C> {
     pub fn new(io: C, profile: Profile) -> Self {
         Self {
-            nic: Nic {
-                io,
-                family: profile.family(),
-                bisr: profile.bisr_workaround(),
-            },
+            nic: Nic::new(io, profile.family(), profile.bisr_workaround()),
             profile,
             state: State::Cold,
             vector: false,
@@ -580,15 +629,20 @@ impl<C: Csr> Power<C> {
     }
     /// `iwl_pcie_gen2_force_power_gating`, for an integrated 22000 device
     /// between its reset and its power-up.
-    fn force_power_gating(&mut self, management: ManagementSession) -> Result<(), Error> {
-        self.nic.activate()?;
-        self.nic.update_prph(HPM_HIPM_GEN_CFG, 0, FORCE_ACTIVE)?;
-        self.nic.io.delay_us(20)?;
+    async fn force_power_gating(&mut self, management: ManagementSession) -> Result<(), Error> {
+        self.nic.activate().await?;
         self.nic
-            .update_prph(HPM_HIPM_GEN_CFG, 0, POWER_GATE | SLEEP)?;
-        self.nic.io.delay_us(20)?;
-        self.nic.update_prph(HPM_HIPM_GEN_CFG, FORCE_ACTIVE, 0)?;
-        self.nic.reset(management)
+            .update_prph(HPM_HIPM_GEN_CFG, 0, FORCE_ACTIVE)
+            .await?;
+        self.nic.wait(20).await?;
+        self.nic
+            .update_prph(HPM_HIPM_GEN_CFG, 0, POWER_GATE | SLEEP)
+            .await?;
+        self.nic.wait(20).await?;
+        self.nic
+            .update_prph(HPM_HIPM_GEN_CFG, FORCE_ACTIVE, 0)
+            .await?;
+        self.nic.reset(management).await
     }
     fn clear_persistence(&mut self) -> Result<(), Error> {
         if self.profile.family() != Family::Ax200 {
@@ -619,7 +673,7 @@ impl<C: Csr> Power<C> {
         }
         Ok(())
     }
-    fn run(&mut self, management: ManagementSession) -> Result<Awake, Error> {
+    async fn run(&mut self, management: ManagementSession) -> Result<Awake, Error> {
         let observed = self.profile.observed();
         if self.nic.read(HW_REV)? != observed.hardware_revision
             || self.nic.read(RF_ID)? != observed.radio_id
@@ -637,11 +691,11 @@ impl<C: Csr> Power<C> {
         }
         self.nic.write(INT, u32::MAX)?;
         self.nic.write(FH_INT, u32::MAX)?;
-        self.nic.ownership(management)?;
+        self.nic.ownership(management).await?;
         self.clear_persistence()?;
-        self.nic.reset(management)?;
+        self.nic.reset(management).await?;
         if self.profile.platform().integrated && self.profile.family() == Family::Ax200 {
-            self.force_power_gating(management)?;
+            self.force_power_gating(management).await?;
         }
         // `iwl_pcie_apm_init` sets these bits and reads none of them back;
         // a bit a register does not keep is no reason to refuse the device.
@@ -649,7 +703,7 @@ impl<C: Csr> Power<C> {
         self.nic.set(HPET, 0xffff0000)?;
         self.nic.set(HW_IF, 0x00080000)?;
         self.nic.set(GIO, 2)?;
-        self.nic.activate()?;
+        self.nic.activate().await?;
         Ok(Awake {
             family: self.profile.family(),
         })
@@ -674,11 +728,22 @@ impl<C: Csr> Power<C> {
     /// Wake the MAC clock with interrupts masked. Retrying an uncertain reset
     /// requires a new checked ownership/reset epoch, never this used object.
     pub fn wake(&mut self, management: ManagementSession) -> Result<Awake, Error> {
+        block_on(self.wake_from_cold(management))
+    }
+    /// [`Self::wake`] a step at a time: each wait is a minimum interval the
+    /// steps poll, when the delay source gives one.
+    pub async fn wake_in_steps(&mut self, management: ManagementSession) -> Result<Awake, Error> {
+        self.nic.stepped = true;
+        let awake = self.wake_from_cold(management).await;
+        self.nic.stepped = false;
+        awake
+    }
+    async fn wake_from_cold(&mut self, management: ManagementSession) -> Result<Awake, Error> {
         if self.state != State::Cold {
             return Err(Error::State);
         }
         self.state = State::Poisoned;
-        let awake = self.run(management)?;
+        let awake = self.run(management).await?;
         self.state = State::Awake(awake);
         Ok(awake)
     }
