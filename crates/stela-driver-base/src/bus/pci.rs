@@ -79,6 +79,7 @@ const EXPRESS_ROOT_PORT: u16 = 4;
 const EXPRESS_DOWNSTREAM: u16 = 6;
 const EXPRESS_DEVICE_CONTROL_2: u16 = 0x28;
 const ARI_FORWARDING: u16 = 1 << 5;
+const EXPRESS_COMPLETION_TIMEOUT_DISABLE: u16 = 1 << 4;
 /// What `pcie_flr` and `pci_save_pcie_state` read and write of the same
 /// capability.
 const EXPRESS_DEVICE_CAPABILITIES: u16 = 4;
@@ -967,6 +968,26 @@ impl<C: ConfigSpace> Function<C> {
             }
         }
         Ok(None)
+    }
+    /// `pcie_capability_set_word(PCI_EXP_DEVCTL2, PCI_EXP_DEVCTL2_COMP_TMOUT_DIS)`:
+    /// the function stops timing out its own requests. False, with nothing
+    /// written, when it has no PCI Express capability or one of version 1,
+    /// which has no device control 2 (Linux skips the write alike).
+    pub fn disable_completion_timeout(&mut self) -> Result<bool, CapabilityError> {
+        let Some(express) = self.express_capability()? else {
+            return Ok(false);
+        };
+        let config = |offset: u16| move |error| CapabilityError::Config { offset, error };
+        let flags = self.config.read16(express + EXPRESS_FLAGS);
+        if flags.map_err(config(express + EXPRESS_FLAGS))? & 0xf < 2 {
+            return Ok(false);
+        }
+        let at = express + EXPRESS_DEVICE_CONTROL_2;
+        let control = self.config.read16(at).map_err(config(at))?;
+        self.config
+            .write16(at, control | EXPRESS_COMPLETION_TIMEOUT_DISABLE)
+            .map_err(config(at))?;
+        Ok(true)
     }
     /// A bridge's secondary bus and how to scan it. A malformed capability
     /// list hides the port type, so the bus is scanned as below a

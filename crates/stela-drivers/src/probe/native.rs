@@ -590,6 +590,15 @@ pub(super) unsafe fn realtek_wifi(
     };
     let configured = (|| -> Result<_, Error> {
         let link_control = crate::bus::pci::link_control_word(&function)?;
+        // rtw_pci_phy_cfg: a chip whose requests must not time out. One
+        // without device control 2 goes on, as Linux does.
+        let spec = realtek_wifi::chip::for_device(function.device);
+        if spec
+            .and_then(|spec| spec.rtw88.as_ref())
+            .is_some_and(|spec| spec.pcie_completion_timeout_off)
+        {
+            function.disable_completion_timeout()?;
+        }
         let config = function.config();
         let identity = (
             config.read16(0x2c)?,

@@ -13,6 +13,7 @@
 use super::{
     beacon::{Beacon, FirmwareBand},
     coex::{Coex, Order},
+    commands,
     download::Download,
     efuse::{self, Board, Physical},
     features::Report,
@@ -430,6 +431,14 @@ pub(super) async unsafe fn boot<I: Io, R: Rings<I>>(
     enable(&mut io).map_err(at("security engine"))?;
     // SAFETY: firmware booted once on this requester, with its mailbox unused.
     let mut control = unsafe { Control::new(io, &report) }.map_err(at("mailbox"))?;
+    // rtw_download_firmware's last step, as the mailbox's first command:
+    // nothing here reaches the mailbox before it.
+    if spec.recover_bluetooth {
+        control
+            .command(commands::recover_bluetooth())
+            .map_err(at("bluetooth recovery"))?;
+        yield_now().await;
+    }
     for order in run.orders {
         // A chip starting up has no power save to leave.
         if let Order::Command(command) = order {

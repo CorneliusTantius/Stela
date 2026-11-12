@@ -1048,3 +1048,29 @@ fn a_function_without_a_reset_is_left_alone_and_one_that_stays_silent_is_an_erro
         ))
     );
 }
+
+#[test]
+fn completion_timeouts_turn_off_only_where_device_control_2_exists() {
+    for (version, expected) in [(2_u32, true), (1, false)] {
+        let mut ecam = Ecam::new();
+        ecam.port(EXPRESS_ROOT_PORT, 0x0005);
+        // An endpoint whose flags carry `version`.
+        *ecam.word(0, 1, 0, 0x0c) = 0;
+        *ecam.word(0, 1, 0, 0x40) = u32::from(CAPABILITY_EXPRESS) | version << 16;
+        let window = EcamWindow {
+            base: ecam.0.as_ptr() as u64,
+            segment: 0,
+            start_bus: 0,
+            end_bus: 1,
+        };
+        // SAFETY: this test exclusively owns the backing allocation.
+        let mut functions = unsafe { Function::enumerate(&window) }.unwrap();
+        let function = functions
+            .iter_mut()
+            .find(|function| function.address.device == 1)
+            .unwrap();
+        assert_eq!(function.disable_completion_timeout().unwrap(), expected);
+        let control = *ecam.word(0, 1, 0, 0x68) & 0xffff;
+        assert_eq!(control, if expected { 0x15 } else { 0x05 });
+    }
+}

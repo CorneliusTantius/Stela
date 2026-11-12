@@ -80,6 +80,12 @@ pub struct Rtw88 {
     /// `lps_deep_mode_supported`'s `LPS_DEEP_MODE_PG`: the chip may gate
     /// its power in deep power save, not only lower its clock.
     pub lps_deep_power_gate: bool,
+    /// `rtw_pci_phy_cfg`'s `PCI_EXP_DEVCTL2_COMP_TMOUT_DIS`: the function
+    /// must not time out its requests.
+    pub pcie_completion_timeout_off: bool,
+    /// `rtw_download_firmware`'s `rtw_fw_set_recover_bt_device` on PCIe: the
+    /// combo chip's Bluetooth function is told to recover once firmware runs.
+    pub recover_bluetooth: bool,
 }
 
 /// A chip's `set_tx_power_index`.
@@ -188,6 +194,8 @@ pub static RTL8822C: Spec = Spec {
         dig: &[(0x1d70, 0x7f), (0x1d70, 0x7f00)],
         dig_min: 0x20,
         lps_deep_power_gate: true,
+        pcie_completion_timeout_off: false,
+        recover_bluetooth: false,
     }),
 };
 
@@ -240,6 +248,8 @@ pub static RTL8821C: Spec = Spec {
         dig: &[(0xc50, 0x7f)],
         dig_min: 0x1c,
         lps_deep_power_gate: false,
+        pcie_completion_timeout_off: true,
+        recover_bluetooth: true,
     }),
 };
 
@@ -256,6 +266,14 @@ pub static RTL8852B: Spec = Spec {
 
 /// Every chip, in the order PCI IDs are matched.
 pub static SPECS: [&Spec; 3] = [&RTL8822C, &RTL8821C, &RTL8852B];
+
+/// The spec of the chip PCI device `device` of Realtek's is, if any.
+pub fn for_device(device: u16) -> Option<&'static Spec> {
+    SPECS
+        .iter()
+        .copied()
+        .find(|spec| spec.devices.contains(&device))
+}
 
 impl Chip {
     pub fn spec(self) -> &'static Spec {
@@ -289,6 +307,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn only_the_rtl8821c_turns_completion_timeouts_off_and_recovers_bluetooth() {
+        let rtw88 = |device| for_device(device).and_then(|spec| spec.rtw88.as_ref());
+        for device in [0xb821, 0xc821] {
+            let spec = rtw88(device).unwrap();
+            assert!(spec.pcie_completion_timeout_off && spec.recover_bluetooth);
+        }
+        let spec = rtw88(0xc822).unwrap();
+        assert!(!spec.pcie_completion_timeout_off && !spec.recover_bluetooth);
+        assert!(rtw88(0xb852).is_none() && for_device(0x8168).is_none());
     }
 
     #[test]

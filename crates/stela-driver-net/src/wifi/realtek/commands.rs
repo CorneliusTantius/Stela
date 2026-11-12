@@ -16,6 +16,8 @@ const SCAN: u32 = 0x59;
 const ADAPTIVITY: u32 = 0x5a;
 /// `H2C_CMD_WIFI_CALIBRATION`.
 const CALIBRATION: u32 = 0x6d;
+/// `H2C_CMD_RECOVER_BT_DEV`.
+const RECOVER_BT_DEVICE: u32 = 0xd1;
 /// `C2H_SCAN_RESULT`.
 const SCAN_RESULT: u8 = 0x38;
 
@@ -143,6 +145,11 @@ pub fn calibration(start: bool) -> (u32, u32) {
     (CALIBRATION | (u32::from(start) << 8), 0)
 }
 
+/// `rtw_fw_set_recover_bt_device`.
+pub fn recover_bluetooth() -> (u32, u32) {
+    (RECOVER_BT_DEVICE | (1 << 8), 0)
+}
+
 /// `rtw_fw_scan_notify`.
 pub fn scan(start: bool) -> (u32, u32) {
     (SCAN | (u32::from(start) << 8), 0)
@@ -250,6 +257,7 @@ mod tests {
             Report::parse(&[0xb, 0, 1, 0, 0, 2]),
             Some(Report::BluetoothAnswer([1, 0, 0, 2, 0, 0, 0, 0]))
         );
+        assert_eq!(recover_bluetooth(), (0x1d1, 0));
         assert_eq!(power_mode(true, 0), (0x0121_0120, 0));
         assert_eq!(power_mode(false, 0), (0x0100_0020, 0xc00));
         let (message, mask) = ra_info(RateInfo {
