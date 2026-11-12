@@ -84,7 +84,7 @@ impl fmt::Display for AttachError {
                 f.write_str("this Intel Wi-Fi adapter is not supported")
             }
             Self::Identity(error) => {
-                write!(f, "this Intel Wi-Fi adapter is not supported ({error:?})")
+                write!(f, "this Intel Wi-Fi adapter is not supported: {error}")
             }
             Self::Power(error) => write!(f, "it did not wake up ({error:?})"),
             Self::NoPinnedFirmware { name, .. } => {
@@ -97,6 +97,9 @@ impl fmt::Display for AttachError {
                 write!(f, "its firmware {name} is invalid ({error:?})")
             }
             Self::Step(error) => write!(f, "its radio step is unknown ({error})"),
+            Self::Boot(boot::Error::RfKilled) => f.write_str(
+                "its radio is switched off by the PC's wireless switch or key (RF kill)",
+            ),
             Self::Boot(error) => write!(f, "its firmware did not start ({error:?})"),
             Self::Stop(error) => write!(f, "it did not stop for Stela to take over ({error:?})"),
         }
@@ -234,4 +237,27 @@ pub(super) unsafe fn start<Q: BootIo>(
         }
     }
     .map_err(AttachError::Boot)
+}
+
+#[cfg(test)]
+mod display_tests {
+    use super::*;
+
+    /// The account names a switched-off radio in plain words and the
+    /// identity registers in hex.
+    #[test]
+    fn rf_kill_and_identity_failures_read_plainly() {
+        assert_eq!(
+            alloc::format!("{}", AttachError::Boot(boot::Error::RfKilled)),
+            "its radio is switched off by the PC's wireless switch or key (RF kill)"
+        );
+        assert_eq!(
+            alloc::format!(
+                "{}",
+                AttachError::Identity(IdentityError::UnsupportedRadio(0x0010_d000))
+            ),
+            "this Intel Wi-Fi adapter is not supported: its radio (CSR_HW_RF_ID 0x0010d000) \
+             is unsupported"
+        );
+    }
 }

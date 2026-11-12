@@ -248,6 +248,25 @@ pub enum IdentityError {
     UnsupportedStep(u32),
 }
 
+/// A plain account, with the registers iwlwifi identifies by in hex.
+impl core::fmt::Display for IdentityError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::UnsupportedPci => f.write_str("its PCI ID is not one iwlwifi lists"),
+            Self::FailedRead => f.write_str("its CSR_HW_REV or CSR_HW_RF_ID reads all ones"),
+            Self::UnsupportedMac(revision) => {
+                write!(f, "its MAC (CSR_HW_REV {revision:#010x}) is unsupported")
+            }
+            Self::UnsupportedRadio(radio) => {
+                write!(f, "its radio (CSR_HW_RF_ID {radio:#010x}) is unsupported")
+            }
+            Self::UnsupportedStep(step) => {
+                write!(f, "no firmware is released for its step {step:#x}")
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Profile {
     observed: Observed,
