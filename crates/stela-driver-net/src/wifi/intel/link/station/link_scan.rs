@@ -108,15 +108,19 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
     pub(super) fn run_link_scan(&mut self, queue: &mut Queue<Q, B>, now: u64) -> Result<(), Error> {
         let client = &mut self.client;
         let leaving = client.leaving;
+        if client
+            .link_scan
+            .abort
+            .as_ref()
+            .is_some_and(Deadline::passed)
+        {
+            // `iwl_mld_scan_stop`: a scan firmware did not let go of in time
+            // is taken as stopped all the same, and its late word ignored.
+            client.link_scan.abort = None;
+            client.link_scan.running = None;
+            return Ok(());
+        }
         if let Some((scanner, ticket)) = &mut client.link_scan.running {
-            if client
-                .link_scan
-                .abort
-                .as_ref()
-                .is_some_and(Deadline::passed)
-            {
-                return Err(Error::Timeout("scan abort"));
-            }
             let cancel = if leaving {
                 scanner.cancel(*ticket).map_err(protocol)?
             } else {

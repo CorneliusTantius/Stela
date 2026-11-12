@@ -99,6 +99,8 @@ struct Device<'n> {
     other: Option<(Vec<u8>, Vec<u8>)>,
     /// A scan of an association's links runs until it is told to stop.
     holds_link_scan: bool,
+    /// Firmware keeps a scan it is told to stop.
+    keeps_aborted_scan: bool,
     /// The PNVM-loaded notification went out after the PNVM doorbell.
     pnvm_loaded: bool,
 }
@@ -259,7 +261,7 @@ impl Device<'_> {
                 self.finish_scan(rom, 1);
             }
         }
-        if (id.group, id.opcode) == (1, 0x0e) {
+        if (id.group, id.opcode) == (1, 0x0e) && !self.keeps_aborted_scan {
             self.finish_scan(rom, 2);
         }
         if (id.group, id.opcode) == (3, 5) && request[4] == 1 {
@@ -839,6 +841,7 @@ fn raise_as<'n>(
         confirm: None,
         other: other.then(|| (other_beacon([60, 70]), other_response())),
         holds_link_scan: false,
+        keeps_aborted_scan: false,
         pnvm_loaded: false,
     };
     device.inject(&boot, &alive);
@@ -3099,6 +3102,44 @@ fn leaving_stops_a_scan_of_the_links_and_waits_for_firmware_to_let_it_go() {
             .iter()
             .any(|(opcode, _)| *opcode == 9)
     );
+}
+
+/// `iwl_mld_scan_stop`: a scan firmware keeps past the abort's second is
+/// taken as stopped, and the station leaves as if firmware had let it go.
+#[test]
+fn a_scan_firmware_keeps_past_its_abort_is_taken_as_stopped() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    let native = Native::default();
+    let (mut wifi, mut device, _, _) = moved_mld(&native);
+    device.holds_link_scan = true;
+    device.keeps_aborted_scan = true;
+    miss_beacons(&mut wifi, &mut device);
+    wifi.radio_mut().end_link_blockout();
+    let scanning = run(&mut wifi, &mut device, |_, device, _| {
+        device.scans.len() > 1
+    });
+    assert!(scanning, "{:?}", wifi.radio().error());
+    let _clock = crate::test_clock::virtualize();
+    wifi.radio_mut().deauthenticate(3).unwrap();
+    let aborted = run(&mut wifi, &mut device, |_, device, _| {
+        device.commands.contains(&(1, 0x0e))
+    });
+    assert!(aborted, "{:?}", wifi.radio().error());
+    assert_ne!(wifi.radio().stage(), Standing::Idle, "the scan holds on");
+    crate::test_clock::advance(
+        Clock {
+            ticks_per_microsecond: 1_000_000,
+        },
+        1_100_000,
+    );
+    let left = run(&mut wifi, &mut device, |wifi, _, _| {
+        wifi.radio().stage() == Standing::Idle
+    });
+    assert!(left, "{:?}", wifi.radio().error());
+    assert_eq!(wifi.radio().error(), None);
+    assert_eq!(wifi.lost(), None);
 }
 
 #[test]
