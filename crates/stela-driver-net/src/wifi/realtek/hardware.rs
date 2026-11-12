@@ -120,6 +120,8 @@ const LINK_SILENT: &str = "PCIe link power save, for a config space bridge that 
 const RECEIVE_DROPPED: &str = "received descriptors the chip filled in wrongly, which are dropped";
 const RECEIVE_TAG_SLIPPED: &str =
     "received buffers whose DMA tag was out of step (PCIe bus timeouts), which are still taken";
+/// rtw88's "failed to poll iqk status bit", after which it goes on.
+const IQK_UNFINISHED: &str = "an IQK calibration firmware did not report done within 300 ms";
 
 fn failed<E: Debug>(step: &'static str) -> impl FnOnce(E) -> String {
     move |error| format!("{step}: {error:?}")
@@ -677,7 +679,11 @@ impl Device for Hardware {
         unsafe { self.calibration.even_gains(io, &self.report) }.map_err(failed("gains"))?;
         self.calibration_handshake(false)?;
         // SAFETY: as above.
-        unsafe { self.control.iqk(&mut self.transmit, self.pages) }.map_err(failed("iqk"))?;
+        let iqk =
+            unsafe { self.control.iqk(&mut self.transmit, self.pages) }.map_err(failed("iqk"))?;
+        if !iqk.completed() {
+            self.limit_once(IQK_UNFINISHED);
+        }
         let io = self.control.io().map_err(failed("registers"))?;
         // SAFETY: as above.
         unsafe { self.calibration.predistort(io, &self.report) }
