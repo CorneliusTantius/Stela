@@ -177,3 +177,31 @@ pub(super) fn drive_cold_prefix<'a>(
     let count = expected.commands().len() as u16;
     (radio, 3 + count, 5 + count)
 }
+
+/// `iwl_trans_pcie_start_fw` runs the unified image with the radio switched
+/// off: the ROM boot reaches ALIVE and the NVM initialization starts, its
+/// commands sent as they are in RF-kill.
+#[test]
+fn a_switched_off_radio_still_boots_its_firmware_and_starts_initialization() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    let bytes = unified_bytes(false);
+    let catalog = catalog_for(&profile(), Family::Ax200.firmware_name(), &bytes);
+    let empty = resources::Catalog::from_handoff(vec![]).unwrap();
+    let source = Source::default();
+    let domain = Arc::new(Domain::default());
+    let state = Arc::new(Mutex::new(ModelState::default()));
+    *state.lock().unwrap().registers.get_mut(&0x24).unwrap() &= !0x0800_0000;
+    let drops = Arc::new(AtomicUsize::new(0));
+    let boot = start(&catalog, &source, &domain, &state, &drops);
+    let boot = command_ready(boot, &empty, &source, &domain, &state);
+    let mut init = boot.initialize_on_device_nvm();
+    assert_eq!(
+        // SAFETY: the initializer owns that same model epoch and domain, and
+        // Source stays exclusive.
+        unsafe { init.advance(&source) }.unwrap(),
+        InitializationProgress::Pending(InitializationPhase::ExtendedConfiguration)
+    );
+    assert_eq!(state.lock().unwrap().registers[&0x24] & 0x0800_0000, 0);
+}

@@ -2216,6 +2216,10 @@ impl<Q: BootIo, B: BiosIo> Radio for Wifi<Q, B> {
             self.error = Some(Error::FirmwareDied(log));
         }
         self.poll();
+        if self.switched_off() {
+            self.client.events.push_back(keeper::Event::FirmwareLost);
+            return Err(Error::SwitchedOff);
+        }
         let served = if self.error.is_none() {
             self.serve()
         } else {

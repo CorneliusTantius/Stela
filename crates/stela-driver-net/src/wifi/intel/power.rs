@@ -215,7 +215,6 @@ pub enum ManagementSession {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Awake {
     pub family: Family,
-    pub rf_killed: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
@@ -653,7 +652,6 @@ impl<C: Csr> Power<C> {
         self.nic.activate()?;
         Ok(Awake {
             family: self.profile.family(),
-            rf_killed: self.nic.read(GP)? & 0x08000000 == 0,
         })
     }
     /// Consume only a successful MAC-clock epoch, transferring its exclusive

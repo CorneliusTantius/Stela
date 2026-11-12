@@ -3123,6 +3123,82 @@ fn a_firmware_error_frees_the_function_and_boots_it_for_the_keeper_to_join_again
     panic!("{:?} {:?}", wifi.radio().phase(), wifi.radio().error());
 }
 
+/// `iwl_mvm_set_hw_rfkill_state`: a radio switched off stops the function,
+/// which says so once and waits, reading only the switch, then boots again
+/// from nothing once the switch is on, without spending a restart.
+#[test]
+fn a_switched_off_radio_stops_the_function_and_boots_again_once_it_is_on() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    const GP: u32 = 0x24;
+    let native = Native::default();
+    let (mut wifi, mut device) = connect(&native, false);
+    let live = native.domain.records.lock().unwrap().live.len();
+    *native.state.lock().unwrap().registers.get_mut(&GP).unwrap() &= !0x0800_0000;
+    assert!(!wifi.carrier(), "the port went with the radio");
+    assert_eq!(wifi.radio().error(), None);
+    assert_eq!(wifi.radio().phase(), Phase::Booting);
+    assert!(wifi.radio().rom().is_none());
+    assert!(native.domain.records.lock().unwrap().live.len() < live);
+    let operations = native.state.lock().unwrap().ops.len();
+    for _ in 0..5 {
+        assert!(!wifi.carrier());
+        assert_eq!(wifi.receive(), Ok(None), "a notice, not a fault");
+    }
+    assert_eq!(wifi.lost(), None);
+    let notices: Vec<_> = core::iter::from_fn(|| wifi.take_diagnostic()).collect();
+    assert_eq!(
+        notices
+            .iter()
+            .filter(|notice| *notice == "the Wi-Fi radio is switched off")
+            .count(),
+        1,
+        "{notices:?}"
+    );
+    {
+        let state = native.state.lock().unwrap();
+        assert!(
+            state.ops[operations..]
+                .iter()
+                .all(|op| matches!(op, Op::Read(GP))),
+            "{:?}",
+            &state.ops[operations..]
+        );
+    }
+    // The switch on, ROM answers the boot as it answered the first.
+    *native.state.lock().unwrap().registers.get_mut(&GP).unwrap() |= 0x0800_0000;
+    wifi.carrier();
+    assert!(wifi.radio().rom().is_some(), "booting again");
+    device.entry = 0;
+    device.answered = None;
+    device.queues.clear();
+    event(&native.state, 1);
+    wifi.carrier();
+    let mut alive = rx_packet(1, 0xcafe, 0);
+    set_sku(&mut alive, [0; 3]);
+    device.inject(wifi.radio().rom().unwrap(), &alive);
+    for _ in 0..600 {
+        wifi.carrier();
+        if wifi.radio().stage() == Standing::Idle {
+            assert_eq!(wifi.radio().address(), Mac(LOCAL));
+            assert!(
+                !native
+                    .state
+                    .lock()
+                    .unwrap()
+                    .ops
+                    .iter()
+                    .any(|op| matches!(op, Op::Reset)),
+                "no reset and no restart"
+            );
+            return;
+        }
+        device.respond(wifi.radio().rom().unwrap());
+    }
+    panic!("{:?} {:?}", wifi.radio().phase(), wifi.radio().error());
+}
+
 #[test]
 fn reset_access_refusal_retains_stopped_owner_and_never_boots_or_retries() {
     if crate::test_process::isolate_model() {

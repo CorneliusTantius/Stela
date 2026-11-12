@@ -108,6 +108,9 @@ pub enum Error {
     /// The firmware has yet to answer what this needs.
     Pending,
     Unsupported(&'static str),
+    /// The radio's switch is off. The function waits for it, stopped, and
+    /// boots again once it is on.
+    SwitchedOff,
 }
 
 impl Error {
@@ -129,13 +132,17 @@ impl Error {
                 | Self::Pending
                 | Self::Unsupported(_)
                 | Self::Restart(_)
+                | Self::SwitchedOff
         )
     }
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "iwlwifi: {self:?}")
+        match self {
+            Self::SwitchedOff => f.write_str("the Wi-Fi radio is switched off"),
+            _ => write!(f, "iwlwifi: {self:?}"),
+        }
     }
 }
 
@@ -197,6 +204,8 @@ enum Stage<Q: BootIo, B: BiosIo> {
     Failed {
         owner: Box<dyn Kept>,
     },
+    /// The function, stopped while its radio's switch is off.
+    SwitchedOff,
     Moving,
 }
 
@@ -291,7 +300,7 @@ impl<Q: BootIo, B: BiosIo> Stage<Q, B> {
             Stage::Queue(owner) | Stage::Ready(owner) | Stage::Removing(owner) => owner.as_mut(),
             Stage::Coexistence(owner) => owner.as_mut(),
             Stage::Failed { owner } => owner.as_mut(),
-            Stage::Moving => return None,
+            Stage::SwitchedOff | Stage::Moving => return None,
         };
         Some(owner)
     }
@@ -502,7 +511,10 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
     /// The ROM boot reads this for itself, ALIVE among it. A register that
     /// stopped answering says as much.
     fn died(&mut self) -> bool {
-        if matches!(self.stage, Stage::Rom(_) | Stage::Pnvm(_)) {
+        if matches!(
+            self.stage,
+            Stage::Rom(_) | Stage::Pnvm(_) | Stage::SwitchedOff
+        ) {
             return false;
         }
         let Ok(fatal) = interrupts::acknowledge(&mut self.restart.io, self.family, self.vector)
@@ -545,6 +557,13 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
         };
         drop(stopped);
         let first = no_reset && !core::mem::replace(&mut self.restart.no_reset, true);
+        self.boot_again(first)
+    }
+
+    /// Boot the stopped function again from its ROM, for the keeper to join
+    /// from nothing, saying so when `no_reset` is the first boot without the
+    /// reset it asked for. Whether it is booting.
+    fn boot_again(&mut self, no_reset: bool) -> bool {
         let restart = &self.restart;
         // SAFETY: the owner that held `io`'s twin stopped, and `new`'s
         // contract holds for what it kept.
@@ -596,10 +615,52 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
         self.error = None;
         self.reported = false;
         self.client = station::Client::new(unassigned());
-        if first {
+        if no_reset {
             self.client
                 .unsupported("a reset of this function: it boots again without one");
         }
+        true
+    }
+
+    /// Whether the radio's switch is on (CSR_GP_CNTRL's HW_RF_KILL_SW bit),
+    /// when the function answers.
+    fn switch(&mut self) -> Option<bool> {
+        const GP: u32 = 0x24;
+        const SWITCH_ON: u32 = 0x0800_0000;
+        match super::power::Csr::read32(&mut self.restart.io, GP) {
+            Ok(u32::MAX) | Err(_) => None,
+            Ok(value) => Some(value & SWITCH_ON != 0),
+        }
+    }
+
+    /// `iwl_mvm_set_hw_rfkill_state`: once the firmware is up, a radio
+    /// switched off stops the function, which waits for the switch, then
+    /// boots again from nothing. The error this boot ended on, if any, is
+    /// the switch's. Whether the radio went off now.
+    fn switched_off(&mut self) -> bool {
+        // A failure already reported is left as it is, read no more.
+        if matches!(
+            self.stage,
+            Stage::Rom(_) | Stage::Pnvm(_) | Stage::SwitchedOff | Stage::Moving
+        ) || (self.reported && matches!(self.stage, Stage::Failed { .. }))
+            || self.switch() != Some(false)
+            || !self
+                .stage
+                .owner()
+                .is_some_and(|owner| owner.stop_function())
+        {
+            return false;
+        }
+        self.stage = Stage::SwitchedOff;
+        self.deadline = None;
+        self.beacons = None;
+        self.selected = None;
+        self.eht = None;
+        self.chains = (0, 0);
+        self.address = Mac::default();
+        self.error = None;
+        self.reported = false;
+        self.client = station::Client::new(unassigned());
         true
     }
 
@@ -639,7 +700,8 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
             | Stage::Radio(_)
             | Stage::Lari(_)
             | Stage::Setup(_)
-            | Stage::Mcc(_) => Phase::Booting,
+            | Stage::Mcc(_)
+            | Stage::SwitchedOff => Phase::Booting,
             Stage::ScanConfiguration(_) | Stage::Board(_) | Stage::Country(_) | Stage::Mac(_) => {
                 Phase::Initializing
             }
@@ -697,7 +759,7 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
             Stage::Unlinking(owner) => owner.rom(),
             Stage::Unbinding(owner) => owner.rom(),
             Stage::Coexistence(owner) => owner.rom(),
-            Stage::Failed { .. } | Stage::Moving => None,
+            Stage::Failed { .. } | Stage::SwitchedOff | Stage::Moving => None,
         }
     }
 
@@ -1051,6 +1113,11 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
                 })
             }
             failed @ Stage::Failed { .. } => Ok(failed),
+            Stage::SwitchedOff if self.switch() == Some(true) => {
+                self.boot_again(false);
+                Ok(core::mem::replace(&mut self.stage, Stage::Moving))
+            }
+            Stage::SwitchedOff => Ok(Stage::SwitchedOff),
             Stage::Moving => Err((Error::Refused("bring-up"), Box::new(()))),
         }
     }

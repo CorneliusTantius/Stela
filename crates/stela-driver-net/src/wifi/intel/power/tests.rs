@@ -149,13 +149,7 @@ fn real_family_ownership_reset_persistence_bisr_and_stable_neighbor_effects() {
     for family in [Family::Ax200, Family::Ax210] {
         let mut power = Power::new(Model::new(family), profile(family));
         let awake = power.wake(ManagementSession::Unknown).unwrap();
-        assert_eq!(
-            awake,
-            Awake {
-                family,
-                rf_killed: false
-            }
-        );
+        assert_eq!(awake, Awake { family });
         assert_eq!(power.state, State::Awake(awake));
         assert_eq!(power.nic.io.registers[&INT_MASK], 0);
         assert_eq!(power.nic.io.registers[&CHICKEN], 0x00800400);
@@ -278,10 +272,11 @@ fn persistence_protection_clock_timeout_rfkill_and_identity_never_invent_ready()
         })
     );
     assert_eq!(power.nic.io.ops.last(), Some(&Op::Delay(200)));
+    // A switched-off radio still wakes: `iwl_pcie_apm_init` reads no switch.
     let mut model = Model::new(family);
     model.registers.insert(GP, 0);
     let mut power = Power::new(model, profile(family));
-    assert!(power.wake(ManagementSession::Unknown).unwrap().rf_killed);
+    assert!(power.wake(ManagementSession::Unknown).is_ok());
     let mut model = Model::new(family);
     model.registers.insert(RF_ID, 0x10d000);
     let mut power = Power::new(model, profile(family));

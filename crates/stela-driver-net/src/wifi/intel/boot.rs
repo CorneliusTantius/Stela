@@ -454,7 +454,7 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
         product_reset_policy: Option<ProductResetPolicy>,
     ) -> Result<Self, Error> {
         let vector = power.vector();
-        let (io, profile, awake) = power.into_awake()?;
+        let (io, profile, _) = power.into_awake()?;
         let (firmware, image) = staged.into_parts();
         let request = profile.firmware_request();
         if !profile.binds(request.name, &image) {
@@ -467,9 +467,9 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
         if product_reset_policy == Some(ProductResetPolicy::ManagedSap) {
             return Err(Error::ManagedSapUnsupported);
         }
-        if awake.rf_killed {
-            return Err(Error::RfKilled);
-        }
+        // `iwl_trans_pcie_start_fw` runs the unified image of these devices
+        // with the radio switched off; the commands that need the radio
+        // are the ones that refuse it.
         let maximum = if family >= Family::Ax210 { 1024 } else { 2048 };
         if !(16..=maximum).contains(&entries) || !entries.is_power_of_two() {
             return Err(Error::QueueSize);
@@ -712,9 +712,6 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
             || self.read_register(0x9c)? != observed.radio_id
         {
             return Err(Error::IdentityChanged);
-        }
-        if self.read_register(0x24)? & 0x08000000 == 0 {
-            return Err(Error::RfKilled);
         }
         // CONFIG_IWLMEI-disabled Linux performs no PLDR coordination. Keep
         // the SB value even when0x80, under this explicit unmanaged
@@ -1149,9 +1146,6 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
         if causes & (interrupts::INT_HW_ERR | interrupts::INT_SW_ERR) != 0 {
             return Err(Error::DeviceError(causes));
         }
-        if self.read_register(0x24)? & 0x08000000 == 0 {
-            return Err(Error::RfKilled);
-        }
         while let Some(bytes) = self.completed_buffer()? {
             let mut observed = false;
             for packet in Packets::new(self.profile.family(), 0, &bytes)? {
@@ -1197,9 +1191,6 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
         let causes = self.causes()?;
         if causes & (interrupts::INT_HW_ERR | interrupts::INT_SW_ERR) != 0 {
             return Err(Error::DeviceError(causes));
-        }
-        if self.read_register(0x24)? & 0x08000000 == 0 {
-            return Err(Error::RfKilled);
         }
         if self.state == State::Published && causes & 1 != 0 {
             self.restock()?;
