@@ -63,7 +63,7 @@ for rust_name,name in [('MAC','rtw8822c_mac'),('BB','rtw8822c_bb'),('AGC','rtw88
     rust+=['',f'// {name}: {len(pairs)} complete pairs; source declaration SHA256 {digest}.',f'pub(super) static {rust_name}: &[[u32; 2]] = &[']+[f'    [0x{a:08x}, 0x{v:08x}],' for a,v in pairs]+['];']
 generated=out/'data.rs';generated.write_text('\n'.join(rust)+'\n')
 subprocess.run(['rustfmt','--edition','2024',str(generated)],check=True)
-native=pathlib.Path(__file__).resolve().parents[2]/'src/net/wifi/realtek/phy/data.rs'
+native=pathlib.Path(__file__).resolve().parents[3]/'stela-driver-net/src/wifi/realtek/phy/data.rs'
 assert generated.read_bytes()==native.read_bytes(), 'committed native table bytes differ from complete pinned source export'
 manifest.append(dict(native_table_bytes=native.stat().st_size,native_table_sha256=hashlib.sha256(native.read_bytes()).hexdigest(),complete_pairs=46215))
 ph=(reference/'rtw88/phy.h').read_text();table_macros=ph[ph.index('#define RTW_DECL_TABLE_PHY_COND_CORE'):ph.index('#define RTW_DECL_TABLE_BB_PG')]
