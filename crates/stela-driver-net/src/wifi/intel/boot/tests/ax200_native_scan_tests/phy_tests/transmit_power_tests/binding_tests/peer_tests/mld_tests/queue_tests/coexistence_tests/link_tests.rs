@@ -626,6 +626,36 @@ fn ax210_image(mut image: Vec<u8>) -> Vec<u8> {
     image
 }
 
+/// An AX210 fixture image as a BE200 one: its API 106 header and the
+/// command versions iwlmld takes, rate format 3 among them.
+fn be200_image(image: Vec<u8>) -> Vec<u8> {
+    let mut image = ax210_image(image);
+    image[72..76].copy_from_slice(&(106u32 << 8).to_le_bytes());
+    let mut at = 88;
+    while at < image.len() {
+        let word = |at: usize| u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
+        let (kind, length) = (word(at), word(at + 4) as usize);
+        if kind == 48 {
+            let mut tlc = false;
+            for entry in image[at + 8..at + 8 + length].as_chunks_mut::<4>().0 {
+                match entry[..2] {
+                    [0xc1, 0] => entry[3] = 6,
+                    [0x1c, 1] => (entry[2], entry[3]) = (11, 9),
+                    [0xf7, 5] => (tlc, entry[3]) = (true, 4),
+                    _ => {}
+                }
+            }
+            if !tlc {
+                image.splice(at + 8 + length..at + 8 + length, [0xf7, 5, 0, 4]);
+                image[at + 4..at + 8].copy_from_slice(&((length + 4) as u32).to_le_bytes());
+            }
+            break;
+        }
+        at += 8 + length.next_multiple_of(4);
+    }
+    image
+}
+
 /// An AX200 RX MPDU packet as an AX210 reports it: `iwl_rx_mpdu_desc`'s
 /// 64-byte form, its rate, energy, GP2 and TSF words moved past the PHY
 /// data that the AX210 adds.
@@ -775,7 +805,9 @@ fn raise_as<'n>(
         46,
         true,
     );
-    let catalog: &'static resources::Catalog = Box::leak(Box::new(if native.ax210 {
+    let catalog: &'static resources::Catalog = Box::leak(Box::new(if native.be200 {
+        catalog_with_pnvm(&be200_profile(), &be200_image(image), AX210_SKU)
+    } else if native.ax210 {
         catalog_with_pnvm(&ax210_profile(), &ax210_image(image), AX210_SKU)
     } else {
         catalog_for(&profile(), Family::Ax200.firmware_name(), &image)
@@ -788,14 +820,27 @@ fn raise_as<'n>(
         .registers
         .extend([(0x388, 0x02123456), (0x38c, 0x789a)]);
     let mut boot = if native.ax210 {
+        let (radio, profile) = if native.be200 {
+            // A BE200 also starts its ROM through GP control.
+            native
+                .state
+                .lock()
+                .unwrap()
+                .registers
+                .insert(0x24, 0x08100001);
+            ((0x472, 0x112200), be200_profile())
+        } else {
+            ((0x420, 0x10d000), ax210_profile())
+        };
         native.state.lock().unwrap().registers.extend([
-            (0x28, 0x420),
-            (0x9c, 0x10d000),
+            (0x28, radio.0),
+            (0x9c, radio.1),
             (0, 0x45678900),
         ]);
         let (observation, step) = step_fixture();
         let step: &'static resources::Catalog = Box::leak(Box::new(step));
-        start_ax210(
+        start_profile(
+            profile,
             catalog,
             crate::wifi::intel::platform::load_step(observation, step).unwrap(),
             source,
@@ -1934,6 +1979,46 @@ fn an_ax210_boots_with_its_pnvm_joins_and_carries_data() {
         "{:?}",
         receipts.pnvm
     );
+    device.inject(
+        wifi.radio().rom().unwrap(),
+        &data(LOCAL, false, [8, 0], &[0x45; 46], Some((0, 1))),
+    );
+    settle(&mut wifi, &mut device);
+    let ethernet = wifi.receive().unwrap().expect("the AP's frame");
+    assert_eq!(ethernet[..6], LOCAL);
+    assert_eq!(ethernet[14..], [0x45; 46]);
+    let sent = device.air.len();
+    let mut frame = AP.to_vec();
+    frame.extend(LOCAL);
+    frame.extend([8, 0]);
+    frame.extend([0x54; 46]);
+    wifi.transmit(&frame).unwrap();
+    settle(&mut wifi, &mut device);
+    let carried = &device.air[sent..];
+    assert!(
+        carried.iter().any(|mpdu| mpdu.ends_with(&[0x54; 46])),
+        "{carried:?}"
+    );
+}
+
+/// A BE200 goes from its ROM through its PNVM file to an association,
+/// then carries data both ways, as iwlmld drives the Bz family.
+#[test]
+fn a_be200_boots_with_its_pnvm_joins_and_carries_data() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    let native = Native {
+        ax210: true,
+        be200: true,
+        ..Native::default()
+    };
+    let (mut wifi, mut device) = connect(&native, false);
+    assert_eq!(
+        wifi.radio().family,
+        crate::wifi::intel::firmware::Family::Bz
+    );
+    assert!(device.pnvm_loaded, "the PNVM went to the firmware");
     device.inject(
         wifi.radio().rom().unwrap(),
         &data(LOCAL, false, [8, 0], &[0x45; 46], Some((0, 1))),

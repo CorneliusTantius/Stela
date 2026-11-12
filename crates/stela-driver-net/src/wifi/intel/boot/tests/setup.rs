@@ -217,6 +217,15 @@ pub(super) fn ax210_profile() -> Profile {
     Profile::select(observed).unwrap()
 }
 
+/// A BE200, of the Bz family, with its FM radio.
+pub(super) fn be200_profile() -> Profile {
+    let mut observed = profile().observed();
+    observed.device = 0x272b;
+    observed.hardware_revision = 0x472;
+    observed.radio_id = 0x112200;
+    Profile::select(observed).unwrap()
+}
+
 pub(super) fn ax210_state() -> Arc<Mutex<ModelState>> {
     let state = Arc::new(Mutex::new(ModelState::default()));
     state
@@ -253,12 +262,25 @@ pub(super) fn start_ax210<'a>(
     state: &Arc<Mutex<ModelState>>,
     drops: &Arc<AtomicUsize>,
 ) -> RomBoot<'a, Model> {
-    // SAFETY: All helper callers supply this sole AX210 model owner's Source/Domain;
+    start_profile(ax210_profile(), catalog, step, source, domain, state, drops)
+}
+
+/// [`start_ax210`] for any profile of the AX210 family or later.
+pub(super) fn start_profile<'a>(
+    profile: Profile,
+    catalog: &'a resources::Catalog,
+    step: StepConfiguration<'a>,
+    source: &Source,
+    domain: &Arc<Domain>,
+    state: &Arc<Mutex<ModelState>>,
+    drops: &Arc<AtomicUsize>,
+) -> RomBoot<'a, Model> {
+    // SAFETY: All helper callers supply this sole model owner's Source/Domain;
     // fresh RAM and serialized register effects have no real DMA, IRQ or active SAP user.
     unsafe {
         RomBoot::start_ax210(
-            awake_profile(state.clone(), drops.clone(), ax210_profile()),
-            crate::wifi::intel::identity::stage(&ax210_profile(), catalog).unwrap(),
+            awake_profile(state.clone(), drops.clone(), profile.clone()),
+            crate::wifi::intel::identity::stage(&profile, catalog).unwrap(),
             step,
             source,
             Some(domain.clone()),

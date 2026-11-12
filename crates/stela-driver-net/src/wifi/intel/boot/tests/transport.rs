@@ -147,7 +147,11 @@ pub(super) fn complete_from_free_slot(
     let payload = &boot.buffers[usize::from(vid - 1)].allocation;
     device_write(domain, payload.region().address, 0, packet, true);
     let mut descriptor = [0; 32];
-    let stride = if boot.profile.family() >= Family::Ax210 {
+    let stride = if boot.profile.family() >= Family::Bz {
+        // `iwl_rx_completion_desc_bz`: the buffer ID first, in 4 bytes.
+        descriptor[..2].copy_from_slice(&vid.to_le_bytes());
+        4
+    } else if boot.profile.family() >= Family::Ax210 {
         descriptor[4..6].copy_from_slice(&vid.to_le_bytes());
         32
     } else {

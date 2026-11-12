@@ -19,6 +19,8 @@ pub(super) struct Native {
     pub(super) transmit_fifo: core::sync::atomic::AtomicU32,
     /// The function is an AX210, which boots with its PNVM file.
     pub(super) ax210: bool,
+    /// With `ax210`, the function is a BE200 instead, of the Bz family.
+    pub(super) be200: bool,
 }
 impl Default for Native {
     fn default() -> Self {
@@ -33,6 +35,7 @@ impl Default for Native {
             firmware: None,
             transmit_fifo: core::sync::atomic::AtomicU32::new(0),
             ax210: false,
+            be200: false,
         }
     }
 }

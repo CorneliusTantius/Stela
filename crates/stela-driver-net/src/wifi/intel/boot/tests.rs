@@ -25,8 +25,9 @@ use model::{Model, ModelState, Op, Owner};
 use mpdu_fixture::exercise_mpdu_observations;
 use recycle_fixture::exercise_rx_recycling;
 use setup::{
-    awake, awake_profile, ax210_profile, ax210_state, catalog_for, catalog_for_target,
-    catalog_with_pnvm, phase_catalog, profile, start, start_ax210, step_fixture,
+    awake, awake_profile, ax210_profile, ax210_state, be200_profile, catalog_for,
+    catalog_for_target, catalog_with_pnvm, phase_catalog, profile, start, start_ax210,
+    start_profile, step_fixture,
 };
 use std::sync::Mutex;
 use transport::{
@@ -85,7 +86,7 @@ unsafe impl super::super::radio::bios::service::BiosIo for RadioBios {
                 raw
             }
             Variable::Wbem => vec![0, 3, 0, 0, 0],
-            Variable::Uats | Variable::Uneb => {
+            Variable::Uats | Variable::Uneb | Variable::Puncturing => {
                 return Err(super::super::radio::bios::service::IoError::NotFound);
             }
             _ => panic!("unrequested source"),
