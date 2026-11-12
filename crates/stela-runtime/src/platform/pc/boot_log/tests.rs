@@ -534,7 +534,7 @@ fn a_resumed_boot_keeps_its_header_for_its_outcome() {
 }
 
 #[test]
-fn a_version_1_log_is_read_and_started_over() {
+fn a_version_1_log_is_kept_whole_read_and_started_over() {
     let region = LAYOUT_BYTES + 4096;
     let mut disk = Recorder::new(region, 512);
     Header {
@@ -548,11 +548,20 @@ fn a_version_1_log_is_read_and_started_over() {
     let log = disk.log().unwrap();
     assert_eq!((log.boots, log.stream.as_slice()), (7, &b"old 1\n"[..]));
     assert!(log.kept.is_empty());
+    // The boot keeps the whole old region, byte for byte, before it starts
+    // the log over; a log of this format or a blank one is not kept.
+    let before = disk.disk.bytes.clone();
+    let (version, kept) = older_format(&mut disk).unwrap().unwrap();
+    assert_eq!(version, 1);
+    assert!(kept == before, "the kept region differs");
+    assert_eq!(read(&kept).unwrap().stream, b"old 1\n");
     let mut writer = Writer::open(&mut disk).unwrap();
     assert_eq!(writer.fresh(), Some(&HeaderError::Version(1)));
     writer.flush(&mut disk).unwrap();
     let log = disk.log().unwrap();
     assert_eq!(text(&log), "=== STELA BOOT 1 ===\n");
+    assert_eq!(older_format(&mut disk).unwrap(), None);
+    assert_eq!(older_format(&mut Recorder::new(region, 512)).unwrap(), None);
     // The old ring bytes in the kept blocks are cleared, not taken as slots.
     assert!(log.kept.is_empty());
     assert!(

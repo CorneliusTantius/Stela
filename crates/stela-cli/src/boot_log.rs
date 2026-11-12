@@ -169,8 +169,19 @@ pub(crate) fn write_logs(
         Some(path) => eprintln!("{}", saved(logs.len(), path)),
         None => eprintln!("{ATTACH}"),
     }
+    if logs
+        .iter()
+        .any(|(place, _)| place.ends_with(crate::efi::OLD_BOOT_LOG))
+    {
+        eprintln!("{OLD_KEPT}");
+    }
     Ok(())
 }
+
+/// What a printed or saved log says when the USB kept a log of an earlier
+/// format: both are in it, and both belong in a report.
+pub(crate) const OLD_KEPT: &str = "The USB also keeps its log from before the log format changed \
+                                   (EFI/stela/boot-old.log); the output holds it before the current one, and a report needs both.";
 
 /// The closing line of a log printed to the terminal.
 const ATTACH: &str = "To attach this to a report, run `stela boot-log --output stela-log.txt` \
@@ -589,9 +600,11 @@ impl ReadAt for Span<'_, '_> {
 /// finds it, and the machine state's at its start and in its last bytes.
 fn partition_logs(read: &mut Reader<'_>, bytes: u64, place: &str) -> Logs {
     let mut logs = Logs::default();
-    if let Ok(log) = file_log(read, bytes) {
-        logs.usb
-            .push((format!("{place}, {}", crate::efi::BOOT_LOG), log));
+    // The log a boot kept from an earlier format comes first: it is older.
+    for name in [crate::efi::OLD_BOOT_LOG, crate::efi::BOOT_LOG] {
+        if let Ok(log) = file_log(read, bytes, name) {
+            logs.usb.push((format!("{place}, {name}"), log));
+        }
     }
     if bytes >= boot_log::PARTITION_BYTES
         && let Ok(log) = state_log(read, 0)
@@ -607,18 +620,16 @@ fn partition_logs(read: &mut Reader<'_>, bytes: u64, place: &str) -> Logs {
     logs
 }
 
-/// The USB's own log, [`crate::efi::BOOT_LOG`] on the FAT32 volume of a
+/// The USB's own log, `name` ([`crate::efi::BOOT_LOG`] or the
+/// [`crate::efi::OLD_BOOT_LOG`] a boot kept) on the FAT32 volume of a
 /// `bytes`-long partition: the file's first [`boot_log::LOG_BYTES`], which
 /// `stela.efi` writes through its clusters.
-fn file_log(read: &mut Reader<'_>, bytes: u64) -> Result<Log> {
+fn file_log(read: &mut Reader<'_>, bytes: u64, name: &str) -> Result<Log> {
     let mut volume = Fat32::open(Span { read, bytes }).map_err(|error| anyhow!("{error}"))?;
-    let file = volume
-        .file(crate::efi::BOOT_LOG)
-        .map_err(|error| anyhow!("{error}"))?;
+    let file = volume.file(name).map_err(|error| anyhow!("{error}"))?;
     ensure!(
         file.bytes >= boot_log::LOG_BYTES,
-        "{} holds {} bytes, fewer than the log's {}",
-        crate::efi::BOOT_LOG,
+        "{name} holds {} bytes, fewer than the log's {}",
         file.bytes,
         boot_log::LOG_BYTES
     );
@@ -633,8 +644,8 @@ fn file_log(read: &mut Reader<'_>, bytes: u64) -> Result<Log> {
             break;
         }
     }
-    ensure!(done == region.len(), "{} ends early", crate::efi::BOOT_LOG);
-    boot_log::read(&region).with_context(|| format!("{} has no boot log", crate::efi::BOOT_LOG))
+    ensure!(done == region.len(), "{name} ends early");
+    boot_log::read(&region).with_context(|| format!("{name} has no boot log"))
 }
 
 /// The boot log of the machine state that starts at byte `state`, when a
@@ -1104,6 +1115,14 @@ pub(crate) mod tests {
     /// A 40 MiB FAT32 volume as setup's EFI partition holds it:
     /// `EFI/STELA/BOOT.LOG` holds `log` when given, in a contiguous chain.
     pub(crate) fn fat_volume(log: Option<&[u8]>) -> Vec<u8> {
+        let files: Vec<(&[u8; 11], &[u8])> =
+            log.map(|log| (b"BOOT    LOG", log)).into_iter().collect();
+        fat_files(&files)
+    }
+
+    /// [`fat_volume`] with `files` in `EFI/STELA`, each a short name and its
+    /// bytes in a contiguous chain.
+    fn fat_files(files: &[(&[u8; 11], &[u8])]) -> Vec<u8> {
         use stela_runtime::pc::fat32::format::{
             END_OF_CHAIN, FATS, Geometry, MEDIA_ENTRY, volume_label,
         };
@@ -1142,19 +1161,27 @@ pub(crate) mod tests {
         };
         entry(&mut bytes, 2, b"EFI        ", DIRECTORY, 3, 0);
         entry(&mut bytes, 3, b"STELA      ", DIRECTORY, 4, 0);
-        if let Some(log) = log {
+        let mut first = 5;
+        for (index, (name, log)) in files.iter().enumerate() {
             let clusters = log.len().div_ceil(geometry.cluster_bytes() as usize) as u32;
-            for cluster in 5..5 + clusters {
-                let next = if cluster + 1 == 5 + clusters {
+            for cluster in first..first + clusters {
+                let next = if cluster + 1 == first + clusters {
                     END_OF_CHAIN
                 } else {
                     cluster + 1
                 };
                 set(&mut bytes, cluster, next);
             }
-            entry(&mut bytes, 4, b"BOOT    LOG", ARCHIVE, 5, log.len() as u32);
-            let at = geometry.cluster_offset(5) as usize;
+            let at = geometry.cluster_offset(4) as usize + index * 32;
+            let slot = &mut bytes[at..at + 32];
+            slot[..11].copy_from_slice(*name);
+            slot[11] = ARCHIVE;
+            slot[20..22].copy_from_slice(&((first >> 16) as u16).to_le_bytes());
+            slot[26..28].copy_from_slice(&(first as u16).to_le_bytes());
+            slot[28..32].copy_from_slice(&(log.len() as u32).to_le_bytes());
+            let at = geometry.cluster_offset(first) as usize;
             bytes[at..at + log.len()].copy_from_slice(log);
+            first += clusters;
         }
         bytes
     }
@@ -1200,6 +1227,30 @@ pub(crate) mod tests {
 
     const ESP: &str = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B";
     const LINUX: &str = "0FC63DAF-8483-4772-8E79-3D69D8477DE4";
+
+    #[test]
+    fn boot_log_reads_the_log_kept_from_the_earlier_format_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("esp.img");
+        let old = region(&["an old failed boot\n"]);
+        let current = region(&["a new boot\n"]);
+        std::fs::write(
+            &path,
+            fat_files(&[(b"BOOT-OLDLOG", &old), (b"BOOT    LOG", &current)]),
+        )
+        .unwrap();
+        let found = find(&path).unwrap();
+        let places: Vec<&str> = found.iter().map(|(place, _)| place.as_str()).collect();
+        assert_eq!(
+            places,
+            [
+                "the file, EFI/stela/boot-old.log",
+                "the file, EFI/stela/boot.log"
+            ]
+        );
+        assert!(render(&found[0].1, Shown::default()).contains("an old failed boot"));
+        assert!(render(&found[1].1, Shown::default()).contains("a new boot"));
+    }
 
     #[test]
     fn boot_log_reads_the_usb_s_own_file_before_the_machine_state() {

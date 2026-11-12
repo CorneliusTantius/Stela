@@ -40,6 +40,9 @@ const MOUNT: &str = "EFI/stela";
 pub(crate) const OPTIONS: &str = "EFI/stela/stela.cfg";
 /// `mount_interface::BOOT_LOG_FILE`.
 pub(crate) const BOOT_LOG: &str = "EFI/stela/boot.log";
+/// `mount_interface::OLD_BOOT_LOG_FILE`: the log of an earlier format a
+/// boot kept before it started [`BOOT_LOG`] over.
+pub(crate) const OLD_BOOT_LOG: &str = "EFI/stela/boot-old.log";
 const SOURCE: &str = "EFI/stela/source.bin";
 
 #[derive(Subcommand)]
@@ -225,7 +228,12 @@ pub fn uninstall(esp: &Path, owned: bool) -> Result<serde_json::Value> {
         true => Some(true),
         false => loader_is_stela(esp)?,
     };
-    let mut remove = vec![esp.join(OPTIONS), esp.join(SOURCE), esp.join(BOOT_LOG)];
+    let mut remove = vec![
+        esp.join(OPTIONS),
+        esp.join(SOURCE),
+        esp.join(BOOT_LOG),
+        esp.join(OLD_BOOT_LOG),
+    ];
     if stela == Some(true) {
         remove.insert(0, esp.join(LOADER));
     }

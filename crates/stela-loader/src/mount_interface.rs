@@ -54,6 +54,9 @@ pub const CHOICES_FILE: &str = "\\EFI\\stela\\choices.cfg";
 /// whole output there from its first line, before and after boot services
 /// end, so every run leaves a log on the USB itself.
 pub const BOOT_LOG_FILE: &str = "\\EFI\\stela\\boot.log";
+/// Where a boot keeps [`BOOT_LOG_FILE`] when it holds a log of an earlier
+/// format, before it starts the log over: once, replacing an older one.
+pub const OLD_BOOT_LOG_FILE: &str = "\\EFI\\stela\\boot-old.log";
 /// The word that stands, in a startup choice's options, for the partition
 /// `stela.efi`'s Install macOS chose for the Mac's internal SSD
 /// (`SERIAL:GUID`), which it keeps in [`DISK_FILE`].

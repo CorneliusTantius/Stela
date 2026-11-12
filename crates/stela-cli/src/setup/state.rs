@@ -224,6 +224,28 @@ pub(super) fn boot_log(
             })
             .with_context(|| format!("cannot read {}: {error}", path.display())),
     };
+    // The log a boot kept when the log format changed: older, so first.
+    let old_path = record.esp.join(crate::efi::OLD_BOOT_LOG);
+    let usb = match fs::read(&old_path) {
+        Ok(region) => {
+            let old = boot_log::read(&region)
+                .map(|log| {
+                    shown(
+                        &format!(
+                            "Earlier boot log on the USB, kept when the log format changed ({})",
+                            old_path.display()
+                        ),
+                        &log,
+                    )
+                })
+                .unwrap_or_else(|error| format!("{}: {error}\n", old_path.display()));
+            match usb {
+                Ok(usb) => Ok(format!("{old}\n{usb}")),
+                Err(error) => Ok(format!("{old}\n{error:#}\n")),
+            }
+        }
+        Err(_) => usb,
+    };
     let install = install_log(environment, record, command);
     match (usb, install) {
         (Ok(usb), Ok(install)) => Ok(format!("{usb}\n{install}")),

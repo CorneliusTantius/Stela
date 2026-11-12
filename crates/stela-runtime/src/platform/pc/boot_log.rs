@@ -1087,6 +1087,29 @@ impl Log {
     }
 }
 
+/// The whole region `device` holds when it is a valid log of an earlier
+/// format, which [`Writer::open`] would start over: its version and bytes,
+/// for the boot to keep before it opens the log. `None` for a log of this
+/// format, a blank region or one that holds no valid log.
+pub fn older_format(device: &mut dyn BlockDevice) -> Result<Option<(u32, Vec<u8>)>, BlockError> {
+    let identity = device.identity();
+    let block = identity.block_size as usize;
+    let bytes = identity.blocks.saturating_mul(block as u64);
+    if block == 0 || bytes <= HEADER_BYTES {
+        return Ok(None);
+    }
+    let mut first = vec![0; block];
+    device.read(0, &mut first)?;
+    match Header::decode(&first, bytes) {
+        Ok(header) if header.version < VERSION => {
+            let mut region = vec![0; bytes as usize];
+            device.read(0, &mut region)?;
+            Ok(Some((header.version, region)))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// The log a whole region holds, its stream in order. A blank or invalid
 /// header is refused by name.
 pub fn read(region: &[u8]) -> Result<Log, HeaderError> {

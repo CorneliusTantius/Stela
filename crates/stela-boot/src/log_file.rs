@@ -13,7 +13,7 @@ use crate::{
 use alloc::{boxed::Box, format, string::String};
 use stela_contracts::refuse;
 use stela_drivers::block::{BlockDevice, BlockError, Features, Identity, Shared, Transport};
-use stela_loader::mount_interface::BOOT_LOG_FILE;
+use stela_loader::mount_interface::{BOOT_LOG_FILE, OLD_BOOT_LOG_FILE};
 use stela_runtime::pc::{
     boot_log::{self, LOG_BYTES, Writer},
     fat32::Fat32,
@@ -26,7 +26,7 @@ use uefi::{
         ProtocolPointer,
         loaded_image::LoadedImage,
         media::{
-            file::{File as _, FileAttribute, FileInfo, FileMode, RegularFile},
+            file::{Directory, File as _, FileAttribute, FileInfo, FileMode, RegularFile},
             fs::SimpleFileSystem,
         },
     },
@@ -103,12 +103,12 @@ fn shared<P: ProtocolPointer + ?Sized>(handle: Handle) -> Option<ScopedProtocol<
 }
 
 fn firmware_file() -> Result<(FileDevice, Option<Guid>)> {
-    let device = shared::<LoadedImage>(boot::image_handle())
+    let device_handle = shared::<LoadedImage>(boot::image_handle())
         .ok_or(refuse!("no loaded image"))?
         .device()
         .ok_or(refuse!("Stela was not loaded from a volume"))?;
-    let mut volume =
-        shared::<SimpleFileSystem>(device).ok_or(refuse!("Stela's volume has no file system"))?;
+    let mut volume = shared::<SimpleFileSystem>(device_handle)
+        .ok_or(refuse!("Stela's volume has no file system"))?;
     let mut root = volume
         .open_volume()
         .map_err(|_| refuse!("Stela's volume cannot be opened"))?;
@@ -126,7 +126,65 @@ fn firmware_file() -> Result<(FileDevice, Option<Guid>)> {
     if size < LOG_BYTES {
         return Err(refuse!("\\EFI\\stela\\boot.log is shorter than the log"));
     }
-    let identity = Identity {
+    let mut device = FileDevice {
+        identity: file_identity(),
+        file,
+    };
+    keep_older_format(&mut device, &mut root);
+    Ok((device, translations::partition(device_handle).map(Guid)))
+}
+
+/// Keep the log when it is of an earlier format, which [`Writer::open`]
+/// starts over: as [`OLD_BOOT_LOG_FILE`], byte for byte, replacing an older
+/// one. A refusal is one note, and the log starts over all the same.
+fn keep_older_format(device: &mut FileDevice, root: &mut Directory) {
+    let older = match boot_log::older_format(device) {
+        Ok(Some(older)) => older,
+        Ok(None) => return,
+        Err(error) => {
+            status::info(&format!(
+                "The USB's boot log could not be read to keep it before it starts over: {error}."
+            ));
+            return;
+        }
+    };
+    let (version, region) = older;
+    match write_file(root, OLD_BOOT_LOG_FILE, &region) {
+        Ok(()) => output::arguments(format_args!(
+            "LOG kept the format {version} log as {OLD_BOOT_LOG_FILE} ({}) before starting \
+             {BOOT_LOG_FILE} over\n",
+            stela_boot_core::log_style::size(region.len() as u64)
+        )),
+        Err(why) => status::info(&format!(
+            "The USB's earlier boot log (format {version}) could not be kept as \
+             {OLD_BOOT_LOG_FILE}: {why}. It is started over."
+        )),
+    }
+}
+
+/// Make `path` hold exactly `bytes`, replacing the file that was there.
+fn write_file(root: &mut Directory, path: &str, bytes: &[u8]) -> Result<(), &'static str> {
+    let path = CString16::try_from(path).map_err(|_| "its path is not UCS-2")?;
+    if let Ok(old) = root.open(&path, FileMode::ReadWrite, FileAttribute::empty()) {
+        old.delete()
+            .map_err(|_| "the firmware refused to remove the older copy")?;
+    }
+    let mut file = root
+        .open(&path, FileMode::CreateReadWrite, FileAttribute::empty())
+        .ok()
+        .and_then(|file| file.into_regular_file())
+        .ok_or("the firmware refused to create the file")?;
+    for chunk in bytes.chunks(64 << 10) {
+        file.write(chunk)
+            .map_err(|_| "the firmware refused a write")?;
+    }
+    file.flush()
+        .map_err(|_| "the firmware refused to store the file")
+}
+
+/// The log file as a device of [`BLOCK`]-byte blocks.
+fn file_identity() -> Identity {
+    Identity {
         transport: Transport::Firmware,
         location: String::from(BOOT_LOG_FILE),
         model: String::new(),
@@ -139,11 +197,7 @@ fn firmware_file() -> Result<(FileDevice, Option<Guid>)> {
             write_cache: true,
             ..Features::default()
         },
-    };
-    Ok((
-        FileDevice { identity, file },
-        translations::partition(device).map(Guid),
-    ))
+    }
 }
 
 fn engine_file(partition: Box<dyn BlockDevice>) -> Result<()> {
