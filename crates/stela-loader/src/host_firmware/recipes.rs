@@ -573,6 +573,22 @@ const REALTEK_WIFI_LICENSE: Artifact = Artifact {
     sha256: "a61351665b4f264f6c631364f85b907d8f8f41f8b369533ef4021765f9f3b62e",
 };
 
+/// ORACLE PIN PENDING: the length and sha256 of linux-firmware's
+/// `rtw88/rtw8821c_fw.bin` at [`WIFI_FIRMWARE_REVISION`], which the
+/// coordinator's oracle measures.
+const RTW8821C_FW_LENGTH: usize = 0;
+const RTW8821C_FW_SHA256: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Recipes whose pins wait on the oracle. Once pinned, each moves into
+/// [`REALTEK_WIFI`], where the RTL8821C's selection and bundle arms already
+/// look for it; until then neither finds it, and setup installs nothing.
+pub const REALTEK_WIFI_PENDING: &[Recipe] = &[wifi(
+    "rtw88/rtw8821c_fw.bin",
+    RTW8821C_FW_LENGTH,
+    RTW8821C_FW_SHA256,
+    &REALTEK_WIFI_LICENSE,
+)];
+
 pub const REALTEK_WIFI: &[Recipe] = &[
     wifi(
         "rtw88/rtw8822c_fw.bin",
@@ -911,6 +927,8 @@ pub fn require_wifi(inventory: &mut Inventory, vendor: u16, device: u16) -> Resu
         ),
         // `rtw_8822ce_id_table`.
         (0x10ec, 0xc822 | 0xc82f) => ("realtek-wifi", "pci:10ec:c822", &["rtw88/rtw8822c_fw.bin"]),
+        // `rtw_8821ce_id_table`.
+        (0x10ec, 0xb821 | 0xc821) => ("realtek-wifi", "pci:10ec:c821", &["rtw88/rtw8821c_fw.bin"]),
         (0x8086, _) if !intel_wifi_images(device).is_empty() => {
             intel = format!("pci:8086:{device:04x}");
             ("wifi-intel", &intel, intel_wifi_images(device))
@@ -1065,6 +1083,12 @@ fn select_realtek_wifi(request: &Request) -> Option<&'static Recipe> {
                 )
         });
     }
+    // The RTL8821C chip's binding, likewise.
+    if request.target.hardware == "pci:10ec:c821" && request.target.revision == "linux-firmware" {
+        return REALTEK_WIFI.iter().find(|recipe| {
+            recipe.image.member == request.name && request.name == "rtw88/rtw8821c_fw.bin"
+        });
+    }
     let pci: Vec<_> = request.target.hardware.split(':').collect();
     if pci.len() != 8
         || pci[0] != "pci"
@@ -1101,6 +1125,7 @@ fn select_realtek_wifi(request: &Request) -> Option<&'static Recipe> {
                     "rtw88/rtw8822c_fw.bin" | "rtw88/rtw8822c_wow_fw.bin"
                 )
         }
+        "b821" | "c821" => syscfg & (1 << 23) == 0 && request.name == "rtw88/rtw8821c_fw.bin",
         "b852" | "b85b" => {
             // Return the exact requested container at every observed cut.
             // Original rtw89 owns suit selection and its failure semantics;

@@ -377,6 +377,10 @@ pub fn select(functions: &[Pci]) -> Selection {
                 );
                 true
             }
+            (0x10ec, 0xb821 | 0xc821) => {
+                selection.members(recipes::REALTEK_WIFI, &["rtw88/rtw8821c_fw.bin"], &why);
+                true
+            }
             (0x10ec, 0xb852 | 0xb85b) => {
                 selection.members(recipes::REALTEK_WIFI, &["rtw89/rtw8852b_fw-2.bin"], &why);
                 true
