@@ -872,8 +872,8 @@ mod tests {
         let manifest = bundle::manifest(&files).unwrap();
         let parsed = bundle::Bundle::parse(&manifest).unwrap();
         assert!(parsed.missing().is_empty());
-        assert_eq!(parsed.objects.len(), 89);
-        assert!(bundle_summary().starts_with("every supported device: 89 files, 118.3 MiB"));
+        assert_eq!(parsed.objects.len(), 90);
+        assert!(bundle_summary().starts_with("every supported device: 90 files, 119.8 MiB"));
         // A volume short of room keeps the small files and leaves the large
         // GPU images out, by name.
         let (files, left) = bundle_plan(Some(MARGIN + 40 * MIB), 0);
@@ -1104,7 +1104,7 @@ mod tests {
         let status = bundle_status(dir.path()).unwrap_err();
         assert_eq!(
             status,
-            "the firmware bundle is incomplete: 3 of 89 files are on the USB"
+            "the firmware bundle is incomplete: 3 of 90 files are on the USB"
         );
     }
 
@@ -1126,7 +1126,7 @@ mod tests {
         )
         .unwrap();
         let status = bundle_status(dir.path()).unwrap_err();
-        assert!(status.contains("lacks 88 of 89 files"), "{status}");
+        assert!(status.contains("lacks 89 of 90 files"), "{status}");
         assert!(
             status.contains("nvidia/ga102/gsp/gsp-570.144.bin"),
             "{status}"

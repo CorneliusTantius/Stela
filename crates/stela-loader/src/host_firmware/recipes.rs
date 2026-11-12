@@ -601,6 +601,11 @@ pub const INTEL_WIFI: &[Recipe] = &[
         "65ccc7ed05c0ecb3ea0374b607ecacfdc693df4e5cbf825a4c91f71ce8fa9b7b",
     ),
     intel_wifi(
+        "intel/iwlwifi/iwlwifi-ma-b0-hr-b0-89.ucode",
+        1539836,
+        "3cdc5ae5fcbf3c4638758bef28b7695c010bd14d57d46357235923f2569b0ad7",
+    ),
+    intel_wifi(
         "intel/iwlwifi/iwlwifi-bz-b0-fm-c0-c106.ucode",
         2150968,
         "a0f8fb464c7203a18b28d966f0565835c8744f21ed9e53fc9a1ae9a33ed52cd3",
@@ -1052,8 +1057,7 @@ pub fn require_wifi(inventory: &mut Inventory, vendor: u16, device: u16) -> Resu
 
 /// What the Intel driver can name for the PCI device `device`
 /// (`stela_drivers::net::wifi::intel::identity::device_images`), by the
-/// family its `iwl_hw_card_ids` entry names. `iwlwifi-ma-b0-hr-b0-89.ucode`
-/// has no recipe, so an MA MAC with an HR radio needs the observed inventory.
+/// family its `iwl_hw_card_ids` entry names.
 fn intel_wifi_images(device: u16) -> &'static [&'static str] {
     match device {
         // AX200.
@@ -1075,6 +1079,7 @@ fn intel_wifi_images(device: u16) -> &'static [&'static str] {
             "iwlwifi-so-a0-gf-a0.pnvm",
             "iwlwifi-ma-b0-gf-a0-89.ucode",
             "iwlwifi-ma-b0-gf-a0.pnvm",
+            "iwlwifi-ma-b0-hr-b0-89.ucode",
         ],
         // Bz MACs.
         0xa840 | 0x7740 | 0x4d40 => &["iwlwifi-bz-b0-fm-c0-c106.ucode", "iwlwifi-bz-b0-fm-c0.pnvm"],

@@ -271,6 +271,7 @@ fn a_wifi_network_requires_every_image_an_intel_device_can_select() {
                 "iwlwifi-so-a0-gf-a0.pnvm",
                 "iwlwifi-ma-b0-gf-a0-89.ucode",
                 "iwlwifi-ma-b0-gf-a0.pnvm",
+                "iwlwifi-ma-b0-hr-b0-89.ucode",
             ][..],
         ),
         (
