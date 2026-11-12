@@ -265,6 +265,54 @@ fn a_stale_or_late_iqk_goes_on_and_publication_or_unwind_failures_quarantine_bot
     }
 }
 #[test]
+fn a_polled_iqk_takes_one_look_a_call_and_ends_at_done_its_300_ms_or_a_hurry() {
+    use super::super::firmware_control::{Control, Error as FwError, tests::bus};
+    for mode in 0..3 {
+        let (_, report) = super::super::phy::control_fixture();
+        let (io, fw, _, _) = bus(report.profile());
+        // SAFETY: the model device, its pages and its domain belong to this test alone; no
+        // other driver, worker or DMA touches them.
+        let mut control = unsafe { Control::new(io, &report) }.unwrap();
+        let memory = Arc::new(Mutex::new(Model::default()));
+        let device = Arc::new(Mutex::new(Device::default()));
+        device.lock().unwrap().iqk_trigger = Some(fw.lock().unwrap().trigger.clone());
+        let mut rings = install_profile(&memory, &device, report.profile()).unwrap();
+        fw.lock().unwrap().iqk_after = (mode == 0).then_some(3);
+        // SAFETY: as above.
+        let mut wait = unsafe { control.start_iqk(&mut rings, &Source) }.unwrap();
+        assert_eq!(
+            control.command((0, 0)),
+            Err(FwError::InvalidState),
+            "nothing interrupts the IQK"
+        );
+        let mut looks = 0;
+        let observed = loop {
+            looks += 1;
+            let hurry = mode == 2 && looks == 2;
+            if let Some(observed) = control.poll_iqk(&mut rings, &mut wait, hurry).unwrap() {
+                break observed;
+            }
+            assert!(looks < 100);
+            fw.lock().unwrap().now += 20_000;
+        };
+        match mode {
+            0 => assert!(observed.completed() && looks == 4),
+            1 => assert!(
+                !observed.completed() && (15..=17).contains(&looks),
+                "{looks}"
+            ),
+            _ => assert!(!observed.completed() && looks == 2),
+        }
+        assert_eq!(fw.lock().unwrap().get(REG_IQKSTAT, 1), 0);
+        assert!(!control.quarantined() && !rings.quarantined());
+        assert!(
+            control.poll_iqk(&mut rings, &mut wait, false).is_err(),
+            "the wait is over"
+        );
+        assert_eq!(control.command((0, 0)), Ok(()));
+    }
+}
+#[test]
 fn every_iqk_control_failure_late_reset_and_regressed_clock_keep_both_owners() {
     use super::super::firmware_control::{Control, tests::bus};
     // One successful run determines the I/O/clock transaction count;

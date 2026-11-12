@@ -193,6 +193,11 @@ pub trait Device {
     fn lost(&self) -> bool {
         false
     }
+    /// Nothing holds frames back: a calibration [`Self::prepare_transmit`]
+    /// began has ended. Each [`Self::receive`] takes a step of it.
+    fn ready(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug)]
@@ -580,6 +585,9 @@ pub struct Rtl8822c<D: Device> {
     reported: Vec<&'static str>,
     /// Frames and reports refused and dropped, as mac80211 counts `rx_dropped`.
     dropped: u64,
+    /// A join whose authentication waits for the calibration
+    /// `rtw_ops_mgd_prepare_tx` began, as mac80211 waits for that call.
+    pending_join: Option<(usize, Join)>,
 }
 
 impl<D: Device> Rtl8822c<D> {
@@ -628,6 +636,7 @@ impl<D: Device> Rtl8822c<D> {
             left: false,
             reported: Vec::new(),
             dropped: 0,
+            pending_join: None,
         })
     }
 
@@ -702,6 +711,24 @@ impl<D: Device> Rtl8822c<D> {
         if self.change_agreements().is_err() {
             self.unsupported("a transmit agreement that would not end");
         }
+    }
+
+    /// mac80211's authentication of a join, on a radio ready to send.
+    fn begin_join(&mut self, handle: usize, join: Join) -> Result<(), Error> {
+        let observed = self.observed(handle)?;
+        let now = self.clock.now_us();
+        self.management_cipher = join.request.pmf().map(|pmf| pmf.management());
+        let mut policy = Admitted(&self.channels);
+        let action = if join.request.pmf().is_some() {
+            self.station
+                .begin_modern_pmf(join, observed, now, &mut policy)
+        } else {
+            self.station
+                .begin_modern(join, observed.bss().clone(), now, &mut policy)
+        }
+        .map_err(Error::Station)?;
+        self.act(action);
+        Ok(())
     }
 
     /// `rtw_sta_remove` and `rtw_ops_bss_info_changed` of the disassociation.
@@ -1777,6 +1804,10 @@ impl<D: Device> Rtl8822c<D> {
     fn operate(&mut self) -> Result<(), Error> {
         let now = self.clock.now_us();
         self.take_incoming(now)?;
+        if self.pending_join.is_some() && self.device.ready() {
+            let (handle, join) = self.pending_join.take().ok_or(Error::Pending)?;
+            self.begin_join(handle, join)?;
+        }
         Self::hardware(self.device.coexist(now))?;
         self.announce_streams()?;
         self.watchdog(now)?;
@@ -1935,7 +1966,10 @@ impl<D: Device> Radio for Rtl8822c<D> {
             Stage::Scanned
         } else if self.admitted.is_some() {
             Stage::Admitted
-        } else if self.hop.is_none() && self.station.phase() == Peering::Idle {
+        } else if self.hop.is_none()
+            && self.pending_join.is_none()
+            && self.station.phase() == Peering::Idle
+        {
             Stage::Idle
         } else {
             Stage::Busy
@@ -1995,6 +2029,7 @@ impl<D: Device> Radio for Rtl8822c<D> {
 
     fn begin_scan(&mut self, request: scan::Request, budget_us: u64) -> Result<(), Error> {
         let now = self.clock.now_us();
+        self.pending_join = None;
         self.power_save(false)?;
         self.observed
             .retain(|heard| now.saturating_sub(heard.at) < BSS_EXPIRY_US);
@@ -2048,22 +2083,14 @@ impl<D: Device> Radio for Rtl8822c<D> {
     }
 
     fn join(&mut self, handle: usize, join: Join, _: ()) -> Result<(), Error> {
-        let observed = self.observed(handle)?;
-        let bss = observed.bss().clone();
+        let bss = self.observed(handle)?.bss().clone();
         self.approach(&bss)?;
-        let now = self.clock.now_us();
-        self.management_cipher = join.request.pmf().map(|pmf| pmf.management());
-        let mut policy = Admitted(&self.channels);
-        let action = if join.request.pmf().is_some() {
-            self.station
-                .begin_modern_pmf(join, observed, now, &mut policy)
+        if self.device.ready() {
+            self.begin_join(handle, join)
         } else {
-            self.station
-                .begin_modern(join, observed.bss().clone(), now, &mut policy)
+            self.pending_join = Some((handle, join));
+            Ok(())
         }
-        .map_err(Error::Station)?;
-        self.act(action);
-        Ok(())
     }
 
     fn begin_external_authentication(
@@ -2322,6 +2349,7 @@ impl<D: Device> Radio for Rtl8822c<D> {
     }
 
     fn deauthenticate(&mut self, reason: u16) -> Result<(), Error> {
+        self.pending_join = None;
         if self.left || self.station.phase() == Peering::Idle {
             return Ok(());
         }
