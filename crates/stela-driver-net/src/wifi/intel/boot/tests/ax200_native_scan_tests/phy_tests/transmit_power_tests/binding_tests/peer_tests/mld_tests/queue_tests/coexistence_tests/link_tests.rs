@@ -1783,6 +1783,34 @@ fn first_body() -> Vec<u8> {
     [&[0xaa, 0xaa, 3, 0, 0, 0, 8, 0][..], &[0x11; 40]].concat()
 }
 
+/// `ieee80211_rx_handlers`: a frame the receive path cannot take is dropped
+/// and counted, and the good frame beside it still arrives; the link never
+/// reports a refused frame as a fault.
+#[test]
+fn a_refused_frame_is_dropped_and_counted_and_the_next_one_arrives() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    let native = Native::default();
+    let (mut wifi, mut device) = connect(&native, false);
+    let before = wifi.radio().dropped_frames();
+    // Too short to hold even an 802.11 header.
+    device.inject(
+        wifi.radio().rom().unwrap(),
+        &mpdu(vec![0x08, 0x02, 0, 0], 3),
+    );
+    device.inject(
+        wifi.radio().rom().unwrap(),
+        &data(LOCAL, false, [8, 0], &[0x45; 46], Some((0, 1))),
+    );
+    settle(&mut wifi, &mut device);
+    let ethernet = wifi.receive().unwrap().expect("the good frame");
+    assert_eq!(ethernet[12..14], [8, 0]);
+    assert_eq!(wifi.radio().dropped_frames(), before + 1);
+    assert_eq!(wifi.receive(), Ok(None));
+    assert!(wifi.carrier());
+}
+
 #[test]
 fn fragments_under_consecutive_packet_numbers_become_one_msdu() {
     if crate::test_process::isolate_model() {

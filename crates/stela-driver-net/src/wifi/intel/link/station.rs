@@ -320,6 +320,11 @@ pub(super) struct Client {
     /// The way down finished: the keeper retires the peer.
     left: bool,
     reported: Vec<&'static str>,
+    /// Frames from the air dropped as mac80211 drops them, counted as its
+    /// `rx_dropped` is, never reported one by one.
+    dropped_frames: u64,
+    /// Firmware notifications iwlwifi logs and goes past.
+    ignored_notifications: u64,
     /// When the rules' last change comes to bear on the links.
     grace_ends: Option<u64>,
     bluetooth: coexistence::Bluetooth,
@@ -340,6 +345,8 @@ impl Client {
             draining: None,
             outbox: VecDeque::new(),
             events: VecDeque::new(),
+            dropped_frames: 0,
+            ignored_notifications: 0,
             received: VecDeque::new(),
             reception: Reception::new(),
             fragments: Fragments::default(),
@@ -573,6 +580,16 @@ fn management(local: Mac, ap: Mac, subtype: u16, protected: bool, body: &[u8]) -
 }
 
 impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
+    /// Frames from the air this boot dropped, as mac80211's `rx_dropped`.
+    pub fn dropped_frames(&self) -> u64 {
+        self.client.dropped_frames
+    }
+
+    /// Firmware notifications this boot went past, as iwlwifi does.
+    pub fn ignored_notifications(&self) -> u64 {
+        self.client.ignored_notifications
+    }
+
     /// Raise the chain for `bss`.
     #[expect(
         clippy::result_large_err,
@@ -999,18 +1016,15 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
         loop {
             match queue.poll_receive().map_err(Error::Queue)? {
                 MpduProgress::Pending | MpduProgress::Backpressure { .. } => return Ok(()),
-                MpduProgress::Rejected(_) => {}
+                MpduProgress::Rejected(_) => self.client.dropped_frames += 1,
                 MpduProgress::Observed(observed) => match observed.normalize() {
                     // mac80211 drops a frame the station cannot use; the
                     // exchange it answers retries or times out.
                     Ok(normalized) => match self.frame(normalized, &observed.metadata(), now) {
-                        Err(Error::Station(_)) => {
-                            self.client
-                                .unsupported("a management frame the station refuses");
-                        }
+                        Err(Error::Station(_)) => self.client.dropped_frames += 1,
                         result => result?,
                     },
-                    Err(_) => self.client.unsupported("an MPDU the receive path refuses"),
+                    Err(_) => self.client.dropped_frames += 1,
                 },
             }
         }
@@ -1290,8 +1304,7 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
                         notification.sequence,
                         raw,
                     ) else {
-                        self.client
-                            .unsupported("a TX response the driver cannot parse");
+                        self.client.ignored_notifications += 1;
                         continue;
                     };
                     let (next, queue_id, status) = (
@@ -1300,8 +1313,7 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
                         response.reported_outcome(),
                     );
                     if queue.reclaim(queue_id, next).is_err() {
-                        self.client
-                            .unsupported("a TX response past what is in flight");
+                        self.client.ignored_notifications += 1;
                     }
                     if response.ra_tid & 0xf < 8 {
                         self.client.count_mpdus(response.ra_tid >> 4, true, 1, now);
@@ -1336,13 +1348,12 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
                 }
                 BLOCK_ACK_NOTIFICATION => {
                     let Ok(queues) = block_ack_queues(raw) else {
-                        self.client.unsupported("a short Block Ack notification");
+                        self.client.ignored_notifications += 1;
                         continue;
                     };
                     for (queue_id, next) in queues {
                         if queue.reclaim(queue_id, next).is_err() {
-                            self.client
-                                .unsupported("a Block Ack past what is in flight");
+                            self.client.ignored_notifications += 1;
                         }
                     }
                     if let (Some(&station), Some(&[low, high])) = (
