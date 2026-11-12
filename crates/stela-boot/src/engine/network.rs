@@ -85,6 +85,17 @@ impl RootLink {
             root,
         }
     }
+
+    /// Show each one-time diagnostic the adapter gave
+    /// ([`Link::take_diagnostic`]) once, on the network step and in the
+    /// log, under its location.
+    fn report(&mut self) {
+        while let Some(line) = self.device.take_diagnostic() {
+            let location = self.device.location();
+            output::arguments(format_args!("NETWORK adapter {location}: {line}\n"));
+            crate::status::info(&format!("adapter {location}: {line}"));
+        }
+    }
 }
 
 impl Drop for RootLink {
@@ -103,22 +114,30 @@ impl Link for RootLink {
         // SAFETY: the loader root `storage::open` captured maps this
         // device.
         let _root = unsafe { RestoreRoot::enter(self.root) };
-        self.device.carrier()
+        let carrier = self.device.carrier();
+        self.report();
+        carrier
     }
     fn transmit(&mut self, frame: &[u8]) -> Result<(), LinkError> {
         // SAFETY: as in `carrier`.
         let _root = unsafe { RestoreRoot::enter(self.root) };
-        self.device.transmit(frame)
+        let sent = self.device.transmit(frame);
+        self.report();
+        sent
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
         // SAFETY: as in `carrier`.
         let _root = unsafe { RestoreRoot::enter(self.root) };
-        self.device.receive()
+        let received = self.device.receive();
+        self.report();
+        received
     }
     fn receive_reusing(&mut self, frame: &mut Vec<u8>) -> Result<bool, LinkError> {
         // SAFETY: as in `carrier`.
         let _root = unsafe { RestoreRoot::enter(self.root) };
-        self.device.receive_reusing(frame)
+        let received = self.device.receive_reusing(frame);
+        self.report();
+        received
     }
     fn signals(&self) -> bool {
         self.device.signals()
