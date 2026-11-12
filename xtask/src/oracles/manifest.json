@@ -75,6 +75,17 @@
     ]
   },
   {
+    "package": "stela-cli",
+    "test": "every_bundled_file_downloads_with_its_pinned_length_and_digest",
+    "source": "crates/stela-cli/src/setup/firmware.rs",
+    "kind": "oracle",
+    "inputs": [],
+    "reason": "downloads every bundled firmware file and notice through setup's sources; set STELA_FIRMWARE_TEST_OUTPUT to a fresh evidence directory",
+    "outputs": [
+      "STELA_FIRMWARE_TEST_OUTPUT"
+    ]
+  },
+  {
     "package": "stela-compiler",
     "test": "region_census_of_real_code",
     "source": "crates/stela-compiler/src/x86_64/block/tests.rs",

@@ -1673,4 +1673,110 @@ mod tests {
             manifest_bytes
         );
     }
+
+    /// Fetch each distinct file and notice of `files` once through
+    /// `download` into `cache`, as [`prefetch`] does, but go on past a
+    /// failure. Returns one line per file and the lines of those that
+    /// failed.
+    fn fetch_every(
+        files: &[(&Artifact, &Artifact)],
+        cache: &Path,
+        download: &mut dyn FnMut(&Artifact) -> Result<Vec<u8>>,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut seen: Vec<&str> = Vec::new();
+        let (mut lines, mut failed) = (Vec::new(), Vec::new());
+        for (object, notice) in files {
+            for artifact in [*object, *notice] {
+                if seen.contains(&artifact.sha256) {
+                    continue;
+                }
+                seen.push(artifact.sha256);
+                let file = format!(
+                    "{} at {}, {} bytes, SHA-256 {}",
+                    artifact.member, artifact.revision, artifact.length, artifact.sha256
+                );
+                match download(artifact).and_then(|bytes| store(cache, artifact, &bytes)) {
+                    Ok(_) => lines.push(format!("ok {file}")),
+                    Err(error) => {
+                        let line = format!("failed {file}: {error:#}");
+                        lines.push(line.clone());
+                        failed.push(line);
+                    }
+                }
+            }
+        }
+        (lines, failed)
+    }
+
+    #[test]
+    fn fetching_every_file_names_each_one_whose_bytes_differ_and_goes_on() {
+        let catalog = synthetic();
+        let [(a, a_bytes), (b, _), (notice, notice_bytes)] = &catalog[..] else {
+            unreachable!()
+        };
+        let files: Vec<(&Artifact, &Artifact)> = vec![(a, notice), (b, notice)];
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let mut download = |artifact: &Artifact| -> Result<Vec<u8>> {
+            Ok(match artifact.member {
+                "vendor/a.bin" => a_bytes.clone(),
+                "LICENSES/LICENCE.vendor" => notice_bytes.clone(),
+                // A source that sends other bytes for the second file.
+                _ => b"other bytes".to_vec(),
+            })
+        };
+        let (lines, failed) = fetch_every(&files, &cache, &mut download);
+        assert_eq!(lines.len(), 3, "the shared notice is fetched once");
+        assert_eq!(failed.len(), 1, "{failed:?}");
+        assert!(
+            failed[0].starts_with("failed vendor/b.bin at synthetic, 11 bytes"),
+            "{failed:?}"
+        );
+        assert!(cache.join(a.sha256).is_file() && cache.join(notice.sha256).is_file());
+        assert!(!cache.join(b.sha256).exists());
+        // The complete bundle shares no digest between a file and a notice,
+        // so the network oracle fetches each of them once.
+        let mut digests: Vec<&str> = bundle::complete()
+            .iter()
+            .flat_map(|(object, notice)| [object.sha256, notice.sha256])
+            .collect();
+        digests.sort_unstable();
+        digests.dedup();
+        assert_eq!(digests.len(), bundle::size().0 + bundle::notices().len());
+    }
+
+    /// Every file and notice the complete bundle puts on a stick, fetched
+    /// through setup's own download path (git.kernel.org first, then
+    /// GitLab) into a fresh evidence directory. Fails naming each file
+    /// whose length or SHA-256 differs from its pin, or that no source
+    /// sent.
+    #[test]
+    #[ignore = "oracle: STELA_FIRMWARE_TEST_OUTPUT"]
+    fn every_bundled_file_downloads_with_its_pinned_length_and_digest() {
+        let output = std::path::PathBuf::from(
+            std::env::var_os("STELA_FIRMWARE_TEST_OUTPUT")
+                .expect("explicit fresh evidence directory"),
+        );
+        assert!(!output.exists(), "never overwrite historical evidence");
+        fs::create_dir_all(&output).unwrap();
+        let files = bundle::complete();
+        assert_eq!(files.len(), bundle::size().0);
+        let client = super::client().unwrap();
+        let (lines, failed) = fetch_every(&files, &output.join("cache"), &mut |artifact| {
+            download(&client, artifact)
+        });
+        fs::write(output.join("downloads.txt"), lines.join("\n") + "\n").unwrap();
+        assert_eq!(
+            lines.len(),
+            files.len() + bundle::notices().len(),
+            "every file and notice once"
+        );
+        assert!(
+            failed.is_empty(),
+            "{} of {} bundled files do not match their pins:\n{}",
+            failed.len(),
+            lines.len(),
+            failed.join("\n")
+        );
+    }
 }
