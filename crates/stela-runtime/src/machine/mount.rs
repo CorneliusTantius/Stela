@@ -58,7 +58,7 @@ pub fn pmgr_qualifications(refusals: &[PmgrBankRefusal], log: &mut dyn FnMut(fmt
             continue;
         }
         log(format_args!(
-            "UNMODELED PMGR {:?}: {}; no register/lifecycle model\n",
+            "UNSUPPORTED PMGR {:?}: {}; no register/lifecycle model\n",
             refusal.bank, refusal.reason,
         ));
     }
@@ -72,7 +72,7 @@ pub fn clpc_absence(hidden: &[String], log: &mut dyn FnMut(fmt::Arguments<'_>)) 
             continue;
         }
         log(format_args!(
-            "UNMODELED CLPC {path}: controller hidden; closed-loop CPU power control unavailable\n"
+            "UNSUPPORTED CLPC {path}: controller hidden; closed-loop CPU power control unavailable\n"
         ));
     }
 }
@@ -938,7 +938,7 @@ mod tests {
         let mut messages = Vec::new();
         clpc_absence(&paths, &mut |message| messages.push(format!("{message}")));
         assert_eq!(messages.len(), 2);
-        assert!(messages[0].contains("UNMODELED CLPC /arm-io/pmgr/clpc: controller hidden"));
+        assert!(messages[0].contains("UNSUPPORTED CLPC /arm-io/pmgr/clpc: controller hidden"));
     }
 
     #[test]
@@ -956,7 +956,7 @@ mod tests {
             messages.push(format!("{message}"))
         });
         assert_eq!(messages.len(), 2);
-        assert!(messages[0].contains("UNMODELED PMGR CpuClusters"));
+        assert!(messages[0].contains("UNSUPPORTED PMGR CpuClusters"));
         assert!(
             messages
                 .iter()

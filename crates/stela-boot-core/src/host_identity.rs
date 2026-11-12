@@ -1,11 +1,17 @@
-//! The boot log's identity line: which `stela.efi` ran on which PC, so a
-//! log a user sends can be matched to a build and to hardware.
+//! The boot's header block: which `stela.efi` ran on which PC and when, so
+//! a log a user sends can be matched to a build and to hardware.
 use alloc::{format, string::String};
 
 /// What the line names.
 pub struct Identity<'a> {
     /// `stela.efi`'s version (its crate version).
     pub version: &'a str,
+    /// The source revision it was built from, or `unknown`.
+    pub build: &'a str,
+    /// The firmware clock's date and time at the start, when it has one.
+    pub time: Option<&'a str>,
+    /// A hypervisor runs the PC (CPUID).
+    pub hypervisor: bool,
     /// The CPU's brand string ([`brand`]).
     pub cpu: &'a str,
     /// CPUID leaf 1's EAX: family, model and stepping.
@@ -90,19 +96,40 @@ pub fn smbios_string(table: &[u8], kind: u8, offset: usize) -> Option<&[u8]> {
     None
 }
 
-/// `HOST version=… cpu="…" family=… model=… stepping=… ram=… firmware="…"`.
-pub fn line(identity: &Identity<'_>) -> String {
-    let (family, model, _) = signature_parts(identity.signature);
-    let signature = identity.signature;
+/// The rule above and below the header block.
+pub const RULE: &str =
+    "================================================================================";
+
+/// The header block, each line labelled in an 8-character column:
+///
+/// ```text
+/// ================================================================================
+/// STELA   0.3.0, build db45c012c4f1, started 2026-11-11 18:44:05 (firmware clock)
+/// PC      Intel(R) Core(TM) i7-12700K, family 0x6 model 0x97 stepping 2
+///         14.9 GiB RAM, firmware "EDK II" revision 0x10000
+/// --------------------------------------------------------------------------------
+/// ```
+pub fn header(identity: &Identity<'_>) -> String {
+    let (family, model, stepping) = signature_parts(identity.signature);
+    let started = identity
+        .time
+        .map(|time| format!(", started {time} (firmware clock)"))
+        .unwrap_or_default();
+    let hypervisor = if identity.hypervisor {
+        ", under a hypervisor"
+    } else {
+        ""
+    };
     format!(
-        "HOST version={} cpu=\"{}\" family={family:#x} model={model:#x} stepping={} ram={:.1}GB \
-         firmware=\"{}\" revision={:#x}\n",
+        "{RULE}\nSTELA   {}, build {}{started}\nPC      {}, family {family:#x} model {model:#x} \
+         stepping {stepping}\n        {} RAM, firmware \"{}\" revision {:#x}{hypervisor}\n{}\n",
         identity.version,
+        identity.build,
         identity.cpu,
-        signature & 0xf,
-        identity.ram_bytes as f64 / 1e9,
+        crate::log_style::size(identity.ram_bytes),
         identity.firmware_vendor,
-        identity.firmware_revision
+        identity.firmware_revision,
+        RULE.replace('=', "-"),
     )
 }
 
@@ -127,24 +154,39 @@ mod tests {
             "AuthenticAMD"
         );
         // Alder Lake: family 6, model 0x97, stepping 2.
-        let line = line(&Identity {
+        let header = header(&Identity {
             version: "0.1.0",
+            build: "db45c012c4f1",
+            time: Some("2026-11-11 18:44:05"),
+            hypervisor: false,
             cpu: &cpu,
             signature: 0x0009_0672,
-            ram_bytes: 16_000_000_000,
+            ram_bytes: 16 << 30,
             firmware_vendor: "EDK II",
             firmware_revision: 0x10000,
         });
         assert_eq!(
-            line,
-            "HOST version=0.1.0 cpu=\"Intel(R) Core(TM) i7-12700K\" family=0x6 model=0x97 \
-             stepping=2 ram=16.0GB firmware=\"EDK II\" revision=0x10000\n"
+            header,
+            format!(
+                "{RULE}\nSTELA   0.1.0, build db45c012c4f1, started 2026-11-11 18:44:05 \
+                 (firmware clock)\nPC      Intel(R) Core(TM) i7-12700K, family 0x6 model 0x97 \
+                 stepping 2\n        16.0 GiB RAM, firmware \"EDK II\" revision 0x10000\n{}\n",
+                RULE.replace('=', "-")
+            )
         );
+        // Every line keeps to 80 columns but the CPU's, and is laid out
+        // already: the formatter leaves it.
+        for line in header.lines() {
+            assert_eq!(crate::log_style::lay_out(line), line);
+        }
         // AMD Zen 4: family 0x19 from the extended family.
-        let zen = super::line(&Identity {
+        let zen = super::header(&Identity {
             signature: 0x00a6_0f12,
             ..Identity {
                 version: "0.1.0",
+                build: "unknown",
+                time: None,
+                hypervisor: true,
                 cpu: "AMD Ryzen 7 7700X",
                 signature: 0,
                 ram_bytes: 0,
@@ -152,7 +194,9 @@ mod tests {
                 firmware_revision: 0,
             }
         });
-        assert!(zen.contains("family=0x19 model=0x61 stepping=2"), "{zen}");
+        assert!(zen.contains("family 0x19 model 0x61 stepping 2"), "{zen}");
+        assert!(zen.contains("STELA   0.1.0, build unknown\n"), "{zen}");
+        assert!(zen.contains("under a hypervisor"), "{zen}");
     }
 
     #[test]

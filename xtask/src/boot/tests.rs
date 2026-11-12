@@ -178,9 +178,10 @@ fn cpu_selection_preserves_model_and_baseline_overrides() {
 fn run_report_keeps_degraded_requirements_and_the_first_guest_panic() {
     let serial = concat!(
         "GUEST| panic handlers ready\r\n",
-        "UNMODELED pc=0x1000 device write at PA 0x2000: missing lifecycle\r\n",
+        "UNSUPPORTED SUMMARY answered=1 distinct=1\r\n",
+        "UNSUPPORTED pc=0x1000 device write at PA 0x2000: missing lifecycle\r\n",
         "GUEST| panic(cpu 0 caller 0x3000): first failure\r\n",
-        "UNMODELED pc=0x4000 debug sample: PE is off\r\n",
+        "UNSUPPORTED pc=0x4000 debug sample: PE is off\r\n",
         "GUEST| panic: nested failure\r\n",
         "STOP UNSUPPORTED a later terminal requirement\r\n",
         "STOP reset: amcc: DRAM access disabled\r\n",

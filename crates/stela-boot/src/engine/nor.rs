@@ -362,14 +362,14 @@ impl BoardFlash {
 pub(crate) fn open_log(disk: &Shared, block: u64, available: u64) -> bool {
     if available < boot_log::PARTITION_BYTES {
         output::arguments(format_args!(
-            "BOOT LOG off: the machine-state partition holds {available:#x} bytes; the log needs {:#x}\n",
+            "LOG machine state off: the machine-state partition holds {available:#x} bytes; the log needs {:#x}\n",
             boot_log::PARTITION_BYTES
         ));
         return false;
     }
     if !boot_log::OFFSET.is_multiple_of(block) || !boot_log::LOG_BYTES.is_multiple_of(block) {
         output::arguments(format_args!(
-            "BOOT LOG off: {block}-byte blocks do not divide the log region\n"
+            "LOG machine state off: {block}-byte blocks do not divide the log region\n"
         ));
         return false;
     }
@@ -380,19 +380,19 @@ pub(crate) fn open_log(disk: &Shared, block: u64, available: u64) -> bool {
     let writer = match boot_log::Writer::open(&mut *device) {
         Ok(writer) => writer,
         Err(error @ (BlockError::Unsupported(_) | BlockError::ReadOnly)) => {
-            output::arguments(format_args!("BOOT LOG off: {error}\n"));
+            output::arguments(format_args!("LOG machine state off: {error}\n"));
             return false;
         }
         Err(error) => {
-            output::arguments(format_args!("BOOT LOG refusal: {error}\n"));
+            output::arguments(format_args!("LOG machine state refused: {error}\n"));
             output::fatal("the boot log could not be opened")
         }
     };
     if let Some(reason) = writer.fresh() {
-        output::arguments(format_args!("BOOT LOG fresh: {reason}\n"));
+        output::arguments(format_args!("LOG machine state fresh: {reason}\n"));
     }
     output::arguments(format_args!(
-        "BOOT LOG boot={} offset={:#x} bytes={:#x} head={:#x}\n",
+        "LOG machine state boot={} offset={:#x} bytes={:#x} head={:#x}\n",
         writer.boots(),
         boot_log::OFFSET,
         boot_log::LOG_BYTES,
@@ -401,13 +401,13 @@ pub(crate) fn open_log(disk: &Shared, block: u64, available: u64) -> bool {
     match output::add_log(writer, device, output::Log::Machine) {
         Ok(()) => true,
         Err(error @ output::Unopened::Store(_)) => {
-            output::arguments(format_args!("BOOT LOG refusal: {error}\n"));
+            output::arguments(format_args!("LOG machine state refused: {error}\n"));
             output::fatal("the boot log could not be stored")
         }
         // The disk took the writes and keeps none: NVRAM will not persist
         // either. The boot goes on, so the screen shows how far it gets.
         Err(error) => {
-            output::arguments(format_args!("BOOT LOG unkept: {error}\n"));
+            output::arguments(format_args!("LOG machine state unkept: {error}\n"));
             crate::status::warn(&format!("the disk does not keep its writes: {error}"));
             false
         }

@@ -202,14 +202,19 @@ pub fn choose() -> Option<String> {
         notice: None,
     };
     for disk in &picker.disks {
+        let refusal = disk
+            .refusal
+            .map(|why| format!(", refused: {why}"))
+            .unwrap_or_default();
         output::arguments(format_args!(
-            "INSTALLER disk {} {} serial={:?} bytes={} table={} refusal={:?}\n",
+            "INSTALLER disk {} \"{}\" serial={} size={} partitions={}{refusal}\n",
             disk.bus,
-            disk.model,
-            disk.serial,
-            disk.bytes(),
+            disk.model.trim(),
+            disk.serial
+                .as_deref()
+                .map_or_else(|| String::from("none"), output::private),
+            stela_boot_core::log_style::size_value(disk.bytes()),
             disk.table.as_ref().map_or(0, |t| t.partitions.len()),
-            disk.refusal
         ));
     }
     loop {
@@ -486,8 +491,9 @@ impl Picker {
         let target = format!("{serial}:{guid}");
         target.parse::<Target>()?;
         output::arguments(format_args!(
-            "INSTALLER writing {target} first_lba={first} blocks={blocks} deleting={} \
+            "INSTALLER writing {} first_lba={first} blocks={blocks} deleting={} \
              table={changed}\n",
+            output::private(&target),
             deleting.len()
         ));
         if changed {

@@ -887,6 +887,8 @@ fn load(
     // Keep this post-EBS boundary when the relocated engine replays status.
     let mut history = [0; crate::status::HISTORY_BYTES];
     let history_bytes = crate::status::history(&mut history);
+    let mut log_tail = [0; crate::output::LOG_TAIL_BYTES];
+    let log_tail_bytes = output::tail_after_boot_services(&mut log_tail);
     let mut host = [0; crate::host_inventory::HANDOFF_BYTES];
     let host_bytes = crate::host_inventory::save(&mut host);
     let handoff_phase::GuestMemory {
@@ -913,6 +915,8 @@ fn load(
             screen,
             history,
             history_bytes,
+            log_tail,
+            log_tail_bytes,
             host,
             host_bytes,
             log_partition: log.map(|guid| guid.0),

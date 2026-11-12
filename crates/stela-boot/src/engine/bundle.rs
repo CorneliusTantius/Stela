@@ -252,7 +252,13 @@ pub(crate) fn read(directory: &str, verify_topology: bool) -> Result<Retained> {
             })
             .transpose()?;
         let bytes: u64 = files.iter().map(|(_, pages)| pages.length as u64).sum();
-        crate::status::done(&format!("{} MB", bytes >> 20));
+        // The files are named one by one only with `--profile` (`READ`) or
+        // when one fails; the step's result has their count and size.
+        crate::status::done(&format!(
+            "{} files, {}",
+            files.len(),
+            stela_boot_core::log_style::size(bytes)
+        ));
         // Reserve the handoff list before relinquishing any page owner.
         let mut retained = Vec::with_capacity(files.len());
         for (name, pages) in files {

@@ -40,6 +40,12 @@ pub struct Handoff {
     /// with (`status::replay`).
     pub history: [u8; crate::status::HISTORY_BYTES],
     pub history_bytes: usize,
+    /// The loader's output after the USB's log through the firmware closed
+    /// (`output::leave_boot_services`), which the engine's record starts
+    /// with, so the USB log holds it once the engine writes it again
+    /// (`output::adopt`).
+    pub log_tail: [u8; crate::output::LOG_TAIL_BYTES],
+    pub log_tail_bytes: usize,
     /// The loader's facts about the PC, as a host record, which the engine
     /// takes up (`host_inventory::restore`).
     pub host: [u8; crate::host_inventory::HANDOFF_BYTES],

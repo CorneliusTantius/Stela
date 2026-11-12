@@ -67,7 +67,7 @@ fn finish<T>(opened: Result<T>) -> Option<T> {
             Some(value)
         }
         Err(why) => {
-            output::arguments(format_args!("BOOT LOG FILE off: {why}\n"));
+            output::arguments(format_args!("LOG off: {why}\n"));
             status::warn(&format!("not kept: {why}"));
             None
         }
@@ -76,10 +76,10 @@ fn finish<T>(opened: Result<T>) -> Option<T> {
 
 fn report(writer: &Writer, through: &str) {
     if let Some(reason) = writer.fresh() {
-        output::arguments(format_args!("BOOT LOG FILE fresh: {reason}\n"));
+        output::arguments(format_args!("LOG fresh: {reason}\n"));
     }
     output::arguments(format_args!(
-        "BOOT LOG FILE {BOOT_LOG_FILE} through the {through} boot={} head={:#x}\n",
+        "LOG {BOOT_LOG_FILE} through the {through}, boot {}, head={:#x}\n",
         writer.boots(),
         writer.head()
     ));

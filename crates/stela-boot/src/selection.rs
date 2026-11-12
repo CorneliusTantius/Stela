@@ -591,7 +591,10 @@ fn route_checked(options: Vec<u8>, consume: bool) -> Result<(Vec<u8>, bool), Ref
             let (disk, part) = match outside {
                 Some(target) => {
                     let value = format!("{}:{}", target.serial, target.partition);
-                    output::arguments(format_args!("BOOT volume on external disk {value}\n"));
+                    output::arguments(format_args!(
+                        "BOOT volume on external disk {}\n",
+                        output::private(&value)
+                    ));
                     retargeted = Some(replace(text, boot_selection::PREBOOT_OPTION, &value));
                     (target, Part::Whole)
                 }
@@ -657,7 +660,7 @@ fn route_checked(options: Vec<u8>, consume: bool) -> Result<(Vec<u8>, bool), Ref
     // Only an installed-system boot has a choice to report, and only the
     // boot that uses it: a `peek` before the menu would repeat the line.
     if consume && selection.is_some() {
-        output::arguments(format_args!("BOOT {log}\n"));
+        output::redacted(format_args!("BOOT {log}\n"));
     }
     Ok((routed.into_bytes(), installed_system))
 }

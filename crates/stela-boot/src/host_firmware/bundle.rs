@@ -59,7 +59,7 @@ fn report(found: Result<Bundled, String>) -> Option<Bundled> {
         Ok(bundled) => Some(bundled),
         Err(why) => {
             output::arguments(format_args!(
-                "HOST FIRMWARE BUNDLE unreadable, the boot goes on without it: {why}\n"
+                "FIRMWARE bundle unreadable, the boot goes on without it: {why}\n"
             ));
             None
         }
@@ -83,7 +83,7 @@ fn functions() -> Vec<Pci> {
             .collect(),
         Err(error) => {
             output::arguments(format_args!(
-                "HOST FIRMWARE BUNDLE no PCI census ({error:?}): USB Bluetooth files only\n"
+                "FIRMWARE no PCI census ({error:?}): USB Bluetooth files only\n"
             ));
             Vec::new()
         }
@@ -116,8 +116,8 @@ fn load_from(
     let selection = bundle::select(&functions);
     for why in &selection.unknown {
         output::arguments(format_args!(
-            "HOST FIRMWARE BUNDLE NO RECIPE for the NVIDIA display device at {why}: its \
-             firmware is not in Stela's catalog\n"
+            "FIRMWARE no recipe for the NVIDIA display device at {why}: its firmware is not \
+             in Stela's catalog\n"
         ));
     }
     let mut bundled = Bundled {
@@ -135,7 +135,7 @@ fn load_from(
         else {
             lacking += 1;
             output::arguments(format_args!(
-                "HOST FIRMWARE BUNDLE LACKS {} for {why}: `stela setup repair` adds it\n",
+                "FIRMWARE lacks {} for {why}: `stela setup repair --usb USB` adds it\n",
                 artifact.member
             ));
             continue;
@@ -150,8 +150,9 @@ fn load_from(
         match read {
             Ok(region) => {
                 output::arguments(format_args!(
-                    "HOST FIRMWARE BUNDLE USE {} bytes={} for {why}\n",
-                    object.member, object.length
+                    "FIRMWARE use {} size={} for {why}\n",
+                    object.member,
+                    stela_boot_core::log_style::size_value(object.length as u64)
                 ));
                 bundled.selected.push(index);
                 bundled.regions.push(region);
@@ -159,7 +160,7 @@ fn load_from(
             Err(error) => {
                 lacking += 1;
                 output::arguments(format_args!(
-                    "HOST FIRMWARE BUNDLE LACKS {} for {why}: {error}\n",
+                    "FIRMWARE lacks {} for {why}: {error}\n",
                     object.member
                 ));
             }
@@ -167,12 +168,12 @@ fn load_from(
     }
     let read_bytes: usize = bundled.objects().iter().map(|object| object.length).sum();
     output::arguments(format_args!(
-        "HOST FIRMWARE BUNDLE {place} files={} pci={} used={} lacking={lacking} bytes={read_bytes} \
-         read_ms={}\n",
+        "FIRMWARE bundle {place} files={} pci={} used={} lacking={lacking} size={} time={}\n",
         bundled.bundle.objects.len(),
         functions.len(),
         bundled.selected.len(),
-        output::millis_since(started)
+        stela_boot_core::log_style::size_value(read_bytes as u64),
+        stela_boot_core::log_style::duration_value(output::millis_since(started))
     ));
     Ok(bundled)
 }

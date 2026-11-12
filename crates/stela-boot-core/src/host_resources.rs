@@ -295,6 +295,12 @@ impl Resources {
             })
             .collect();
         let smbios_record = phase.map(|phase| smbios::record(phase, &self.smbios, smbios_identity));
+        if let Some(phase) = phase {
+            log(format_args!(
+                "{}",
+                smbios::summary(phase, &self.smbios, smbios_identity)
+            ));
+        }
         if !self.present && additional.is_empty() {
             if let Some(record) = smbios_record {
                 log(format_args!("HOST SMBIOS RECORD {record}\n"));

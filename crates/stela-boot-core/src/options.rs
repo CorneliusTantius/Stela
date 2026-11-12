@@ -158,6 +158,21 @@ pub fn number(value: &str) -> Result<u64, Error> {
     .map_err(|_| Error::Number)
 }
 
+/// The log level an option line asks for (`--profile`), read from its
+/// words alone: the boot logs at it from its first lines, before the line
+/// is routed and parsed whole ([`System::log_level`]).
+pub fn log_level_of(line: &str) -> crate::log_level::Level {
+    use crate::log_level::Level;
+    if line
+        .split_ascii_whitespace()
+        .any(|word| word == "--profile")
+    {
+        Level::Profile
+    } else {
+        Level::Default
+    }
+}
+
 /// The legacy HTTP-only host/path adapter. URLs that need a transport scheme
 /// must use the original full URL; HTTPS cannot lose its security requirement.
 pub fn split_url(url: &str) -> Result<(&str, &str)> {
@@ -289,7 +304,7 @@ pub struct System {
     /// every PE on the BSP instead, as native rounds and checks do.
     pub parallel: bool,
     /// Time the engine's phases and report them with each heartbeat
-    /// (`--profile`).
+    /// (`--profile`), which also logs at [`crate::log_level::Level::Profile`].
     pub profile: bool,
     /// The machine's ECID for a bundle built from the Preboot volume
     /// (`--ecid HEX`, nonzero).
@@ -545,6 +560,11 @@ fn flag(set: &mut bool, duplicate: Error) -> Result<(), Error> {
 }
 
 impl System {
+    /// How much this boot logs: `--profile`, else the default level.
+    pub fn log_level(&self) -> crate::log_level::Level {
+        log_level_of(if self.profile { "--profile" } else { "" })
+    }
+
     /// This boot starts the macOS the Preboot disk holds, which needs a GPU;
     /// its recoveryOS and a staged update's installer show on the firmware's
     /// display, as a restore does.

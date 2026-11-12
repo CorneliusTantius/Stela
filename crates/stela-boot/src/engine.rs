@@ -869,8 +869,8 @@ fn show_reset(otherwise: &str, action: &str, hold: u64) {
     }
     show_stop(&guest_down(String::from(otherwise)));
     crate::status::info(
-        "Its full log is on this USB: on another computer, `stela setup boot-log --usb USB` \
-         prints it.",
+        "Its full log is on this USB: on another computer, `stela boot-log --output \
+         stela-log.txt` saves it.",
     );
     crate::status::countdown(action, hold);
 }
@@ -1141,6 +1141,11 @@ fn finish<H: Host>(
     // An orderly stop has nothing to debug: its registers and frames stay
     // out of the log unless `--profile` asks for them.
     let full = options.profile || !matches!(&stop, Stop::Reset(reset) if orderly(reset));
+    // A stop worth debugging prints every line from here, after the detail
+    // held back below the log level.
+    if full {
+        output::flush_pending();
+    }
     parallel::report_source_observations(machine);
     survey_report(machine);
     let drained = machine.devices.with(Drained::take);

@@ -121,13 +121,14 @@ fn find() -> (u64, TscSource, u64) {
         // reports how far the enumerated crystal is from the timers'.
         if let Some((calibrated, source)) = measured {
             crate::output::arguments(format_args!(
-                "HOST TSC hz={hz} source=cpuid measured_hz={} measured_by={} differs_ppm={}\n",
-                calibrated.hz,
+                "TSC rate={} source=cpuid measured={} by={} off={}ppm\n",
+                megahertz(hz),
+                megahertz(calibrated.hz),
                 source.name(),
                 hz.abs_diff(calibrated.hz) * 1_000_000 / hz,
             ));
         } else {
-            crate::output::arguments(format_args!("HOST TSC hz={hz} source=cpuid\n"));
+            crate::output::arguments(format_args!("TSC rate={} source=cpuid\n", megahertz(hz)));
         }
         return (hz, TscSource::Cpuid, CPUID_TOLERANCE_PPM);
     }
@@ -137,8 +138,8 @@ fn find() -> (u64, TscSource, u64) {
             _ => PM_TOLERANCE_PPM,
         };
         crate::output::arguments(format_args!(
-            "HOST TSC hz={} source={} accuracy_ppm={} cross_check_ppm={} agreed={}\n",
-            calibrated.hz,
+            "TSC rate={} source={} accuracy={}ppm cross-check={}ppm agreed={}\n",
+            megahertz(calibrated.hz),
             source.name(),
             calibrated.uncertainty_ppm,
             calibrated.disagreement_ppm,
@@ -214,7 +215,7 @@ fn measure_against_timers() -> Option<(Calibrated, TscSource)> {
         Ok(calibrated) => Some((calibrated, source)),
         Err(error) => {
             crate::output::arguments(format_args!(
-                "HOST TSC calibration against {} failed: {error:?}\n",
+                "TSC calibration against {} failed: {error:?}\n",
                 source.name()
             ));
             None
@@ -388,4 +389,9 @@ fn enumerated_tsc_hz() -> Option<u64> {
     };
     let hz = crystal * u64::from(ratio.ebx) / u64::from(ratio.eax);
     (hz != 0).then_some(hz)
+}
+
+/// `hz` as the log writes a rate: MHz with three decimals.
+fn megahertz(hz: u64) -> alloc::string::String {
+    alloc::format!("{}.{:03}MHz", hz / 1_000_000, hz % 1_000_000 / 1000)
 }

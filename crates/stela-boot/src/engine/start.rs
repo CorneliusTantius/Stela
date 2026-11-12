@@ -193,6 +193,19 @@ fn start(handoff: u64) -> Started {
         output::fatal("engine handoff has the wrong magic");
     }
     layout::set(handoff.placement);
+    // The loader's lines after its USB log closed come first in this
+    // image's record, at the level the options ask for.
+    // SAFETY: the options were left allocated by the loader.
+    let options_text = unsafe {
+        core::slice::from_raw_parts(
+            layout::physical(handoff.options.physical) as *const u8,
+            handoff.options.bytes as usize,
+        )
+    };
+    if let Ok(text) = core::str::from_utf8(options_text) {
+        output::set_level(stela_boot_core::options::log_level_of(text));
+    }
+    output::adopt(&handoff.log_tail[..handoff.log_tail_bytes.min(handoff.log_tail.len())]);
     // Use the physmap directly: its CPU and physical bases have the
     // same alignment phase. A separately placed heap alias cannot in general
     // satisfy higher-order CPU/physical page alignment simultaneously.
@@ -1963,7 +1976,7 @@ fn memory_resources(
         ) {
             Ok(plan) => Some(MemoryResources::T6020Cold(plan)),
             Err(error) => {
-                output::arguments(format_args!("UNMODELED T602x memory cache: {error}\n"));
+                output::arguments(format_args!("UNSUPPORTED T602x memory cache: {error}\n"));
                 None
             }
         }
@@ -1997,7 +2010,7 @@ fn bind_native_pmp(
     let refusal = AppleDevices::native_pmp_system_endpoint_refusal(board)
         .unwrap_or_else(|error| output::fatal(&error));
     if let Some(reason) = refusal {
-        output::arguments(format_args!("UNMODELED {reason}\n"));
+        output::arguments(format_args!("UNSUPPORTED {reason}\n"));
     } else {
         use stela_soc::machine::{ExplicitRuntimeConfiguration, NativePmpClock, SourceProvenance};
         let pmp = board

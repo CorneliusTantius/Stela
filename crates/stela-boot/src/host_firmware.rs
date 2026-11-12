@@ -44,8 +44,9 @@ pub unsafe fn after_ebs(resources: &Resources) -> Result<Option<Arc<Catalog>>> {
     if let Some(catalog) = &catalog {
         let (images, bytes) = catalog.inventory();
         output::arguments(format_args!(
-            "HOST FIRMWARE phase=after-ebs images={images} bytes={bytes} catalog_ms={}\n",
-            output::millis_since(started)
+            "FIRMWARE catalog after-ebs images={images} size={} check={}\n",
+            stela_boot_core::log_style::size_value(bytes as u64),
+            stela_boot_core::log_style::duration_value(output::millis_since(started))
         ));
     }
     Ok(catalog)
@@ -244,9 +245,10 @@ pub fn read(root: &mut Directory) -> Result<Resources> {
             .ok_or(refuse!("missing host firmware catalog"))?;
     let (images, total) = catalog.inventory();
     output::arguments(format_args!(
-        "HOST FIRMWARE phase=before-ebs images={images} bytes={total} read_ms={read_ms} \
-         catalog_ms={}\n",
-        output::millis_since(started)
+        "FIRMWARE catalog before-ebs images={images} size={} read={} check={}\n",
+        stela_boot_core::log_style::size_value(total as u64),
+        stela_boot_core::log_style::duration_value(read_ms),
+        stela_boot_core::log_style::duration_value(output::millis_since(started))
     ));
     Ok(resources)
 }

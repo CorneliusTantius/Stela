@@ -220,12 +220,17 @@ pub fn read(budget: u64) -> Option<Opened> {
             PackRead::Whole(bytes) => (bytes, bytes),
             PackRead::Part { read, held } => (read, held),
         };
+        let size = stela_boot_core::log_style::size_value;
         output::arguments(format_args!(
-            "TRANSLATIONS {path} bound={bound} budget={budget} pack={read} held={held} \
-             skipped={} allocated={allocated} partition={} read_ms={}\n",
+            "TRANSLATIONS {path} bound={} budget={} pack={} held={} skipped={} \
+             allocated={allocated} partition={} read={}\n",
+            size(bound),
+            size(budget),
+            size(read),
+            size(held),
             pack == PackRead::Skipped,
             partition.is_some(),
-            output::millis_since(reading)
+            stela_boot_core::log_style::duration_value(output::millis_since(reading))
         ));
         let region = match region {
             Some(region) => region,

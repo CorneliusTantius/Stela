@@ -1,6 +1,9 @@
 //! What the screen says while Stela starts: one line per step, in the style
 //! of a Linux boot, while every detail goes to the UART and the boot log
-//! ([`output`]). A running step's line shows a moving marker, its time so
+//! ([`output`]). The log gets each step's start (`STEP  title`), its result
+//! with its exact duration (`OK    title (484.0 MiB, 17.7 s)`, `WARN`,
+//! `FAIL`) and each [`info`] line (`NOTE  text`), in the mark column of
+//! `stela_boot_core::log_style`. A running step's line shows a moving marker, its time so
 //! far and its progress, with lines such as macOS's console output under
 //! it ([`stream`]), and its result replaces them when it ends:
 //!
@@ -125,6 +128,17 @@ impl Mark {
             Mark::Warn => 'w',
             Mark::Failed => 'f',
             Mark::Info => 'i',
+        }
+    }
+
+    /// The mark column of the log's line.
+    fn column(self) -> &'static str {
+        use stela_boot_core::log_style::{FAIL, NOTE, OK, WARN};
+        match self {
+            Mark::Ok => OK,
+            Mark::Warn => WARN,
+            Mark::Failed => FAIL,
+            Mark::Info => NOTE,
         }
     }
 
@@ -255,7 +269,6 @@ impl State {
             }
             return;
         };
-        let seconds = self.seconds(running.started);
         let millis = self.millis(running.started);
         let mut text = running.title;
         // A failed step keeps what it was on, such as the PCI function a
@@ -265,14 +278,20 @@ impl State {
             text.push_str(" at ");
             text.push_str(&running.detail);
         }
-        match (result.is_empty(), seconds) {
-            (true, 0) => {}
-            (true, seconds) => text.push_str(&format!(" ({seconds} s)")),
-            (false, 0) => text.push_str(&format!(" ({result})")),
-            (false, seconds) => text.push_str(&format!(" ({result}, {seconds} s)")),
+        // The log's line always carries the step's time; the screen's only
+        // from a second on.
+        let time = stela_boot_core::log_style::duration(millis);
+        let logged = match result.is_empty() {
+            true => format!("{text} ({time})"),
+            false => format!("{text} ({result}, {time})"),
+        };
+        match (result.is_empty(), millis >= 1000) {
+            (true, false) => {}
+            (true, true) => text.push_str(&format!(" ({time})")),
+            (false, false) => text.push_str(&format!(" ({result})")),
+            (false, true) => text.push_str(&format!(" ({result}, {time})")),
         }
-        // The log's line carries the exact time, which the screen's rounds.
-        output::arguments(format_args!("STEP {} {text} ms={millis}\n", mark.letter()));
+        output::arguments(format_args!("{}{logged}\n", mark.column()));
         self.line(mark, &text);
     }
 
@@ -316,12 +335,9 @@ pub fn begin(title: &str) {
         if state.running.is_some() {
             state.finish(Mark::Ok, "");
         }
-        // Seconds since the PC started, which the serial port's lines lack.
-        let millis = state.millis(0);
         output::arguments(format_args!(
-            "STEP {title} t={}.{:03}\n",
-            millis / 1000,
-            millis % 1000
+            "{}{title}\n",
+            stela_boot_core::log_style::STEP
         ));
         state.running = Some(Running {
             title: String::from(title),
@@ -442,8 +458,9 @@ pub fn fail(result: &str) {
     output::flush_log();
 }
 
-/// A line of its own, under the step lines.
+/// A line of its own, under the step lines, and a `NOTE` line in the log.
 pub fn info(text: &str) {
+    output::arguments(format_args!("{}{text}\n", Mark::Info.column()));
     with(|state| state.line(Mark::Info, text));
 }
 
@@ -463,6 +480,21 @@ pub fn take_screen(screen: Option<console::Framebuffer>) {
         }
         state.draw_running();
     });
+}
+
+/// The running step's title, else the last finished step's, for the
+/// outcome of a boot that stops.
+pub fn current() -> Option<String> {
+    let state = STATE.0.try_borrow().ok()?;
+    if let Some(running) = &state.running {
+        return Some(running.title.clone());
+    }
+    state
+        .history
+        .lines()
+        .rev()
+        .find(|line| !line.starts_with('i'))
+        .map(|line| String::from(line.get(1..).unwrap_or_default()))
 }
 
 /// The finished lines so far.

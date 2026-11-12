@@ -18,8 +18,9 @@ use core::{
     convert::Infallible,
     fmt::{self, Write},
     mem::MaybeUninit,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
+use stela_boot_core::log_level::{Level, Need, Repeat, Repeats};
 use stela_drivers::block::{BlockDevice, BlockError, Submission};
 use stela_runtime::pc::boot_log::{PENDING_BYTES, Pending, Unkept, Writer};
 
@@ -553,7 +554,7 @@ pub fn set_clock(tsc_hz: u64) {
 
 /// `[  12.345] `: the seconds since the PC started, as the kernel's own
 /// lines show them; nothing before the counter's rate is known.
-fn stamp(record: &mut Pending<[u8; PENDING_BYTES]>) {
+fn stamp<const N: usize>(record: &mut Pending<[u8; N]>) {
     let hz = TSC_HZ.load(Ordering::Relaxed);
     if hz == 0 {
         return;
@@ -602,6 +603,15 @@ impl<const N: usize> Write for Text<N> {
 /// take both with them.
 pub fn leave_boot_services() {
     crate::firmware::stop_ticker();
+    let firmware_log = with_sinks(true, |sinks| {
+        sinks.iter().any(|sink| sink.kind == Log::Firmware)
+    });
+    if firmware_log == Some(true) {
+        arguments(format_args!(
+            "LOG paused until Stela's USB driver opens it again; a log that ends here \
+             stopped before that, and the screen shows why\n"
+        ));
+    }
     // The engine's copy of this image has a queue of its own: send this
     // one's now, bounded, and the loader's last lines directly.
     unqueue_serial();
@@ -609,7 +619,54 @@ pub fn leave_boot_services() {
     with_sinks(true, |sinks| {
         sinks.retain(|sink| sink.kind != Log::Firmware)
     });
+    if let Ok(record) = RECORD.0.try_borrow() {
+        BOOT_SERVICES_LEFT.store(record.pushed(), Ordering::Relaxed);
+    }
     disable_firmware_console();
+}
+
+/// The most loader output after [`leave_boot_services`] the engine takes
+/// up ([`tail_after_boot_services`]).
+pub const LOG_TAIL_BYTES: usize = 8 << 10;
+/// The record's position when the USB's log through the firmware closed.
+static BOOT_SERVICES_LEFT: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Copy into `into` the output since [`leave_boot_services`], which no
+/// log of this image will store, its newest bytes when it is longer; how
+/// many bytes.
+pub fn tail_after_boot_services(into: &mut [u8; LOG_TAIL_BYTES]) -> usize {
+    let mark = BOOT_SERVICES_LEFT.load(Ordering::Relaxed);
+    let mut length = 0;
+    let _ = exclusive(|| {
+        let Ok(record) = RECORD.0.try_borrow() else {
+            return;
+        };
+        if mark > record.pushed() {
+            return;
+        }
+        let from = mark.max(record.pushed().saturating_sub(LOG_TAIL_BYTES as u64));
+        let Ok(_) = record.copy_since(from, |bytes| {
+            let take = bytes.len().min(LOG_TAIL_BYTES - length);
+            into[length..length + take].copy_from_slice(&bytes[..take]);
+            length += take;
+            Ok::<_, Infallible>(())
+        });
+    });
+    length
+}
+
+/// Start this image's record with `bytes`, the loader's output after its
+/// USB log closed ([`tail_after_boot_services`]): the serial port had
+/// them from the loader, and the USB log gets them once it opens again.
+pub fn adopt(bytes: &[u8]) {
+    let _ = exclusive(|| {
+        if let Ok(mut record) = RECORD.0.try_borrow_mut() {
+            record.push(bytes);
+            if !bytes.is_empty() && !bytes.ends_with(b"\n") {
+                record.push(b"\n");
+            }
+        }
+    });
 }
 
 /// The relocated engine has its own statics, not the loader image's updated
@@ -641,24 +698,257 @@ fn firmware_console(text: &str) {
     }
 }
 
+/// The boot's log level: 1 with `--profile` ([`set_level`]).
+static LEVEL: AtomicU8 = AtomicU8::new(0);
+/// The boot is stopping for a reason worth debugging: every line is printed
+/// from now on, whatever its level ([`flush_pending`]).
+static STOPPING: AtomicBool = AtomicBool::new(false);
+/// The heartbeat in progress is one the default level logs ([`beat`]).
+static BEAT_LOGGED: AtomicBool = AtomicBool::new(true);
+/// The line being written is printed, decided at its start.
+static LINE_PRINTED: AtomicBool = AtomicBool::new(true);
+/// What the next line asks for in place of its family's level
+/// ([`line_needing`]): 0 for its family's, else [`need_code`].
+static FORCED: AtomicU8 = AtomicU8::new(0);
+/// Lines the boot does not print, the newest [`HELD_BYTES`], which a
+/// stopping boot prints ([`flush_pending`]). Reached only under [`WRITING`].
+const HELD_BYTES: usize = 64 << 10;
+static HELD_BACK: Global<Pending<[u8; HELD_BYTES]>> =
+    Global(RefCell::new(Pending::new([0; HELD_BYTES])));
+/// Lines alike seen so far ([`repeated`]).
+#[cfg_attr(not(feature = "nvk"), expect(dead_code))]
+static REPEATS: Global<Repeats> = Global(RefCell::new(Repeats::new()));
+
+#[cfg_attr(not(feature = "nvk"), expect(dead_code))]
+fn need_code(need: Need) -> u8 {
+    match need {
+        Need::Always => 1,
+        Need::Beat => 2,
+        Need::Profile => 3,
+    }
+}
+
+fn need_of(code: u8) -> Option<Need> {
+    Some(match code {
+        1 => Need::Always,
+        2 => Need::Beat,
+        3 => Need::Profile,
+        _ => return None,
+    })
+}
+
+/// Print lines at `level` from now on. Raising it to the profile level
+/// prints what was held before the level was known, such as the
+/// firmware's records.
+pub fn set_level(level: Level) {
+    LEVEL.store(u8::from(level == Level::Profile), Ordering::Relaxed);
+    if level == Level::Profile {
+        print_held();
+    }
+}
+
+/// The boot's log level.
+pub fn level() -> Level {
+    match LEVEL.load(Ordering::Relaxed) {
+        0 => Level::Default,
+        _ => Level::Profile,
+    }
+}
+
+/// Heartbeat `count` begins: the default level logs one in
+/// [`stela_boot_core::log_level::BEAT_EVERY`].
+pub fn beat(count: u64) {
+    BEAT_LOGGED.store(
+        count.is_multiple_of(stela_boot_core::log_level::BEAT_EVERY),
+        Ordering::Relaxed,
+    );
+}
+
+/// Whether a line that asks for `need` is printed now.
+fn printed(need: Need) -> bool {
+    STOPPING.load(Ordering::Relaxed) || need.printed(level(), BEAT_LOGGED.load(Ordering::Relaxed))
+}
+
+/// `value`, a disk serial number, a volume's UUID or several joined by
+/// `:`, as the log names it: whole at the profile level, which test runs
+/// read, else shortened to its last characters, as in every line a user
+/// may paste ([`stela_boot_core::log_style::short_ids`]).
+pub fn private(value: &str) -> alloc::string::String {
+    if level() == Level::Profile {
+        alloc::string::String::from(value)
+    } else {
+        stela_boot_core::log_style::short_ids(value)
+    }
+}
+
+/// Print a line that may name volume UUIDs or disk serial numbers in text
+/// it does not build itself: whole at the profile level, else with each
+/// shortened ([`stela_boot_core::log_style::redact`]).
+pub fn redacted(args: fmt::Arguments<'_>) {
+    if level() == Level::Profile {
+        arguments(args);
+    } else {
+        let line = alloc::format!("{args}");
+        arguments(format_args!(
+            "{}",
+            stela_boot_core::log_style::redact(&line)
+        ));
+    }
+}
+
+/// Print `{family} {text}`, an event an app may cause many times: at the
+/// default level, once and then as counts of the lines alike ([`Repeats`]);
+/// every time with `--profile`.
+#[cfg_attr(not(feature = "nvk"), expect(dead_code))]
+pub fn repeated(family: &str, text: &str) {
+    if level() == Level::Profile || STOPPING.load(Ordering::Relaxed) {
+        arguments(format_args!("{family} {text}\n"));
+        return;
+    }
+    let seen = REPEATS
+        .0
+        .try_borrow_mut()
+        .map_or(Repeat::First, |mut repeats| repeats.see(text));
+    match seen {
+        Repeat::First => arguments(format_args!("{family} {text}\n")),
+        Repeat::Count(count) => arguments(format_args!(
+            "{family} {count} times so far, like: {text}\n"
+        )),
+        Repeat::Again => line_needing(Need::Profile, format_args!("{family} {text}\n")),
+    }
+}
+
+/// Print one line that asks for `need` whatever its family's level, such
+/// as a macOS console line that holds a panic.
+#[cfg_attr(not(feature = "nvk"), expect(dead_code))]
+pub fn line_needing(need: Need, args: fmt::Arguments<'_>) {
+    let written = exclusive(|| {
+        FORCED.store(need_code(need), Ordering::Relaxed);
+        let _ = Output.write_fmt(args);
+        FORCED.store(0, Ordering::Relaxed);
+    });
+    if written.is_none() && printed(need) {
+        let _ = Serial.write_fmt(args);
+    }
+}
+
+/// Spaces for the mark and topic columns, written without the heap.
+const SPACES: &str = "                                ";
+
+/// Write `bytes` to the serial port and, when `record`, to the record:
+/// one printed piece of a line.
+fn emit(record: &mut Option<core::cell::RefMut<'_, Pending<[u8; PENDING_BYTES]>>>, text: &str) {
+    serial(text.as_bytes());
+    if RAW_SCREEN.load(Ordering::Relaxed) {
+        console::write(&[(text, console::Color::Text)]);
+    }
+    if let Some(record) = record.as_mut() {
+        record.push(text.as_bytes());
+    }
+}
+
+/// The one formatter: each line is printed or held by its level
+/// ([`stela_boot_core::log_level`]), and a printed line is laid out in the
+/// mark and topic columns ([`stela_boot_core::log_style::layout`]) unless
+/// its form is a contract; the record's copy also gets the time column.
 struct Output;
 impl Write for Output {
     fn write_str(&mut self, value: &str) -> fmt::Result {
-        serial(value.as_bytes());
-        if RAW_SCREEN.load(Ordering::Relaxed) {
-            console::write(&[(value, console::Color::Text)]);
-        }
-        if let Ok(mut record) = RECORD.0.try_borrow_mut() {
-            for line in value.split_inclusive('\n') {
-                if LINE_START.load(Ordering::Relaxed) {
-                    stamp(&mut record);
+        use stela_boot_core::log_style::{Layout, MARK_WIDTH, layout, topic_gap};
+        for line in value.split_inclusive('\n') {
+            let start = LINE_START.load(Ordering::Relaxed);
+            let mut text = line;
+            let mut columns = None;
+            if start {
+                let need = need_of(FORCED.load(Ordering::Relaxed))
+                    .unwrap_or_else(|| stela_boot_core::log_level::classify(line));
+                LINE_PRINTED.store(printed(need), Ordering::Relaxed);
+                if need != Need::Profile
+                    && let Layout::Detail { topic, taken } = layout(line)
+                {
+                    columns = Some(&line[..topic]);
+                    text = &line[taken..];
                 }
-                record.push(line.as_bytes());
-                LINE_START.store(line.ends_with('\n'), Ordering::Relaxed);
             }
+            LINE_START.store(line.ends_with('\n'), Ordering::Relaxed);
+            if !LINE_PRINTED.load(Ordering::Relaxed) {
+                if let Ok(mut held) = HELD_BACK.0.try_borrow_mut() {
+                    if start {
+                        stamp(&mut held);
+                    }
+                    held.push(line.as_bytes());
+                }
+                continue;
+            }
+            let mut record = RECORD.0.try_borrow_mut().ok();
+            if start && let Some(record) = record.as_mut() {
+                stamp(record);
+            }
+            if let Some(topic) = columns {
+                emit(&mut record, &SPACES[..MARK_WIDTH]);
+                emit(&mut record, topic);
+                emit(
+                    &mut record,
+                    &SPACES[..topic_gap(topic.len()).min(SPACES.len())],
+                );
+            }
+            emit(&mut record, text);
         }
         Ok(())
     }
+}
+
+/// The boot stops for a reason worth debugging: print every line from now
+/// on and, once, the detail held back below the log level.
+fn release_held() {
+    STOPPING.store(true, Ordering::Relaxed);
+    print_held();
+}
+
+/// Print the detail held back below the log level, between lines that say
+/// so, and hold none. Leaves it held while another processor writes.
+fn print_held() {
+    let _ = exclusive(|| {
+        let (Ok(mut held), Ok(mut record)) =
+            (HELD_BACK.0.try_borrow_mut(), RECORD.0.try_borrow_mut())
+        else {
+            return;
+        };
+        if held.is_empty() {
+            return;
+        }
+        let mut header = Text::<96>::default();
+        let _ = writeln!(
+            header,
+            "HELD BACK {} bytes of detail below the log level, newest last:",
+            held.bytes()
+        );
+        if !LINE_START.load(Ordering::Relaxed) {
+            serial(b"\n");
+            record.push(b"\n");
+        }
+        stamp(&mut record);
+        serial(header.as_bytes());
+        record.push(header.as_bytes());
+        let Ok(()) = held.drain(|bytes| {
+            serial(bytes);
+            record.push(bytes);
+            Ok::<_, Infallible>(())
+        });
+        stamp(&mut record);
+        serial(b"HELD BACK end\n");
+        record.push(b"HELD BACK end\n");
+        LINE_START.store(true, Ordering::Relaxed);
+    });
+}
+
+/// Print what is pending and store it: the detail held back below the log
+/// level (once), then every open log, waiting for the stores. For a boot
+/// that stops, or a step that fails and cannot go on; every line is printed
+/// from then on. Safe to call more than once.
+pub fn flush_pending() {
+    release_held();
+    flush_log();
 }
 
 /// Why [`add_log`] did not keep a log.
@@ -766,7 +1056,7 @@ fn flush_where(due: impl Fn(&Sink) -> bool, wait: bool) {
         static SAID: AtomicBool = AtomicBool::new(false);
         if !SAID.swap(true, Ordering::Relaxed) {
             arguments(format_args!(
-                "BOOT LOG not stored: this processor stopped inside the host drivers\n"
+                "LOG not stored: this processor stopped inside the host drivers\n"
             ));
         }
         return;
@@ -809,7 +1099,7 @@ fn flush_where(due: impl Fn(&Sink) -> bool, wait: bool) {
         );
     });
     for (kind, error) in failed {
-        arguments(format_args!("BOOT LOG refusal: {error}\n"));
+        arguments(format_args!("LOG refused: {error}\n"));
         if kind == Log::Machine {
             fatal("the boot log could not be stored");
         }
@@ -846,9 +1136,7 @@ pub fn report_log_stores() {
             Log::Firmware => "firmware",
             Log::Usb => "usb",
         };
-        arguments(format_args!(
-            "BOOT LOG {name} stores={stores} ms={millis}\n"
-        ));
+        arguments(format_args!("LOG {name} stores={stores} time={millis}ms\n"));
     }
 }
 
@@ -875,6 +1163,7 @@ pub fn hypervisor_exit_port() -> bool {
 /// Report `code` on the hypervisor exit port, then halt. On a PC the screen
 /// keeps the output until the machine is powered off.
 pub fn terminate(code: u32) -> ! {
+    outcome(code);
     arguments(format_args!(
         "STELA STOPPED code={code:#x}; power off to continue\n"
     ));
@@ -883,6 +1172,31 @@ pub fn terminate(code: u32) -> ! {
     unqueue_serial();
     flush_log();
     halt(code)
+}
+
+/// Why the boot stops, once known ([`fatal`], [`stopping`]), for its
+/// outcome block.
+static REASON: Global<Option<alloc::string::String>> = Global(RefCell::new(None));
+
+/// End the boot's block in the log: where it stopped, when, and why.
+fn outcome(code: u32) {
+    let millis = match TSC_HZ.load(Ordering::Relaxed) {
+        0 => 0,
+        hz => rdtsc() / (hz / 1000).max(1),
+    };
+    let step = crate::status::current();
+    let reason = REASON.0.try_borrow().ok().and_then(|reason| reason.clone());
+    let rule = "--------------------------------------------------------------------------------";
+    arguments(format_args!("{rule}\n"));
+    arguments(format_args!(
+        "OUTCOME stopped in \"{}\" at {}.{} s, code {code:#x}{}{}\n",
+        step.as_deref().unwrap_or("the start"),
+        millis / 1000,
+        millis % 1000 / 100,
+        if reason.is_some() { ": " } else { "" },
+        reason.as_deref().unwrap_or(""),
+    ));
+    arguments(format_args!("{}\n", rule.replace('-', "=")));
 }
 
 /// Stop before allocator initialization. UART/record formatting and UEFI's
@@ -917,17 +1231,21 @@ fn stopped(message: &str, next: &str) {
     if console::active() && !RAW_SCREEN.load(Ordering::Relaxed) {
         crate::status::fail(message);
         crate::status::info(next);
-    } else if FIRMWARE_CONSOLE.load(Ordering::Relaxed) {
-        firmware_console("\nStela stopped: ");
-        firmware_console(message);
-        firmware_console("\n");
+    } else {
+        arguments(format_args!("{}{next}\n", stela_boot_core::log_style::NOTE));
+        if FIRMWARE_CONSOLE.load(Ordering::Relaxed) {
+            firmware_console("\nStela stopped: ");
+            firmware_console(message);
+            firmware_console("\n");
+        }
     }
 }
 
 /// What a stopped boot tells the user to do next: where its log is, and how
 /// to read it on another computer.
 pub const STOPPED: &str = "Stela stopped. Its log is on this USB: on another computer, `stela \
-    setup boot-log --usb USB` prints it; include it in a report. Turn the PC off to try again.";
+    boot-log --output stela-log.txt` saves it; attach that file to a report. Turn the PC off to \
+    try again.";
 
 /// What a stop before the engine writes the USB's log again tells the
 /// user: the screen is all that is kept of this part of the run.
@@ -951,6 +1269,10 @@ pub fn stopped_text() -> &'static str {
 pub fn fatal(message: impl core::fmt::Display) -> ! {
     let message = alloc::string::ToString::to_string(&message);
     arguments(format_args!("\nSTELA FATAL {message}\n"));
+    if let Ok(mut reason) = REASON.0.try_borrow_mut() {
+        reason.get_or_insert_with(|| message.clone());
+    }
+    release_held();
     // The reason reaches the port before any later step can stop for good.
     unqueue_serial();
     crate::engine::stop_gpus_for_fatal();
@@ -964,6 +1286,10 @@ pub fn fatal(message: impl core::fmt::Display) -> ! {
 #[cfg(feature = "nvk")]
 pub fn stopping(message: &str) {
     arguments(format_args!("\nSTELA STOP {message}\n"));
+    if let Ok(mut reason) = REASON.0.try_borrow_mut() {
+        reason.get_or_insert_with(|| alloc::string::String::from(message));
+    }
+    release_held();
     unqueue_serial();
     stopped(message, "Stela stopped. The PC turns off.");
 }

@@ -724,10 +724,10 @@ pub(super) fn unmodeled_report<H: Host>(
         ));
     }
     for requirement in requirements {
-        output::arguments(format_args!("UNMODELED {requirement}\n"));
+        output::arguments(format_args!("UNSUPPORTED {requirement}\n"));
     }
     for line in requests {
-        output::arguments(format_args!("UNMODELED {line}\n"));
+        output::arguments(format_args!("UNSUPPORTED {line}\n"));
     }
 }
 

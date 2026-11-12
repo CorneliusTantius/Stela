@@ -95,7 +95,7 @@ fn initial_heap_bytes() -> Result<usize, EarlyText> {
 /// build, the CPU, the RAM the firmware describes and the firmware.
 fn host_identity() -> alloc::string::String {
     use core::arch::x86_64::__cpuid;
-    use stela_boot_core::host_identity::{Identity, brand, line};
+    use stela_boot_core::host_identity::{Identity, brand, header};
     let signature = __cpuid(1).eax;
     let mut words = [0u32; 12];
     if __cpuid(0x8000_0000).eax >= 0x8000_0004 {
@@ -142,8 +142,23 @@ fn host_identity() -> alloc::string::String {
     host_inventory::number("HostMemoryBytes", ram_bytes);
     host_inventory::text("FirmwareVendor", vendor.clone());
     host_inventory::number("FirmwareRevision", uefi::system::firmware_revision().into());
-    line(&Identity {
+    // The firmware clock as it reads, local time or UTC as the PC keeps it.
+    let time = uefi::runtime::get_time().ok().map(|time| {
+        alloc::format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            time.year(),
+            time.month(),
+            time.day(),
+            time.hour(),
+            time.minute(),
+            time.second()
+        )
+    });
+    header(&Identity {
         version: env!("CARGO_PKG_VERSION"),
+        build: env!("STELA_BUILD"),
+        time: time.as_deref(),
+        hypervisor: output::hypervisor_exit_port(),
         cpu: &cpu,
         signature,
         ram_bytes,
@@ -242,8 +257,8 @@ fn main() -> Status {
     };
     status::set_clock(firmware::tsc_hz());
     firmware::start_ticker();
-    let log = log_file::open();
     output::arguments(format_args!("{}", host_identity()));
+    let log = log_file::open();
     if output::hypervisor_exit_port() {
         output::arguments(format_args!(
             "HOST hypervisor present: stop codes also go to its exit port\n"
@@ -251,7 +266,7 @@ fn main() -> Status {
     }
     status::begin("Connecting the firmware's drivers to every device");
     let handles = firmware::connect_all();
-    output::arguments(format_args!("FIRMWARE connected {handles} handles\n"));
+    output::arguments(format_args!("FIRMWARE handles={handles}\n"));
     status::done("");
     status::begin("Reading Stela's settings");
     let (mut volume, mut firmware_root) = firmware::volume().unwrap_or_else(|e| output::fatal(e));
@@ -259,6 +274,9 @@ fn main() -> Status {
         host_firmware::read(&mut firmware_root).unwrap_or_else(|e| output::fatal(e));
     drop(firmware_root);
     let options = firmware::options(&mut volume).unwrap_or_else(|e| output::fatal(e));
+    if let Ok(text) = core::str::from_utf8(&options) {
+        output::set_level(stela_boot_core::options::log_level_of(text));
+    }
     let options = choice::resolve(&mut volume, options);
     status::done("");
     let held = system::held_at_start(&options);

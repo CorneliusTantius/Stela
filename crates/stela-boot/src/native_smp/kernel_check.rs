@@ -524,7 +524,7 @@ pub(crate) unsafe fn check(
     let unmodeled = machine.take_unmodeled();
     if !unmodeled.is_empty() {
         for requirement in unmodeled {
-            crate::output::arguments(format_args!("NATIVE SCHEDULER UNMODELED {requirement}\n"));
+            crate::output::arguments(format_args!("NATIVE SCHEDULER UNSUPPORTED {requirement}\n"));
         }
         return Err(refuse!(
             "native scheduler answered an unsupported operation degraded"

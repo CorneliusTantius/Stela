@@ -266,11 +266,13 @@ unsafe fn with_interrupts<R>(body: impl FnOnce() -> R) -> R {
     result
 }
 
-/// Logs why the service refused a guest's call, once for each reason.
+/// Logs why the service refused a guest's call, once for each reason, and
+/// below the profile level once for reasons alike but for their numbers
+/// (`output::repeated`).
 fn report(reason: &str) {
     static SEEN: Seen<512> = Seen::new();
     if let Some(unheld) = SEEN.first_time(reason) {
-        output::arguments(format_args!("GPU REFUSED {reason}{unheld}\n"));
+        output::repeated("GPU REFUSED", &alloc::format!("{reason}{unheld}"));
     }
 }
 

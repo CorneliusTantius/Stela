@@ -66,9 +66,9 @@ pub fn check_pieces(
         ));
     }
     output::arguments(format_args!(
-        "INSTALL MEDIUM {directory}: {} pieces, {} bytes, build {}\n",
+        "INSTALL MEDIUM {directory}: {} pieces, {}, build {}\n",
         pieces.len(),
-        manifest.source.bytes,
+        stela_boot_core::log_style::size(manifest.source.bytes),
         manifest.product_build
     ));
     Ok(())

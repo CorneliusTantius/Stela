@@ -223,6 +223,60 @@ pub fn capture_with(
     };
     capture
 }
+/// The readable line for the SMBIOS observation: the PC's maker and model
+/// as its firmware names them, the table's size and a short hash
+/// ([`record`] is the full JSON, printed with `--profile`).
+pub fn summary(
+    phase: &str,
+    capture: &Capture,
+    identity: Option<smbios::SystemIdentity<'_>>,
+) -> alloc::string::String {
+    let text = |value: smbios::Observation<'_>| match value {
+        smbios::Observation::Value(bytes) => {
+            let text = alloc::string::String::from_utf8_lossy(
+                crate::host_identity::smbios_text(bytes).unwrap_or_default(),
+            );
+            let text: alloc::string::String = text
+                .chars()
+                .filter(|c| !c.is_control() && *c != '"')
+                .take(48)
+                .collect();
+            alloc::format!("\"{text}\"")
+        }
+        smbios::Observation::Absent => alloc::string::String::from("none"),
+        smbios::Observation::NotObserved => alloc::string::String::from("unread"),
+    };
+    match capture.state {
+        State::Present => {
+            let identity = identity.unwrap_or_default();
+            let digest: alloc::string::String = capture.sha256[..6]
+                .iter()
+                .map(|b| alloc::format!("{b:02x}"))
+                .collect();
+            alloc::format!(
+                "SMBIOS {phase} vendor={} product={} board={} size={}B sha={digest}\n",
+                text(identity.system_vendor),
+                text(identity.product_name),
+                text(identity.board_vendor),
+                capture.region.bytes,
+            )
+        }
+        State::NotCaptured => alloc::format!("SMBIOS {phase} not captured\n"),
+        State::Unavailable => {
+            alloc::format!("SMBIOS {phase} unavailable: the firmware has no SMBIOS table\n")
+        }
+        State::Failed(error) => alloc::format!(
+            "SMBIOS {phase} unreadable at {:?}: {:?}{}\n",
+            error.stage,
+            error.reason,
+            error
+                .status
+                .map(|status| alloc::format!(", status={status:#x}"))
+                .unwrap_or_default()
+        ),
+    }
+}
+
 pub fn record(
     phase: &str,
     capture: &Capture,

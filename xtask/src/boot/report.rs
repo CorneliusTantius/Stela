@@ -59,7 +59,10 @@ pub(super) fn finish(arguments: &Run, outcome: Outcome) -> Result<ExitCode> {
         None => TIMEOUT_EXIT,
     };
     let qemu_returncode = code;
-    let serial_text = fs::read_to_string(&paths.serial).unwrap_or_default();
+    // Read by family, without the log's mark and topic columns.
+    let serial_text = stela_boot_core::log_style::unlay_text(
+        &fs::read_to_string(&paths.serial).unwrap_or_default(),
+    );
     let mount_exit = arguments
         .audio_check
         .map(|_| audio_check::guest_exit(&serial_text));

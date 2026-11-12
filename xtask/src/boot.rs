@@ -774,6 +774,11 @@ fn launch(arguments: Run) -> Result<ExitCode> {
         ));
     }
     let network = network::Check::start(&arguments, &mut options)?;
+    // The firmware's catalog records, which the qualification compares,
+    // print only at the profile log level.
+    if arguments.host_firmware.is_some() && !options.split_whitespace().any(|w| w == "--profile") {
+        options.push_str(" --profile");
+    }
     let options = storage::payload(&arguments, &paths, options)?;
     ensure!(
         arguments.host_firmware.is_none() || system,
@@ -959,7 +964,8 @@ fn guest(arguments: &Run, preboot: Option<&preboot::Preboot>) -> Result<(Vec<u8>
 /// answered degraded. Buffered diagnostics are not a causal clock.
 fn first_unsupported(serial: &str) -> Option<&str> {
     serial.lines().find_map(|line| {
-        line.strip_prefix("UNMODELED ")
+        line.strip_prefix("UNSUPPORTED ")
+            .filter(|rest| !rest.starts_with("SUMMARY "))
             .or_else(|| line.strip_prefix("STOP UNSUPPORTED "))
     })
 }

@@ -165,6 +165,25 @@ fn every_option_survives_a_round_trip() {
          --restore-manifest m.plist --restore-identity 2"
     ));
     assert_eq!(restore.restore_manifest_path.as_deref(), Some("m.plist"));
+    assert_eq!(options.log_level(), crate::log_level::Level::Profile);
+}
+
+#[test]
+fn the_log_level_takes_one_option() {
+    use crate::log_level::Level;
+    let plain = round_trip(&format!("--system --storage {DISK}"));
+    assert_eq!(plain.log_level(), Level::Default);
+    let profile = round_trip(&format!("--system --storage {DISK} --profile"));
+    assert_eq!(profile.log_level(), Level::Profile);
+    // Read from the words alone, before routing.
+    for line in [&plain, &profile] {
+        assert_eq!(super::log_level_of(&line.to_string()), line.log_level());
+    }
+    assert_eq!(
+        super::log_level_of("--system --storage @disk --profile"),
+        Level::Profile
+    );
+    assert_eq!(super::log_level_of("--system --profiles"), Level::Default);
 }
 
 #[test]

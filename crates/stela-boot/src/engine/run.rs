@@ -974,6 +974,7 @@ impl Heartbeat {
             cost.add(name, now.wrapping_sub(at));
             at = now;
         };
+        output::beat(self.beats);
         let mut cost = BeatCost::new();
         let next = Beat::at(machine, now);
         let elapsed = now - self.beat.at;
@@ -1381,15 +1382,12 @@ impl Heartbeat {
                 {
                     *total += now.saturating_sub(*before);
                 }
-                for (total, (now, before)) in branch_misses
-                    .iter_mut()
-                    .zip(
-                        now.branch_misses
-                            .as_flattened()
-                            .iter()
-                            .zip(before.branch_misses.as_flattened()),
-                    )
-                {
+                for (total, (now, before)) in branch_misses.iter_mut().zip(
+                    now.branch_misses
+                        .as_flattened()
+                        .iter()
+                        .zip(before.branch_misses.as_flattened()),
+                ) {
                     *total += now.saturating_sub(*before);
                 }
                 let promoted = stela_compiler::x86_64::chain::STAMP_COUNTS + 1;

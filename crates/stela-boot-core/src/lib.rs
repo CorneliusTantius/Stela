@@ -44,6 +44,8 @@ pub mod hpet;
 pub mod interrupt_image;
 pub mod ioapic;
 pub mod irq_context;
+pub mod log_level;
+pub mod log_style;
 pub mod madt;
 pub mod memory_budget;
 pub mod memory_types;

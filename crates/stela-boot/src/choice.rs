@@ -153,7 +153,10 @@ pub fn chosen_disk(volume: &mut FileSystem) -> Option<String> {
     match disk.parse::<stela_runtime::pc::storage::Target>() {
         Ok(_) => Some(disk.into()),
         Err(_) => {
-            output::arguments(format_args!("CHOSEN DISK refused: {disk:?}\n"));
+            output::arguments(format_args!(
+                "CHOSEN DISK refused: {:?}\n",
+                output::private(disk)
+            ));
             None
         }
     }
@@ -438,7 +441,7 @@ fn menu(volume: &mut FileSystem, choices: &Choices, mut menu: Menu<'_>) -> Optio
                     menu.notice = Some("The chosen disk could not be recorded on the USB.");
                     continue;
                 }
-                output::arguments(format_args!("CHOSEN DISK {disk}\n"));
+                output::arguments(format_args!("CHOSEN DISK {}\n", output::private(&disk)));
                 return Some(chosen(choices, *n, Some(&disk)));
             }
             Item::Choice(n, _) => return Some(chosen(choices, *n, menu.disk.as_deref())),
@@ -482,7 +485,10 @@ pub fn choose(volume: &mut FileSystem, options: Vec<u8>, held: Option<&str>) -> 
 /// `None` when the volume has no choices or no console input to choose with.
 pub fn hold(volume: &mut FileSystem, reason: &str) -> Option<Vec<u8>> {
     let choices = read(volume)?;
-    output::arguments(format_args!("HOLD {reason}\n"));
+    output::arguments(format_args!(
+        "{}{reason}\n",
+        stela_boot_core::log_style::NOTE
+    ));
     let held = Menu::new(&choices, Some(reason), chosen_disk(volume));
     menu(volume, &choices, held)
 }
