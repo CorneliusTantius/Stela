@@ -108,6 +108,7 @@ const PROFILE: &[&str] = &[
     "GPU PUMP",
     "GPU QUEUED",
     "GPU SERVED",
+    "GPU STORE",
     "GPU TAKEN",
     "GPU TIMES",
     "GUEST PERFORMANCE",
@@ -277,6 +278,7 @@ mod tests {
         assert_eq!(classify("USBX"), Need::Always);
         assert_eq!(classify("HEAP small=3M large=9M"), Need::Beat);
         assert_eq!(classify("HEAP LARGE 4M"), Need::Profile);
+        assert_eq!(classify("GPU STORE hits=0 misses=11"), Need::Profile);
         assert_eq!(
             classify("NATIVE FIRMWARE INIT delivered apic=0x1"),
             Need::Profile
