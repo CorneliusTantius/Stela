@@ -114,7 +114,10 @@ impl Kind {
             Some(Self::MediatekWifi)
         } else if function.vendor == 0x10ec
             && function.class[..2] == [2, 0x80]
-            && realtek_wifi::identity::RTL8822C_DEVICES.contains(&function.device)
+            && (realtek_wifi::identity::RTL8822C_DEVICES.contains(&function.device)
+                || realtek_wifi::chip::RTL8821C
+                    .devices
+                    .contains(&function.device))
         {
             Some(Self::RealtekWifi)
         } else if function.vendor == 0x8086 && intel_pcie::DEVICE_IDS.contains(&function.device) {
