@@ -327,3 +327,37 @@ fn a_refused_or_failed_stop_never_drains_or_binds_and_keeps_the_original_root() 
         );
     }
 }
+
+/// Intel VMD through the shared hand-over: an admitted host is prepared,
+/// stopped (it runs no engine of its own), drained and bound to its own
+/// domain, which the NVMe controller behind it then reaches memory through;
+/// a device ID no VMD profile lists is refused before anything is drained.
+#[test]
+fn an_intel_vmd_host_is_handed_over_and_an_unlisted_one_refused() {
+    let services = BootServices::new(0x8086, 0x9a0b, [0x01, 0x04, 0]);
+    let mut stop = super::super::VmdStop { profile: None };
+    // SAFETY: the services are this test's model.
+    let Ok(handed) = (unsafe { hand_over(&services, ADDRESS, &mut stop) }) else {
+        panic!("the VMD host is handed over");
+    };
+    assert!(stop.profile.is_some());
+    assert_eq!(
+        services.events(),
+        [Event::Prepare, Event::Drain, Event::Bind, Event::RootDrop]
+    );
+    drop((handed.requester, handed.attachment));
+
+    let services = BootServices::new(0x8086, 0x1234, [0x01, 0x04, 0]);
+    let mut stop = super::super::VmdStop { profile: None };
+    // SAFETY: as above.
+    let Err((error, owner)) = (unsafe { hand_over(&services, ADDRESS, &mut stop) }) else {
+        panic!("an unlisted VMD device is refused");
+    };
+    assert!(matches!(
+        error,
+        crate::probe::Error::Vmd(crate::bus::vmd::Error::UnsupportedDevice)
+    ));
+    assert!(owner.is_some(), "the prepared function stays held");
+    drop(owner);
+    assert_eq!(services.events(), [Event::Prepare]);
+}

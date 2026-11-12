@@ -892,6 +892,48 @@ mod attach {
         shared.gpios.push((path, gpio.clone()));
         Ok(gpio)
     }
+
+    #[cfg(test)]
+    mod hand_over_tests {
+        use super::*;
+        use crate::probe::native::hand_over::tests::{ADDRESS, BootServices, Event};
+
+        /// An LPSS I2C controller through the shared hand-over: its profile
+        /// is chosen on admission and its BAR0 is asked for, to hold it in
+        /// reset before anything is drained; a controller no LPSS profile
+        /// lists is refused with its prepared function still held.
+        #[test]
+        fn an_lpss_i2c_controller_asks_for_its_bar_and_an_unlisted_one_is_refused() {
+            let services = BootServices::new(0x8086, 0xa368, [0x0c, 0x80, 0]);
+            let mut stop = LpssStop { profile: None };
+            // SAFETY: the services are this test's model.
+            let Err((_, owner)) =
+                (unsafe { native_hand_over::hand_over(&services, ADDRESS, &mut stop) })
+            else {
+                panic!("the model maps no BAR");
+            };
+            assert!(stop.profile.is_some());
+            assert!(owner.is_some());
+            drop(owner);
+            assert_eq!(services.events(), [Event::Prepare, Event::MapBar]);
+
+            let services = BootServices::new(0x8086, 0x1234, [0x0c, 0x80, 0]);
+            let mut stop = LpssStop { profile: None };
+            // SAFETY: as above.
+            let Err((error, owner)) =
+                (unsafe { native_hand_over::hand_over(&services, ADDRESS, &mut stop) })
+            else {
+                panic!("an unlisted controller is refused");
+            };
+            assert!(matches!(
+                error,
+                PlatformError::Lpss(crate::bus::lpss::Error::Unsupported)
+            ));
+            assert!(owner.is_some());
+            drop(owner);
+            assert_eq!(services.events(), [Event::Prepare]);
+        }
+    }
 }
 
 #[cfg(test)]
