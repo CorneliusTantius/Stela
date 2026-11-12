@@ -10,6 +10,7 @@ use alloc::string::String;
 use core::fmt;
 use stela_drivers::net::LinkError;
 
+pub mod dhcp;
 pub mod http;
 pub mod ranges;
 pub mod stack;

@@ -96,6 +96,22 @@ impl RootLink {
             crate::status::info(&format!("adapter {location}: {line}"));
         }
     }
+
+    /// Name in the log each DHCPv4 message a Wi-Fi link sent or received,
+    /// which tells a station that joined but got no lease from one that
+    /// never joined. Only the message type is logged: no network name,
+    /// address or key.
+    fn dhcp(&self, frame: &[u8], direction: &str) {
+        if !self.device.wireless() {
+            return;
+        }
+        if let Some(message) = stela_runtime::net::dhcp::message(frame) {
+            output::arguments(format_args!(
+                "NETWORK adapter {}: DHCP {message} {direction}\n",
+                self.device.location()
+            ));
+        }
+    }
 }
 
 impl Drop for RootLink {
@@ -123,6 +139,9 @@ impl Link for RootLink {
         let _root = unsafe { RestoreRoot::enter(self.root) };
         let sent = self.device.transmit(frame);
         self.report();
+        if sent.is_ok() {
+            self.dhcp(frame, "sent");
+        }
         sent
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
@@ -130,6 +149,9 @@ impl Link for RootLink {
         let _root = unsafe { RestoreRoot::enter(self.root) };
         let received = self.device.receive();
         self.report();
+        if let Ok(Some(frame)) = &received {
+            self.dhcp(frame, "received");
+        }
         received
     }
     fn receive_reusing(&mut self, frame: &mut Vec<u8>) -> Result<bool, LinkError> {
@@ -137,6 +159,9 @@ impl Link for RootLink {
         let _root = unsafe { RestoreRoot::enter(self.root) };
         let received = self.device.receive_reusing(frame);
         self.report();
+        if let Ok(true) = received {
+            self.dhcp(frame, "received");
+        }
         received
     }
     fn signals(&self) -> bool {
