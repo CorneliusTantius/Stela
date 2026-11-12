@@ -128,6 +128,9 @@ enum Consumer {
     /// extended word classifies as zero, as r8169's RTL9151AS check reads it.
     RealtekExtended,
     IntelRsa,
+    /// Intel's TLV boot loader (`btintel_bootloader_setup_tlv`), over USB
+    /// or PCIe.
+    IntelTlv,
     Wifi,
     Nouveau,
 }
@@ -376,6 +379,67 @@ pub const INTEL_RSA: &[Recipe] = &[
         license: &INTEL_LICENSE,
         consumer: Consumer::IntelRsa,
     },
+];
+
+/// The Bluetooth licence at the revision of the TLV images.
+const INTEL_TLV_LICENSE: Artifact = Artifact {
+    source: LINUX_FIRMWARE,
+    revision: WIFI_FIRMWARE_REVISION,
+    member: "LICENSES/LICENCE.ibt_firmware",
+    length: 2040,
+    sha256: "5181b0b51efc79d5acb2c9bb92042878fdbad97a92114d4ab5e32e2b5b52fce4",
+};
+const fn intel_tlv(member: &'static str, length: usize, sha256: &'static str) -> Recipe {
+    Recipe {
+        image: Artifact {
+            source: LINUX_FIRMWARE,
+            revision: WIFI_FIRMWARE_REVISION,
+            member,
+            length,
+            sha256,
+        },
+        license: &INTEL_TLV_LICENSE,
+        consumer: Consumer::IntelTlv,
+    }
+}
+/// The images Intel's TLV boot loader names from a controller's CNVi and
+/// CNVR tops (`btintel_get_fw_name_tlv`): the AX210 (`ibt-0041-0041`), the
+/// AX211 and AX201 CNVi (`ibt-0040-0041`) and the BE200 (`ibt-0291-0291`).
+/// Some names are links in linux-firmware; [`INTEL_TLV_LINKS`] resolves
+/// them to these members.
+pub const INTEL_TLV: &[Recipe] = &[
+    intel_tlv(
+        "intel/ibt-0041-0041.sfi",
+        713524,
+        "2e5f11ecc302e10dba51e9e07babef1b6d5c2a2359c695f1a23836552271d906",
+    ),
+    intel_tlv(
+        "intel/ibt-0040-0041.sfi",
+        721052,
+        "f14d059858623283f9e1bca3c9f5c5edc272cf538959d8f194327e3a9af5a75a",
+    ),
+    intel_tlv(
+        "intel/ibt-0040-0041.ddc",
+        9,
+        "fe272982577efdc289cfe3e8bedafca607c0b7d6c9df1aab1880e22ef930d077",
+    ),
+    intel_tlv(
+        "intel/ibt-0093-0291.sfi",
+        985652,
+        "2b4671c49992845877541e0d780bff77ea6f6a02134b5503d1b4531367397f0f",
+    ),
+    intel_tlv(
+        "intel/ibt-0093-0041.ddc",
+        4,
+        "e0fb10fe29f60607d6507ced3f697492d9611f62c4765feaee59c4bd4101d3e7",
+    ),
+];
+/// The names the TLV loader asks for that linux-firmware keeps as links,
+/// with the member each link resolves to.
+const INTEL_TLV_LINKS: &[(&str, &str)] = &[
+    ("intel/ibt-0041-0041.ddc", "intel/ibt-0040-0041.ddc"),
+    ("intel/ibt-0291-0291.sfi", "intel/ibt-0093-0291.sfi"),
+    ("intel/ibt-0291-0291.ddc", "intel/ibt-0093-0041.ddc"),
 ];
 
 const WIFI_FIRMWARE_LICENSE: Artifact = Artifact {
@@ -1197,6 +1261,36 @@ fn select_intel_rsa(request: &Request) -> Option<&'static Recipe> {
     })
 }
 
+/// The Intel TLV loader's request: an Intel USB or PCIe controller, its
+/// complete TLV identity bound as the revision, and the image the loader
+/// named from it, a link resolved to its member.
+fn select_intel_tlv(request: &Request, pcie: bool) -> Option<&'static Recipe> {
+    let fields: Vec<_> = request.target.hardware.split(':').collect();
+    let hardware = if pcie {
+        fields.len() == 5 && fields[0] == "pci" && fields[1] == "8086"
+    } else {
+        fields.len() == 4 && fields[0] == "usb" && fields[1] == "8087"
+    };
+    if !hardware || !fields[2..].iter().all(|field| hex_field(field, 4)) {
+        return None;
+    }
+    let digest = request
+        .target
+        .revision
+        .strip_prefix("tlv-v1:sha256:")
+        .or_else(|| request.target.revision.strip_prefix("tlv-iml-v1:sha256:"))?;
+    if !hex_field(digest, 64) {
+        return None;
+    }
+    let member = INTEL_TLV_LINKS
+        .iter()
+        .find(|(name, _)| *name == request.name)
+        .map_or(request.name.as_str(), |(_, member)| member);
+    INTEL_TLV
+        .iter()
+        .find(|recipe| recipe.image.member == member)
+}
+
 /// The pinned recipe for `request`'s exact name and target, if any.
 /// Board-specific requests and resources boot reads itself have none.
 pub fn recipe(request: &Request) -> Option<&'static Recipe> {
@@ -1206,6 +1300,8 @@ pub fn recipe(request: &Request) -> Option<&'static Recipe> {
     match request.target.driver.as_str() {
         "realtek" => select_realtek(request),
         "intel-bluetooth-usb-rsa" => select_intel_rsa(request),
+        "intel-bluetooth-usb-tlv" => select_intel_tlv(request, false),
+        "intel-bluetooth-pcie-tlv" => select_intel_tlv(request, true),
         "wifi-regulatory" => select_regulatory(request),
         "wifi-intel" => select_intel_wifi(request),
         "wifi-mt792x" => select_mediatek_wifi(request),
@@ -1697,6 +1793,100 @@ mod tests {
                 "{revision}"
             );
         }
+    }
+
+    fn bluetooth(driver: &str, name: &str, hardware: &str, revision: &str) -> Inventory {
+        let mut request = wifi_inventory(driver, name, hardware).requests()[0].clone();
+        request.target.revision = revision.into();
+        // A DDC file can be as short as 4 bytes.
+        request.minimum_bytes = 1;
+        let mut observed = Inventory::default();
+        observed.observe(request.view()).unwrap();
+        observed
+    }
+
+    /// Each TLV image an Intel controller names is pinned over USB and PCIe;
+    /// a name linux-firmware keeps as a link is served from its target, and
+    /// the licence is read at the images' own revision.
+    #[test]
+    fn intel_tlv_recipes_serve_each_name_and_resolve_links() {
+        let digest = "ab".repeat(32);
+        let live = format!("tlv-v1:sha256:{digest}");
+        let iml = format!("tlv-iml-v1:sha256:{digest}");
+        for (name, member) in [
+            ("intel/ibt-0041-0041.sfi", "intel/ibt-0041-0041.sfi"),
+            ("intel/ibt-0041-0041.ddc", "intel/ibt-0040-0041.ddc"),
+            ("intel/ibt-0040-0041.sfi", "intel/ibt-0040-0041.sfi"),
+            ("intel/ibt-0040-0041.ddc", "intel/ibt-0040-0041.ddc"),
+            ("intel/ibt-0291-0291.sfi", "intel/ibt-0093-0291.sfi"),
+            ("intel/ibt-0291-0291.ddc", "intel/ibt-0093-0041.ddc"),
+        ] {
+            for (driver, hardware, revision) in [
+                ("intel-bluetooth-usb-tlv", "usb:8087:0032:0000", &live),
+                ("intel-bluetooth-pcie-tlv", "pci:8086:a876:8086:0094", &iml),
+            ] {
+                let plan = Plan::select(&bluetooth(driver, name, hardware, revision)).unwrap();
+                let selection = &plan.selections[0];
+                assert_eq!(selection.request.name, name);
+                assert_eq!(selection.recipe.image.member, member);
+                assert_eq!(
+                    selection.recipe.license.member,
+                    "LICENSES/LICENCE.ibt_firmware"
+                );
+                assert_eq!(
+                    (
+                        selection.recipe.image.revision,
+                        selection.recipe.license.revision
+                    ),
+                    (WIFI_FIRMWARE_REVISION, WIFI_FIRMWARE_REVISION)
+                );
+            }
+        }
+        let name = "intel/ibt-0041-0041.sfi";
+        for (driver, hardware, revision) in [
+            (
+                "intel-bluetooth-usb-tlv",
+                "usb:0bda:0032:0000",
+                live.clone(),
+            ),
+            ("intel-bluetooth-usb-tlv", "usb:8087:0032", live.clone()),
+            (
+                "intel-bluetooth-usb-tlv",
+                "pci:8086:a876:8086:0094",
+                live.clone(),
+            ),
+            (
+                "intel-bluetooth-pcie-tlv",
+                "usb:8087:0032:0000",
+                live.clone(),
+            ),
+            (
+                "intel-bluetooth-usb-tlv",
+                "usb:8087:0032:0000",
+                "tlv-v1:sha256:ab".into(),
+            ),
+            (
+                "intel-bluetooth-usb-tlv",
+                "usb:8087:0032:0000",
+                digest.clone(),
+            ),
+        ] {
+            assert!(
+                Plan::select(&bluetooth(driver, name, hardware, &revision)).is_err(),
+                "{driver} {hardware} {revision}"
+            );
+        }
+        // A name no recipe pins, such as a member reached only as a link's
+        // target under a name the loader never asks for, is refused.
+        assert!(
+            Plan::select(&bluetooth(
+                "intel-bluetooth-usb-tlv",
+                "intel/ibt-0190-0291-usb.sfi",
+                "usb:8087:0037:0000",
+                &live
+            ))
+            .is_err()
+        );
     }
 
     #[test]

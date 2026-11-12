@@ -21,8 +21,8 @@ fn the_complete_bundle_holds_every_recipe_once_by_content() {
     assert_eq!(count, objects.len());
     // The RTL8168H and RTL8168M share a file, as the RTL9151A and RTL9151AS do.
     assert_eq!(count + 2, recipes().count());
-    // The recipes' recorded lengths: 79 files, 115.8 MiB.
-    assert_eq!((count, bytes), (79, 121_450_256), "{count} {bytes}");
+    // The recipes' recorded lengths: 84 files, 118.1 MiB.
+    assert_eq!((count, bytes), (84, 123_870_497), "{count} {bytes}");
     // The GPU's large images come last, for a volume short of room.
     assert_eq!(objects.last().unwrap().length, 63_571_696);
     let manifest = manifest(&complete()).unwrap();
@@ -78,7 +78,12 @@ fn members(selection: &Selection) -> Vec<&'static str> {
     members
 }
 
-const BLUETOOTH: [&str; 5] = [
+const BLUETOOTH: [&str; 10] = [
+    "intel/ibt-0040-0041.ddc",
+    "intel/ibt-0040-0041.sfi",
+    "intel/ibt-0041-0041.sfi",
+    "intel/ibt-0093-0041.ddc",
+    "intel/ibt-0093-0291.sfi",
     "intel/ibt-20-1-3.ddc",
     "intel/ibt-20-1-3.sfi",
     "mediatek/BT_RAM_CODE_MT7922_1_1_hdr.bin",
@@ -133,7 +138,7 @@ fn a_boot_selects_exactly_the_files_its_pci_functions_need() {
         "pci 10de:2c02"
     );
     // About the GSP image and the small files, not the whole bundle.
-    assert!(pc.bytes() < 70_000_000, "{}", pc.bytes());
+    assert!(pc.bytes() < 72_000_000, "{}", pc.bytes());
     // An AX210: its image and PNVM and the database.
     let ax210 = select(&[pci(0x8086, 0x2725, 0x02)]);
     let mut expected: Vec<&str> = BLUETOOTH.to_vec();
