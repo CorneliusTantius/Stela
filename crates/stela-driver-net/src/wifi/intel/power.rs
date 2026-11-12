@@ -546,6 +546,20 @@ pub fn read_silicon<C: Csr>(
     Ok(silicon)
 }
 
+/// The rest of what `_iwl_pci_probe` reads to choose a configuration after
+/// CSR_HW_REV, in its order: the early NIC access ([`read_silicon`]), then
+/// CSR_HW_RF_ID, only once the MAC is awake.
+pub fn read_radio<C: Csr>(
+    io: &mut C,
+    family: Family,
+    bisr: bool,
+    management: ManagementSession,
+) -> Result<(Silicon, u32), Error> {
+    let silicon = read_silicon(io, family, bisr, management)?;
+    let radio_id = io.read32(RF_ID)?;
+    Ok((silicon, radio_id))
+}
+
 pub struct Power<C: Csr> {
     nic: Nic<C>,
     profile: Profile,

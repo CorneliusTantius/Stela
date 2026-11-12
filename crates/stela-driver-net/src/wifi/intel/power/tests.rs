@@ -551,6 +551,34 @@ fn an_asleep_persistence_word_and_unkept_apm_bits_still_wake_the_mac() {
     ));
 }
 
+/// `_iwl_pci_probe` reads CSR_HW_RF_ID after `iwl_pcie_prepare_card_hw` and
+/// `iwl_trans_activate_nic`, never from a MAC still in reset.
+#[test]
+fn the_radio_id_is_read_once_the_mac_is_awake() {
+    for family in [Family::Ax200, Family::Ax210, Family::Bz] {
+        let mut model = Model::new(if family == Family::Ax200 {
+            Family::Ax200
+        } else {
+            Family::Ax210
+        });
+        let (_, radio) =
+            read_radio(&mut model, family, false, ManagementSession::NotConnected).unwrap();
+        assert_eq!(radio, model.registers[&RF_ID]);
+        let initialized = if family == Family::Bz { MAC_INIT } else { 4 };
+        let woken = model
+            .ops
+            .iter()
+            .position(|op| matches!(op, Op::Write(GP, value) if value & initialized != 0))
+            .unwrap();
+        let read = model
+            .ops
+            .iter()
+            .position(|op| *op == Op::Read(RF_ID))
+            .unwrap();
+        assert!(woken < read, "{family:?}");
+    }
+}
+
 #[test]
 fn the_early_access_reads_what_the_csrs_do_not_say() {
     let mut model = Model::new(Family::Ax210);

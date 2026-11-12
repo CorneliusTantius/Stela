@@ -24,8 +24,6 @@ use core::fmt;
 
 /// CSR_HW_REV.
 const HW_REV: u32 = 0x28;
-/// CSR_HW_RF_ID.
-const HW_RF_ID: u32 = 0x9c;
 
 /// The function's PCI identity from its configuration space.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -130,10 +128,10 @@ pub unsafe fn attach<Q: BootIo, B: BiosIo>(
     mut inputs: Inputs<B>,
 ) -> Result<Station<Q, B>, AttachError> {
     let hardware_revision = io.read32(HW_REV).map_err(AttachError::Register)?;
-    let radio_id = io.read32(HW_RF_ID).map_err(AttachError::Register)?;
     let (family, _) =
         identity::device(pci.device).ok_or(AttachError::Identity(IdentityError::UnsupportedPci))?;
-    let silicon = power::read_silicon(
+    // CSR_HW_RF_ID is read with the MAC awake, as `_iwl_pci_probe` reads it.
+    let (silicon, radio_id) = power::read_radio(
         &mut io,
         family,
         identity::bisr_workaround(pci.device),
