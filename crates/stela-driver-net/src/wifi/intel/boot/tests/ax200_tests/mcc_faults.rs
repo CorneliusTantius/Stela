@@ -59,10 +59,26 @@ fn mcc_failures_keep_evidence_and_owner() {
             // SAFETY: the fixture's `source` hands out fresh exclusive pages for its sole simulated
             // requester domain.
             let result = unsafe { mcc.advance(&source) };
+            if case == 2 {
+                // `iwl_bios_get_mcc`: a WRDD the platform cannot give is
+                // absent, and the firmware's current country stands.
+                result.unwrap();
+                assert!(mcc.first_error().is_none());
+                assert_eq!(
+                    mcc.bios_country(),
+                    Some(crate::wifi::intel::radio::lari::Observation::Unavailable)
+                );
+                assert!(mcc.platform_reads().iter().any(|read| read.incomplete()));
+                mcc.stop().unwrap();
+                drop(mcc);
+                assert!(domain.records.lock().unwrap().live.is_empty());
+                assert_eq!(drops.load(Ordering::Relaxed), 1);
+                assert_eq!(bios_drops.load(Ordering::Relaxed), 1);
+                continue;
+            }
             match case {
                 0 => assert!(matches!(result, Err(Ax200MccError::Schema(_)))),
                 1 => assert!(matches!(result, Err(Ax200MccError::ChannelInventory(_)))),
-                2 => assert!(matches!(result, Err(Ax200MccError::Platform(_)))),
                 3 => assert!(matches!(
                     result,
                     Err(Ax200MccError::Boot(Error::InitializationResponse { .. }))
@@ -71,11 +87,7 @@ fn mcc_failures_keep_evidence_and_owner() {
             }
             assert_eq!(mcc.responses().len(), 1);
             assert_eq!(mcc.responses()[0].raw, raw);
-            if case == 2 {
-                assert_eq!(mcc.profiles().len(), 1);
-            } else {
-                assert!(mcc.profiles().is_empty());
-            }
+            assert!(mcc.profiles().is_empty());
         }
         let original = mcc.first_error().unwrap().clone();
         let ops = state.lock().unwrap().ops.len();

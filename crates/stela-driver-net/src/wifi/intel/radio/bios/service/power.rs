@@ -360,57 +360,57 @@ impl<B: BiosIo> Session<B> {
         variable: Variable,
         uefi: fn(&[u8]) -> Option<(u8, T)>,
         acpi: fn(&Object) -> Option<(u8, T)>,
-    ) -> Result<Option<Selected<T>>, Error> {
-        if self.locked()?
-            && let Some(raw) = self.uefi(variable)?
+    ) -> Option<Selected<T>> {
+        if self.locked()
+            && let Some(raw) = self.uefi(variable)
             && let Some((revision, value)) = uefi(&raw)
         {
-            return Ok(Some(Selected {
+            return Some(Selected {
                 source: lari::Source::Uefi,
                 revision,
                 value,
-            }));
+            });
         }
-        if let Some(object) = self.acpi(Request::PowerTable(variable))?
+        if let Some(object) = self.acpi(Request::PowerTable(variable))
             && let Some((revision, value)) = acpi(&object)
         {
-            return Ok(Some(Selected {
+            return Some(Selected {
                 source: lari::Source::Acpi,
                 revision,
                 value,
-            }));
+            });
         }
-        Ok(None)
+        None
     }
-    pub(crate) fn power_tables(&mut self) -> Result<Tables, Error> {
-        let ppag = self.selected_table(Variable::Ppag, uefi_ppag, acpi_ppag)?;
-        let mut sar = self.selected_table(Variable::Wrds, uefi_sar, acpi_sar)?;
+    pub(crate) fn power_tables(&mut self) -> Tables {
+        let ppag = self.selected_table(Variable::Ppag, uefi_ppag, acpi_ppag);
+        let mut sar = self.selected_table(Variable::Wrds, uefi_sar, acpi_sar);
         if let Some(sar) = sar.as_mut()
             && let Some(extended) =
-                self.selected_table(Variable::Ewrd, uefi_extended_sar, acpi_extended_sar)?
+                self.selected_table(Variable::Ewrd, uefi_extended_sar, acpi_extended_sar)
         {
             sar.value.profiles[1..].copy_from_slice(&extended.value);
         }
         // Source also observes WGDS without WRDS for diagnostics. AX200 API77
         // is newer than the source's serial>=38 geo-support threshold.
-        let geo = self.selected_table(Variable::Wgds, uefi_geo, acpi_geo)?;
+        let geo = self.selected_table(Variable::Wgds, uefi_geo, acpi_geo);
         let sgom = if let Some(geo) = &geo {
-            self.uefi(Variable::Sgom)?
+            self.uefi(Variable::Sgom)
                 .as_deref()
                 .and_then(|raw| power_tables::CountryMap::parse(raw).ok())
                 .and_then(|table| table.sgom(geo.value.count).ok())
         } else {
             None
         };
-        let tas = self.selected_table(Variable::Wtas, uefi_tas, acpi_tas)?;
+        let tas = self.selected_table(Variable::Wtas, uefi_tas, acpi_tas);
         let map = |raw: Option<_>| {
             raw.as_deref()
                 .and_then(|raw| power_tables::CountryMap::parse(raw).ok())
                 .and_then(|table| table.raw_map().try_into().ok())
         };
-        let ap_types = map(self.uefi(Variable::Uats)?);
-        let unii9_ap_types = map(self.uefi(Variable::Uneb)?);
-        Ok(Tables {
+        let ap_types = map(self.uefi(Variable::Uats));
+        let unii9_ap_types = map(self.uefi(Variable::Uneb));
+        Tables {
             ppag,
             sar,
             geo,
@@ -418,7 +418,7 @@ impl<B: BiosIo> Session<B> {
             sgom,
             ap_types,
             unii9_ap_types,
-        })
+        }
     }
 }
 
@@ -601,13 +601,13 @@ mod tests {
         }
     }
     #[test]
-    fn selection_reads_same_session_uefi_then_acpi_and_incomplete_never_means_absent() {
+    fn selection_reads_same_session_uefi_then_acpi_and_an_unreadable_variable_is_absent() {
         for uefi_valid in [false, true] {
             let mut session = Session::new(Namespace {
                 incomplete: false,
                 uefi_valid,
             });
-            let tables = session.power_tables().unwrap();
+            let tables = session.power_tables();
             let sar = tables.sar.unwrap();
             assert_eq!(
                 sar.source,
@@ -634,13 +634,19 @@ mod tests {
             incomplete: true,
             uefi_valid: false,
         });
+        // `iwl_bios_get_wrds_table`: the UEFI table it cannot read gives way
+        // to the ACPI one, as an absent one does.
+        let sar = session.power_tables().sar.unwrap();
+        assert_eq!(sar.source, lari::Source::Acpi);
+        let reads = session.reads();
+        let unread = reads
+            .iter()
+            .find(|r| matches!(r, Read::Uefi(Variable::Wrds, _)))
+            .unwrap();
         assert_eq!(
-            session.power_tables(),
-            Err(Error::IncompleteUefi(Variable::Wrds, IoError::Unavailable))
+            unread,
+            &Read::Uefi(Variable::Wrds, Err(IoError::Unavailable))
         );
-        assert!(matches!(
-            session.reads().last(),
-            Some(Read::Uefi(Variable::Wrds, Err(IoError::Unavailable)))
-        ));
+        assert!(unread.incomplete());
     }
 }

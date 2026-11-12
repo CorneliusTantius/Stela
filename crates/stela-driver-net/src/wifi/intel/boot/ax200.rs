@@ -67,7 +67,6 @@ pub enum Ax200SetupPhase {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ax200SetupError {
     Boot(Error),
-    Platform(service::Error),
     Control(control::Error),
     QueueLayout,
     AuxiliaryStationRequired,
@@ -213,13 +212,9 @@ impl<Q: BootIo, B: BiosIo> Ax200Setup<'_, Q, B> {
             dqa_command: dqa.is_some(),
             firmware_ltr: fw.supports_capability(50),
         });
-        // Resolve the ECKV source before any new firmware publication;
-        // a missing native service leaves the entire request unpublished.
-        let clock = self
-            .lari
-            .bios
-            .external_clock()
-            .map_err(Ax200SetupError::Platform)?;
+        // Resolve the ECKV source before any new firmware publication; one
+        // the platform cannot give is absent, as `iwl_bios_get_eckv` leaves it.
+        let clock = self.lari.bios.external_clock();
         let power = Control::device_power(
             &self.lari.radio.initialized.boot.firmware,
             self.options.power_mode,

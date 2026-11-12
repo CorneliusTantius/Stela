@@ -19,7 +19,6 @@ pub enum Ax200MccPhase {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ax200MccError {
     Boot(Error),
-    Platform(service::Error),
     Schema(mcc::Error),
     ChannelInventory(mcc::channel::InventoryMismatch),
     LarUnsupported,
@@ -207,12 +206,7 @@ impl<Q: BootIo, B: BiosIo> Ax200Mcc<'_, Q, B> {
                     if self.phase == Ax200MccPhase::WaitingCurrent {
                         let fw = &self.setup.lari.radio.initialized.boot.firmware;
                         if fw.supports_api(9) || fw.supports_capability(29) {
-                            let country = self
-                                .setup
-                                .lari
-                                .bios
-                                .country()
-                                .map_err(Ax200MccError::Platform)?;
+                            let country = self.setup.lari.bios.country();
                             self.bios_country = Some(country);
                             if let Observation::Observed(value) = country {
                                 self.request = Some(mcc::Request {

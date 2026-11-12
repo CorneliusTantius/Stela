@@ -31,6 +31,16 @@ pub(super) fn power_variable(case: u8, variable: Variable) -> Result<Vec<u8>, se
             raw.extend([0x31; 338]);
             raw
         }
+        // Case 11's block list is full.
+        Variable::Wtas if case == 11 => {
+            let mut raw = vec![1];
+            raw.extend(0x10007u32.to_le_bytes());
+            raw.push(16);
+            for country in 0..16u16 {
+                raw.extend((0x4100 + country).to_le_bytes());
+            }
+            raw
+        }
         Variable::Wtas => {
             let mut raw = vec![1];
             raw.extend(0x10007u32.to_le_bytes());
@@ -86,7 +96,7 @@ fn ax200_board_schema_and_native_owner() {
     exercise(true);
 }
 fn exercise(actual: bool) {
-    for case in 0..11u8 {
+    for case in 0..12u8 {
         let bytes = if actual {
             use sha2::{Digest, Sha256};
             let root = std::env::var("STELA_IWLWIFI_IMAGES").unwrap();
@@ -115,7 +125,7 @@ fn exercise(actual: bool) {
         let mut options = Ax200SetupOptions::new(Clock {
             ticks_per_microsecond: 1_000_000,
         });
-        if case >= 9 {
+        if case == 9 || case == 10 {
             options.clock.ticks_per_microsecond = 1;
             options.command_timeout_us = 1;
         }
@@ -168,9 +178,6 @@ fn exercise(actual: bool) {
             assert!(board.commands().is_empty());
             assert!(board.responses().is_empty());
             assert_eq!(state.lock().unwrap().registers[&0x460], bell_before);
-        } else if case == 2 || case == 3 {
-            assert!(matches!(result, Err(Ax200BoardPolicyError::Platform(_))));
-            assert_eq!(state.lock().unwrap().registers[&0x460], bell_before);
         } else if case == 6 {
             assert_eq!(result, Err(Ax200BoardPolicyError::Boot(Error::RfKilled)));
         } else if case == 7 {
@@ -180,7 +187,28 @@ fn exercise(actual: bool) {
             ));
         } else {
             result.unwrap();
-            let expected = if case == 4 {
+            // Case 2's WRDS cannot be read, so it is absent: no SAR and, as
+            // `iwl_mvm_sar_init` does, no geo table without it. Case 3's
+            // SMBIOS cannot be read, so it matches no vendor, as case 4's
+            // unlisted vendor does.
+            if matches!(case, 2 | 3) {
+                assert!(board.platform_reads().iter().any(|read| read.incomplete()));
+            }
+            let expected = if case == 2 {
+                vec![
+                    BoardCommandKind::Ppag,
+                    BoardCommandKind::Sgom,
+                    BoardCommandKind::Tas,
+                ]
+            } else if case == 11 {
+                // `iwl_mvm_tas_init`: an unlisted vendor's full block list
+                // has no room for US and Canada, so TAS stays off.
+                vec![
+                    BoardCommandKind::Sar,
+                    BoardCommandKind::Geo,
+                    BoardCommandKind::Sgom,
+                ]
+            } else if case == 4 || case == 3 {
                 vec![
                     BoardCommandKind::Sar,
                     BoardCommandKind::Geo,
@@ -314,7 +342,10 @@ fn exercise(actual: bool) {
                 sequence += 1;
                 entry += 1;
             }
-            if case == 0 || case == 4 {
+            if case == 11 {
+                assert_eq!(board.phase(), Ax200BoardPolicyPhase::CountryRequired);
+            }
+            if matches!(case, 0 | 3 | 4) {
                 assert_eq!(board.phase(), Ax200BoardPolicyPhase::CountryRequired);
                 assert_eq!(board.responses().len(), expected.len());
                 let sar = board
@@ -329,7 +360,7 @@ fn exercise(actual: bool) {
                 let tas = board.commands().last().unwrap();
                 assert_eq!(
                     u32::from_le_bytes(tas.bytes()[..4].try_into().unwrap()),
-                    if case == 4 { 3 } else { 1 }
+                    if case == 0 { 1 } else { 3 }
                 );
             }
         }

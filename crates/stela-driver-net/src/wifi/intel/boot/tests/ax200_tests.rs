@@ -16,7 +16,9 @@ pub(super) struct ClockBios {
 // SAFETY: the original exact namespace model plus a real modeled EFI ECKV read.
 unsafe impl BiosIo for ClockBios {
     fn evaluate(&mut self, request: Request) -> Result<Object, IoError> {
-        if let Request::PowerTable(_) = request {
+        // The namespace has no power tables, ECKV or WRDD methods: what
+        // the EFI variables leave out stays absent.
+        if let Request::PowerTable(_) | Request::ExternalClock | Request::Country = request {
             return Err(IoError::NotFound);
         }
         self.inner.evaluate(request)
@@ -55,7 +57,14 @@ unsafe impl BiosIo for ClockBios {
         match self.board_case {
             Some(3) | None => Err(IoError::Unavailable),
             case => Ok(service::DmiIdentity {
-                system_vendor: Some(if case == Some(4) { "Example" } else { "HP" }.into()),
+                system_vendor: Some(
+                    if matches!(case, Some(4 | 11)) {
+                        "Example"
+                    } else {
+                        "HP"
+                    }
+                    .into(),
+                ),
                 board_vendor: None,
             }),
         }

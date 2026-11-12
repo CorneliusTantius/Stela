@@ -135,11 +135,11 @@ fn locked_uefi_cache_never_fills_missing_functions_from_copied_acpi() {
         scenario: 2 + 3 * 8 + 3 * 64,
     }); // locked, valid UEFI with empty bitmap
     assert_eq!(
-        session.observe(lari::Input::Dsm(4)).unwrap(),
+        session.observe(lari::Input::Dsm(4)),
         lari::Observation::Unavailable
     );
     assert_eq!(
-        session.observe(lari::Input::Dsm(1)).unwrap(),
+        session.observe(lari::Input::Dsm(1)),
         lari::Observation::Unavailable
     );
     assert_eq!(session.reads().len(), 2);
@@ -153,7 +153,7 @@ fn locked_uefi_cache_never_fills_missing_functions_from_copied_acpi() {
     let mut session = Session::new(Model {
         scenario: 2 + 2 * 8 + 3 * 64,
     });
-    let value = session.observe(lari::Input::Dsm(2)).unwrap();
+    let value = session.observe(lari::Input::Dsm(2));
     assert!(matches!(
         value,
         lari::Observation::Observed(lari::Value {
@@ -163,7 +163,7 @@ fn locked_uefi_cache_never_fills_missing_functions_from_copied_acpi() {
         })
     ));
     let reads = session.reads().len();
-    assert_eq!(session.observe(lari::Input::Dsm(2)).unwrap(), value);
+    assert_eq!(session.observe(lari::Input::Dsm(2)), value);
     assert_eq!(session.reads().len(), reads);
 }
 #[derive(Clone)]
@@ -193,8 +193,11 @@ unsafe impl BiosIo for Missing {
         .variable(variable)
     }
 }
+/// `iwl_acpi_get_object` and `iwl_uefi_get_variable`: whatever keeps a read
+/// from answering, the value is absent and selection carries on as it does
+/// without it. The session still records that the read was incomplete.
 #[test]
-fn incomplete_service_or_collection_never_becomes_policy_absence() {
+fn an_incomplete_service_or_collection_reads_as_absent() {
     for error in [IoError::Unavailable, IoError::BoundExceeded] {
         for (request, variable, input) in [
             (Some(Request::Glai), None, lari::Input::Dsm(4)),
@@ -215,11 +218,15 @@ fn incomplete_service_or_collection_never_becomes_policy_absence() {
                 variable,
                 error,
             });
-            assert!(session.observe(input).is_err());
-            assert!(session.reads().iter().any(|r| match r {
-                Read::Acpi(_, Err(e)) | Read::Uefi(_, Err(e)) => *e == error,
-                _ => false,
-            }));
+            let mut absent = Session::new(Missing {
+                request,
+                variable,
+                error: IoError::NotFound,
+            });
+            assert_eq!(session.observe(input), absent.observe(input));
+            assert_eq!(call_ids(session.reads()), call_ids(absent.reads()));
+            assert!(session.reads().iter().any(Read::incomplete));
+            assert!(!absent.reads().iter().any(Read::incomplete));
         }
     }
     let mut session = Session::new(Missing {
@@ -229,7 +236,7 @@ fn incomplete_service_or_collection_never_becomes_policy_absence() {
     });
     // Source failure defaults GLAI to unlocked and can exhaust the
     // ACPI path. The exact failure remains in the original reads.
-    session.observe(lari::Input::Dsm(4)).unwrap();
+    session.observe(lari::Input::Dsm(4));
     assert_eq!(
         session.reads()[0],
         Read::Acpi(Request::Glai, Err(IoError::Failed(0x1234)))
@@ -267,7 +274,7 @@ fn unchanged_linux_bios_selection_cache_and_complete_raw_call_order() {
         } else {
             lari::Input::Dsm(f[1] as u8)
         };
-        let result = session.observe(input).unwrap();
+        let result = session.observe(input);
         match result {
             lari::Observation::Observed(value) => {
                 assert_eq!(f[2], 1, "{line}");
@@ -327,56 +334,38 @@ unsafe impl BiosIo for ClockModel {
     }
 }
 #[test]
-fn clock_selection_requires_source() {
+fn clock_selection_requires_source_and_takes_an_unread_one_as_absent() {
     for scenario in 0..8 {
         let mut session = Session::new(ClockModel(scenario));
         let result = session.external_clock();
-        if scenario == 2 || scenario == 3 {
-            assert_eq!(
-                result,
-                Err(Error::IncompleteUefi(
-                    Variable::Eckv,
-                    if scenario == 2 {
-                        IoError::Unavailable
-                    } else {
-                        IoError::BoundExceeded
-                    }
-                ))
-            );
-            assert_eq!(session.reads().len(), 2);
-        } else if scenario == 5 {
-            assert_eq!(
-                result,
-                Err(Error::IncompleteAcpi(
-                    Request::ExternalClock,
-                    IoError::Unavailable
-                ))
-            );
-        } else {
-            let expected = match scenario {
-                0 => lari::Observation::Observed(lari::Value {
-                    value: 2,
-                    source: lari::Source::Uefi,
-                    revision: 0,
-                }),
-                6 | 7 => lari::Observation::Unavailable,
-                _ => lari::Observation::Observed(lari::Value {
-                    value: 1,
-                    source: lari::Source::Acpi,
-                    revision: 0,
-                }),
-            };
-            assert_eq!(result, Ok(expected));
-            let count = session.reads().len();
-            assert_eq!(session.external_clock(), Ok(expected));
-            assert_eq!(session.reads().len(), count);
-            assert_eq!(count, if scenario == 0 || scenario == 4 { 2 } else { 3 });
-            if scenario == 4 {
-                assert!(matches!(
-                    session.reads()[1],
-                    Read::Acpi(Request::ExternalClock, _)
-                ));
-            }
+        let expected = match scenario {
+            0 => lari::Observation::Observed(lari::Value {
+                value: 2,
+                source: lari::Source::Uefi,
+                revision: 0,
+            }),
+            5..=7 => lari::Observation::Unavailable,
+            _ => lari::Observation::Observed(lari::Value {
+                value: 1,
+                source: lari::Source::Acpi,
+                revision: 0,
+            }),
+        };
+        assert_eq!(result, expected, "{scenario}");
+        let count = session.reads().len();
+        assert_eq!(session.external_clock(), expected);
+        assert_eq!(session.reads().len(), count);
+        assert_eq!(count, if scenario == 0 || scenario == 4 { 2 } else { 3 });
+        assert_eq!(
+            session.reads().iter().any(Read::incomplete),
+            matches!(scenario, 2 | 3 | 5),
+            "{scenario}"
+        );
+        if scenario == 4 {
+            assert!(matches!(
+                session.reads()[1],
+                Read::Acpi(Request::ExternalClock, _)
+            ));
         }
     }
 }
@@ -408,12 +397,12 @@ unsafe impl BiosIo for CountryModel {
     }
 }
 #[test]
-fn bios_country_accepts_only_cn_and_never_converts_missing_service_into_absence() {
+fn bios_country_accepts_only_cn_and_takes_an_unread_one_as_absent() {
     for scenario in 0..6 {
         let mut session = Session::new(CountryModel(scenario));
         let result = session.country();
         let expected = match scenario {
-            0 | 1 => Ok(lari::Observation::Observed(lari::Value {
+            0..=2 => lari::Observation::Observed(lari::Value {
                 value: 0x434e,
                 source: if scenario == 0 {
                     lari::Source::Uefi
@@ -421,20 +410,16 @@ fn bios_country_accepts_only_cn_and_never_converts_missing_service_into_absence(
                     lari::Source::Acpi
                 },
                 revision: 0,
-            })),
-            2 => Err(Error::IncompleteUefi(Variable::Wrdd, IoError::Unavailable)),
-            3 | 5 => Ok(lari::Observation::Unavailable),
-            4 => Err(Error::IncompleteAcpi(
-                Request::Country,
-                IoError::Unavailable,
-            )),
-            _ => unreachable!(),
+            }),
+            _ => lari::Observation::Unavailable,
         };
-        assert_eq!(result, expected);
-        if result.is_ok() {
-            let reads = session.reads().len();
-            assert_eq!(session.country(), expected);
-            assert_eq!(session.reads().len(), reads);
-        }
+        assert_eq!(result, expected, "{scenario}");
+        assert_eq!(
+            session.reads().iter().any(Read::incomplete),
+            matches!(scenario, 2 | 4)
+        );
+        let reads = session.reads().len();
+        assert_eq!(session.country(), expected);
+        assert_eq!(session.reads().len(), reads);
     }
 }

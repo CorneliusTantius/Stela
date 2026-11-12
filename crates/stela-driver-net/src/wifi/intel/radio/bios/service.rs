@@ -33,7 +33,8 @@ pub enum Object {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IoError {
     /// The platform service has not been implemented or cannot be called now.
-    /// This is never a BIOS absence and must prevent command publication.
+    /// The session records it as such and, as Linux does for any failed
+    /// read, goes on as if the value were absent.
     Unavailable,
     /// A collection bound prevented a complete observation.
     BoundExceeded,
@@ -82,11 +83,27 @@ pub enum Read {
     Uefi(Variable, Result<Vec<u8>, IoError>),
     Dmi(Result<DmiIdentity, IoError>),
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Error {
-    IncompleteAcpi(Request, IoError),
-    IncompleteUefi(Variable, IoError),
-    IncompleteDmi(IoError),
+impl Read {
+    /// Whether this read left its value unknown rather than absent: a service
+    /// that could not answer or an answer past its bound. Like every other
+    /// failed read, Linux takes it as an absent value.
+    pub fn incomplete(&self) -> bool {
+        match self {
+            Self::Acpi(_, Err(error)) | Self::Uefi(_, Err(error)) | Self::Dmi(Err(error)) => {
+                error.incomplete()
+            }
+            Self::Uefi(_, Ok(raw)) => raw.len() > MAX_VARIABLE,
+            Self::Dmi(Ok(identity)) => oversized(identity),
+            _ => false,
+        }
+    }
+}
+/// The largest EFI variable this session takes.
+const MAX_VARIABLE: usize = 4096;
+fn oversized(identity: &DmiIdentity) -> bool {
+    [&identity.system_vendor, &identity.board_vendor]
+        .into_iter()
+        .any(|vendor| vendor.as_ref().is_some_and(|v| v.len() > MAX_VARIABLE))
 }
 #[derive(Clone, Copy)]
 struct Cache {
@@ -114,40 +131,35 @@ impl<B: BiosIo> Session<B> {
             country: None,
         }
     }
-    pub(crate) fn dmi_identity(&mut self) -> Result<DmiIdentity, Error> {
+    /// The SMBIOS vendors, as `dmi_match` sees them: one it cannot read
+    /// matches no vendor.
+    pub(crate) fn dmi_identity(&mut self) -> DmiIdentity {
         let result = self.io.dmi_identity();
         self.reads.push(Read::Dmi(result.clone()));
-        // Any failure is incomplete identity, not an invented unapproved board.
-        let identity = result.map_err(Error::IncompleteDmi)?;
-        if identity
-            .system_vendor
-            .as_ref()
-            .is_some_and(|v| v.len() > 4096)
-            || identity
-                .board_vendor
-                .as_ref()
-                .is_some_and(|v| v.len() > 4096)
-        {
-            return Err(Error::IncompleteDmi(IoError::BoundExceeded));
+        match result {
+            Ok(identity) if !oversized(&identity) => identity,
+            _ => DmiIdentity {
+                system_vendor: None,
+                board_vendor: None,
+            },
         }
-        Ok(identity)
     }
     pub(crate) fn reads(&self) -> &[Read] {
         &self.reads
     }
     /// Source ECKV selection in this session's original namespace.
     /// Missing services are incomplete observations, not an absent clock.
-    pub(crate) fn external_clock(&mut self) -> Result<lari::Observation, Error> {
+    pub(crate) fn external_clock(&mut self) -> lari::Observation {
         if let Some(observation) = self.external_clock {
-            return Ok(observation);
+            return observation;
         }
         let observation = self.scalar(
             ScalarKind::ExternalClock,
             Variable::Eckv,
             Request::ExternalClock,
-        )?;
+        );
         self.external_clock = Some(observation);
-        Ok(observation)
+        observation
     }
     /// Source WRDD permits CN only. This records a BIOS observation, never
     /// location/OS permission or an override of a firmware response.
@@ -157,30 +169,30 @@ impl<B: BiosIo> Session<B> {
         const REVISION: u8 = 0;
         const MASK: u32 = 3;
         match self.uefi(Variable::Puncturing) {
-            Ok(Some(raw)) if raw.first() == Some(&REVISION) => raw
+            Some(raw) if raw.first() == Some(&REVISION) => raw
                 .get(1..5)
                 .and_then(|value| value.try_into().ok())
                 .map_or(0, |value| u32::from_le_bytes(value) & MASK),
             _ => 0,
         }
     }
-    pub(crate) fn country(&mut self) -> Result<lari::Observation, Error> {
+    pub(crate) fn country(&mut self) -> lari::Observation {
         if let Some(observation) = self.country {
-            return Ok(observation);
+            return observation;
         }
-        let observation = self.scalar(ScalarKind::Country, Variable::Wrdd, Request::Country)?;
+        let observation = self.scalar(ScalarKind::Country, Variable::Wrdd, Request::Country);
         self.country = Some(observation);
-        Ok(observation)
+        observation
     }
     fn scalar(
         &mut self,
         kind: ScalarKind,
         variable: Variable,
         request: Request,
-    ) -> Result<lari::Observation, Error> {
+    ) -> lari::Observation {
         let mut value = None;
-        if self.locked()?
-            && let Some(raw) = self.uefi(variable)?
+        if self.locked()
+            && let Some(raw) = self.uefi(variable)
             && let Ok(scalar) = Scalar::parse(kind, &raw)
         {
             value = Some(lari::Value {
@@ -190,7 +202,7 @@ impl<B: BiosIo> Session<B> {
             });
         }
         if value.is_none()
-            && let Some((0, raw)) = self.acpi(request)?.as_ref().and_then(wifi_value)
+            && let Some((0, raw)) = self.acpi(request).as_ref().and_then(wifi_value)
             && (kind != ScalarKind::Country || raw as u32 == 0x434e)
         {
             value = Some(lari::Value {
@@ -199,46 +211,39 @@ impl<B: BiosIo> Session<B> {
                 revision: 0,
             });
         }
-        Ok(value.map_or(lari::Observation::Unavailable, lari::Observation::Observed))
+        value.map_or(lari::Observation::Unavailable, lari::Observation::Observed)
     }
-    fn acpi(&mut self, request: Request) -> Result<Option<Object>, Error> {
+    /// `iwl_acpi_get_object`: an object that fails to evaluate, for any
+    /// reason, is absent.
+    fn acpi(&mut self, request: Request) -> Option<Object> {
         let result = self.io.evaluate(request);
         self.reads.push(Read::Acpi(request, result.clone()));
-        match result {
-            Ok(object) => Ok(Some(object)),
-            Err(e) if e.incomplete() => Err(Error::IncompleteAcpi(request, e)),
-            Err(_) => Ok(None),
-        }
+        result.ok()
     }
-    fn uefi(&mut self, variable: Variable) -> Result<Option<Vec<u8>>, Error> {
+    /// `iwl_uefi_get_variable`: a variable that cannot be read, or is larger
+    /// than any table, is absent.
+    fn uefi(&mut self, variable: Variable) -> Option<Vec<u8>> {
         let result = self.io.variable(variable);
         self.reads.push(Read::Uefi(variable, result.clone()));
-        match result {
-            Ok(raw) if raw.len() > 4096 => {
-                Err(Error::IncompleteUefi(variable, IoError::BoundExceeded))
-            }
-            Ok(raw) => Ok(Some(raw)),
-            Err(e) if e.incomplete() => Err(Error::IncompleteUefi(variable, e)),
-            Err(_) => Ok(None),
-        }
+        result.ok().filter(|raw| raw.len() <= MAX_VARIABLE)
     }
-    fn locked(&mut self) -> Result<bool, Error> {
+    fn locked(&mut self) -> bool {
         if let Some(locked) = self.locked {
-            return Ok(locked);
+            return locked;
         }
         let locked = self
-            .acpi(Request::Glai)?
+            .acpi(Request::Glai)
             .as_ref()
             .and_then(wifi_value)
             .is_some_and(|(revision, status)| revision == 0 && (1..=2).contains(&status));
         self.locked = Some(locked);
-        Ok(locked)
+        locked
     }
-    fn load_uefi(&mut self) -> Result<(), Error> {
+    fn load_uefi(&mut self) {
         if self.cache.is_some() {
-            return Ok(());
+            return;
         }
-        if let Some(raw) = self.uefi(Variable::GeneralConfiguration)?
+        if let Some(raw) = self.uefi(Variable::GeneralConfiguration)
             && let Ok(table) = GeneralConfiguration::parse(&raw)
         {
             self.cache = Some(Cache {
@@ -248,11 +253,10 @@ impl<B: BiosIo> Session<B> {
                 revision: 4,
             });
         }
-        Ok(())
     }
-    fn load_acpi(&mut self) -> Result<(), Error> {
+    fn load_acpi(&mut self) {
         if self.cache.is_some() {
-            return Ok(());
+            return;
         }
         let mut cache = Cache {
             values: [0; 15],
@@ -261,7 +265,7 @@ impl<B: BiosIo> Session<B> {
             revision: 0,
         };
         if let Some(query) = self
-            .acpi(Request::Dsm(0))?
+            .acpi(Request::Dsm(0))
             .as_ref()
             .and_then(|o| integer(o, 4))
         {
@@ -272,7 +276,7 @@ impl<B: BiosIo> Session<B> {
                 }
                 let size = if index <= 2 { 1 } else { 4 };
                 if let Some(value) = self
-                    .acpi(Request::Dsm(index))?
+                    .acpi(Request::Dsm(index))
                     .as_ref()
                     .and_then(|o| integer(o, size))
                 {
@@ -284,18 +288,17 @@ impl<B: BiosIo> Session<B> {
             }
         }
         self.cache = Some(cache);
-        Ok(())
     }
-    pub(crate) fn observe(&mut self, input: lari::Input) -> Result<lari::Observation, Error> {
-        let locked = self.locked()?;
+    pub(crate) fn observe(&mut self, input: lari::Input) -> lari::Observation {
+        let locked = self.locked();
         let result = match input {
             lari::Input::Dsm(index) => {
                 if locked {
-                    self.load_uefi()?;
+                    self.load_uefi();
                 }
                 // Linux shares this cache between both paths: a valid UEFI
                 // cache with a missing function cannot trigger fresh AML reads.
-                self.load_acpi()?;
+                self.load_acpi();
                 let cache = self.cache.as_ref().unwrap();
                 (index < 15 && index != 5 && cache.valid & (1 << index) != 0).then(|| lari::Value {
                     value: cache.values[usize::from(index)],
@@ -306,7 +309,7 @@ impl<B: BiosIo> Session<B> {
             lari::Input::WideBandwidth => {
                 let mut value = None;
                 if locked
-                    && let Some(raw) = self.uefi(Variable::Wbem)?
+                    && let Some(raw) = self.uefi(Variable::Wbem)
                     && let Ok(scalar) = Scalar::parse(ScalarKind::WideBandwidth, &raw)
                 {
                     value = Some(lari::Value {
@@ -317,7 +320,7 @@ impl<B: BiosIo> Session<B> {
                 }
                 if value.is_none()
                     && let Some((0, raw)) = self
-                        .acpi(Request::WideBandwidth)?
+                        .acpi(Request::WideBandwidth)
                         .as_ref()
                         .and_then(wifi_value)
                 {
@@ -330,7 +333,7 @@ impl<B: BiosIo> Session<B> {
                 value
             }
         };
-        Ok(result.map_or(lari::Observation::Unavailable, lari::Observation::Observed))
+        result.map_or(lari::Observation::Unavailable, lari::Observation::Observed)
     }
 }
 fn integer(object: &Object, size: usize) -> Option<u64> {

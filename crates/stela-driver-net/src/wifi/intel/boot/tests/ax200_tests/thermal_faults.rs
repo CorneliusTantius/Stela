@@ -49,8 +49,18 @@ fn thermal_power_errors_remain_sticky_and_uncertain_dma_keeps_both_owners() {
         let result = unsafe { setup.advance(&source) };
         match case {
             0 => {
-                assert!(matches!(result, Err(Ax200SetupError::Platform(_))));
-                assert_eq!(state.lock().unwrap().ops.len(), before);
+                // `iwl_bios_get_eckv`: a clock source the platform cannot give
+                // is absent, and the power command goes out without it.
+                result.unwrap();
+                assert!(state.lock().unwrap().ops.len() > before);
+                assert!(setup.first_error().is_none());
+                assert!(setup.platform_reads().iter().any(|read| read.incomplete()));
+                setup.stop().unwrap();
+                drop(setup);
+                assert!(domain.records.lock().unwrap().live.is_empty());
+                assert_eq!(drops.load(Ordering::Relaxed), 1);
+                assert_eq!(bios_drops.load(Ordering::Relaxed), 1);
+                continue;
             }
             1 => assert_eq!(result, Err(Ax200SetupError::Boot(Error::RfKilled))),
             2 => {

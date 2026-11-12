@@ -1070,6 +1070,17 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
     ) -> Result<Stage<Q, B>, (Error, Box<dyn Kept>)> {
         // `iwl_mvm_init_mcc` leaves the BIOS country, else the current one.
         let firmware = board.profiles().last().map(|profile| profile.country);
+        // Every BIOS read of this boot is behind the board policy. Linux
+        // takes one that could not answer as an absent table.
+        if board
+            .platform_reads()
+            .iter()
+            .any(super::radio::bios::service::Read::incomplete)
+        {
+            self.client.unsupported(
+                "the platform's Wi-Fi ACPI or UEFI settings it could not read: the radio runs without them",
+            );
+        }
         let Some(database) = self.database.take() else {
             return Err((Error::Refused("country"), board));
         };

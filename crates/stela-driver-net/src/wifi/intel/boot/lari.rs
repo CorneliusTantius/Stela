@@ -22,7 +22,6 @@ pub enum LariPhase {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LariError {
     Boot(Error),
-    Platform(service::Error),
     Plan(lari::Error),
 }
 /// Keeps both the initialized radio epoch and the BIOS service owner.
@@ -130,7 +129,7 @@ impl<Q: BootIo, B: BiosIo> LariRadio<'_, Q, B> {
                         break;
                     }
                     Err(lari::Error::NotObserved(input)) => {
-                        let value = self.bios.observe(input).map_err(LariError::Platform)?;
+                        let value = self.bios.observe(input);
                         match input {
                             lari::Input::Dsm(index) => self.inputs.dsm[usize::from(index)] = value,
                             lari::Input::WideBandwidth => self.inputs.wide_bandwidth = value,

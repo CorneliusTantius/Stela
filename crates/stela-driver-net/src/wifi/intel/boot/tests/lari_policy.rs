@@ -71,18 +71,6 @@ fn lari_schema_missing_services_rfkill_and_uncertain_command_keep_original_owner
                 );
                 assert!(lari.platform_reads().is_empty());
             }
-            1 => {
-                use crate::wifi::intel::radio::bios::service::{
-                    Error as BiosError, IoError, Request,
-                };
-                assert_eq!(
-                    result,
-                    Err(LariError::Platform(BiosError::IncompleteAcpi(
-                        Request::Glai,
-                        IoError::Unavailable
-                    )))
-                );
-            }
             2 => assert_eq!(result, Err(LariError::Boot(Error::RfKilled))),
             3 => {
                 result.unwrap();
@@ -132,7 +120,13 @@ fn lari_schema_missing_services_rfkill_and_uncertain_command_keep_original_owner
             5 => {
                 result.unwrap();
             }
-            6 => {
+            // `iwl_acpi_get_object`: an ACPI namespace that cannot answer
+            // reads as one without the objects, so LARI sends nothing.
+            1 | 6 => {
+                assert_eq!(
+                    lari.platform_reads().iter().any(|read| read.incomplete()),
+                    case == 1
+                );
                 assert_eq!(result, Ok(LariPhase::RxQueueConfigurationRequired));
                 assert_eq!(lari.plan().unwrap().commands().count(), 0);
                 assert!(lari.responses().is_empty());
@@ -141,7 +135,7 @@ fn lari_schema_missing_services_rfkill_and_uncertain_command_keep_original_owner
             }
             _ => unreachable!(),
         }
-        if case <= 1 {
+        if case == 0 {
             assert_eq!(state.lock().unwrap().ops.len(), ops);
             assert_eq!(source.calls.load(Ordering::Relaxed), allocations);
         }
@@ -161,7 +155,7 @@ fn lari_schema_missing_services_rfkill_and_uncertain_command_keep_original_owner
         } else {
             assert_eq!(
                 lari.phase(),
-                if case == 6 {
+                if case == 1 || case == 6 {
                     LariPhase::RxQueueConfigurationRequired
                 } else {
                     LariPhase::Failed

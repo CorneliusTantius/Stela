@@ -229,9 +229,8 @@ pub(super) fn prepare(
         }
         commands.push(command(BoardCommandKind::Sar, SAR_COMMAND, bytes));
     }
-    if tables.sar.is_none() && tables.geo.is_some() {
-        return Err(Ax200BoardPolicyError::GeoWithoutSar);
-    }
+    // `iwl_mvm_sar_init` only logs a WGDS without WRDS, and sends no geo
+    // table without the SAR one.
     if sar_enabled && let Some(table) = &tables.geo {
         let v = version(fw, GEO_COMMAND)?;
         let (profiles, bands, has_revision) = match v {
@@ -277,50 +276,55 @@ pub(super) fn prepare(
             return Err(unsupported(BoardCommandKind::Tas, v));
         }
         if table.value.selection & 1 != 0 || v == 5 {
-            let identity = identity.ok_or(Ax200BoardPolicyError::State)?;
-            let mut countries = table.value.countries.clone();
-            if !tas_approved(identity) {
-                for country in [u16::from_be_bytes(*b"US"), u16::from_be_bytes(*b"CA")] {
-                    if !countries.contains(&country) {
-                        if countries.len() == 16 {
-                            return Err(Ax200BoardPolicyError::TasBlockListFull);
+            'tas: {
+                let identity = identity.ok_or(Ax200BoardPolicyError::State)?;
+                let mut countries = table.value.countries.clone();
+                if !tas_approved(identity) {
+                    for country in [u16::from_be_bytes(*b"US"), u16::from_be_bytes(*b"CA")] {
+                        if !countries.contains(&country) {
+                            if countries.len() == 16 {
+                                // `iwl_mvm_tas_init`: with no room to block US
+                                // and Canada, TAS stays off.
+                                break 'tas;
+                            }
+                            countries.push(country);
                         }
-                        countries.push(country);
                     }
                 }
+                let mut bytes = alloc::vec![0; if v == 2 { 68 } else if v == 5 { 44 } else { 72 }];
+                if v == 5 {
+                    bytes[..2].copy_from_slice(&(countries.len() as u16).to_le_bytes());
+                    for (i, value) in countries.iter().enumerate() {
+                        bytes[2 + i * 2..4 + i * 2].copy_from_slice(&value.to_le_bytes());
+                    }
+                    bytes[36] = source(table.source);
+                    bytes[37] = table.revision;
+                    bytes[40..44].copy_from_slice(&table.value.selection.to_le_bytes());
+                } else {
+                    bytes[..4].copy_from_slice(&(countries.len() as u32).to_le_bytes());
+                    for (i, value) in countries.iter().enumerate() {
+                        bytes[4 + i * 4..8 + i * 4]
+                            .copy_from_slice(&u32::from(*value).to_le_bytes());
+                    }
+                    let selection = table.value.selection;
+                    let override_iec = table.revision > 0 && selection & 2 != 0;
+                    let enable_iec = table.revision > 0 && selection & 4 != 0;
+                    if v == 3 {
+                        bytes[68..70].copy_from_slice(&u16::from(override_iec).to_le_bytes());
+                        bytes[70..72].copy_from_slice(&u16::from(enable_iec).to_le_bytes());
+                    } else if v == 4 {
+                        bytes[68] = u8::from(override_iec);
+                        bytes[69] = u8::from(enable_iec);
+                        bytes[70] = u8::from(table.revision > 0 && selection & (1 << 16) != 0);
+                        bytes[71] = u8::from(
+                            fw.supports_capability(CANADA_TAS_CAPABILITY)
+                                && table.revision > 1
+                                && selection & (1 << 15) != 0,
+                        );
+                    }
+                }
+                commands.push(command(BoardCommandKind::Tas, TAS_COMMAND, bytes));
             }
-            let mut bytes = alloc::vec![0; if v == 2 { 68 } else if v == 5 { 44 } else { 72 }];
-            if v == 5 {
-                bytes[..2].copy_from_slice(&(countries.len() as u16).to_le_bytes());
-                for (i, value) in countries.iter().enumerate() {
-                    bytes[2 + i * 2..4 + i * 2].copy_from_slice(&value.to_le_bytes());
-                }
-                bytes[36] = source(table.source);
-                bytes[37] = table.revision;
-                bytes[40..44].copy_from_slice(&table.value.selection.to_le_bytes());
-            } else {
-                bytes[..4].copy_from_slice(&(countries.len() as u32).to_le_bytes());
-                for (i, value) in countries.iter().enumerate() {
-                    bytes[4 + i * 4..8 + i * 4].copy_from_slice(&u32::from(*value).to_le_bytes());
-                }
-                let selection = table.value.selection;
-                let override_iec = table.revision > 0 && selection & 2 != 0;
-                let enable_iec = table.revision > 0 && selection & 4 != 0;
-                if v == 3 {
-                    bytes[68..70].copy_from_slice(&u16::from(override_iec).to_le_bytes());
-                    bytes[70..72].copy_from_slice(&u16::from(enable_iec).to_le_bytes());
-                } else if v == 4 {
-                    bytes[68] = u8::from(override_iec);
-                    bytes[69] = u8::from(enable_iec);
-                    bytes[70] = u8::from(table.revision > 0 && selection & (1 << 16) != 0);
-                    bytes[71] = u8::from(
-                        fw.supports_capability(CANADA_TAS_CAPABILITY)
-                            && table.revision > 1
-                            && selection & (1 << 15) != 0,
-                    );
-                }
-            }
-            commands.push(command(BoardCommandKind::Tas, TAS_COMMAND, bytes));
         }
     }
     if six_ghz

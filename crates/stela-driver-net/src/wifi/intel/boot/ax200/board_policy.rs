@@ -46,12 +46,9 @@ pub enum Ax200BoardPolicyPhase {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Ax200BoardPolicyError {
     Boot(Error),
-    Platform(service::Error),
     MissingApi { group: u8, command: u8 },
     Version { kind: BoardCommandKind, version: u8 },
     PpagGain { chain: u8, band: u8, gain: i8 },
-    GeoWithoutSar,
-    TasBlockListFull,
     Deadline(BoardCommandKind),
     State,
 }
@@ -134,27 +131,12 @@ impl<Q: BootIo, B: BiosIo> Ax200BoardPolicy<'_, Q, B> {
     }
     fn prepare(&mut self) -> Result<(), Ax200BoardPolicyError> {
         // These are real same-session reads, never copied caller observations.
-        let tables = self
-            .scan
-            .mcc
-            .setup
-            .lari
-            .bios
-            .power_tables()
-            .map_err(Ax200BoardPolicyError::Platform)?;
+        let tables = self.scan.mcc.setup.lari.bios.power_tables();
         self.tables = Some(tables);
         let fw = &self.scan.mcc.setup.lari.radio.initialized.boot.firmware;
         let tables = self.tables.as_ref().unwrap();
         let identity = if commands::needs_identity(fw, tables) {
-            Some(
-                self.scan
-                    .mcc
-                    .setup
-                    .lari
-                    .bios
-                    .dmi_identity()
-                    .map_err(Ax200BoardPolicyError::Platform)?,
-            )
+            Some(self.scan.mcc.setup.lari.bios.dmi_identity())
         } else {
             None
         };
