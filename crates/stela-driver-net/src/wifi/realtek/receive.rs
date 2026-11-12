@@ -26,9 +26,7 @@ pub enum Error {
     Removed,
     Index(u16),
     InitialIndices,
-    Tag { expected: u16, observed: u16 },
     Quarantined,
-    Packet(ParseError),
 }
 impl From<beacon::Error> for Error {
     fn from(e: beacon::Error) -> Self {
@@ -181,6 +179,12 @@ pub struct Ring<R: Registers> {
     configured: bool,
     used: bool,
     poisoned: bool,
+    /// Descriptors `rtw_rx_query_rx_desc` refuses or `rtw_pci_rx_napi` finds
+    /// oversized, which rtw88 skips and rearms.
+    dropped: u32,
+    /// Buffers whose tag was not the one expected: rtw88's "pci bus timeout,
+    /// check dma status" warning, after which it takes the frame anyway.
+    tag_slips: u32,
 }
 impl<R: Registers> Ring<R> {
     /// # Safety
@@ -227,6 +231,8 @@ impl<R: Registers> Ring<R> {
             configured: false,
             used: false,
             poisoned: true,
+            dropped: 0,
+            tag_slips: 0,
         };
         for i in 0..COUNT {
             ring.reset_descriptor(i)?;
@@ -259,6 +265,14 @@ impl<R: Registers> Ring<R> {
     }
     pub fn expected_tag(&self) -> u16 {
         self.tag
+    }
+    /// Descriptors skipped as rtw88 skips them, since installation.
+    pub fn dropped(&self) -> u32 {
+        self.dropped
+    }
+    /// Tags out of step, which rtw88 only warns of, since installation.
+    pub fn tag_slips(&self) -> u32 {
+        self.tag_slips
     }
     fn reset_descriptor(&mut self, index: usize) -> Result<(), Error> {
         self.buffers[index]
@@ -320,11 +334,10 @@ impl<R: Registers> Ring<R> {
                 .map_err(beacon::Error::from)?;
             // SAFETY: `address` bounds this aligned u16 inside the synced descriptor.
             let observed = u16::from_le(unsafe { pointer.as_ptr().cast::<u16>().read_volatile() });
+            // rtw_pci_dma_check: a tag out of step is warned of, and the
+            // frame is still taken, with the expected tag counting on.
             if observed != self.tag {
-                return Err(Error::Tag {
-                    expected: self.tag,
-                    observed,
-                });
+                self.tag_slips = self.tag_slips.saturating_add(1);
             }
             // SAFETY: the same producer advance hands this descriptor's buffer to the CPU.
             unsafe { self.buffers[index].dma.sync_for_cpu(0..BUFFER) }
@@ -337,7 +350,12 @@ impl<R: Registers> Ring<R> {
             // after hardware completion/visibility; callback borrow ends before
             // descriptor/payload rearm or any new hardware ownership transfer.
             let bytes = unsafe { core::slice::from_raw_parts(pointer.as_ptr(), BUFFER) };
-            receive(parse(bytes).map_err(Error::Packet)?);
+            // rtw_pci_rx_napi skips what rtw_rx_query_rx_desc refuses and
+            // what would overrun its buffer, and rearms the slot.
+            match parse(bytes) {
+                Ok(packet) => receive(packet),
+                Err(_) => self.dropped = self.dropped.saturating_add(1),
+            }
             self.reset_descriptor(index)?;
             self.descriptor
                 .dma

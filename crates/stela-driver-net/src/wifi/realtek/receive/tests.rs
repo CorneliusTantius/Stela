@@ -226,10 +226,9 @@ fn native_iovas_visibility_budget_wrap_and_tag_wrap_match_device_ownership() {
 }
 #[test]
 fn adverse_completion_errors_never_release_pins_or_claim_a_frame() {
-    for mode in 0..8 {
+    for mode in 2..8 {
         let mut h = Harness::new();
-        let tag = if mode == 0 { 9 } else { 0 };
-        h.complete(1, tag, &packet(if mode == 1 { 4 } else { 64 }));
+        h.complete(1, 0, &packet(64));
         match mode {
             2 => h.device.lock().unwrap().consumer = 1,
             3 => h.device.lock().unwrap().producer = 512,
@@ -252,6 +251,48 @@ fn adverse_completion_errors_never_release_pins_or_claim_a_frame() {
         assert_eq!(h.device.lock().unwrap().drops, 0);
         assert_eq!(h.memory.lock().unwrap().mappings.len(), 513);
     }
+}
+#[test]
+fn what_rtw88_drops_or_only_warns_of_leaves_the_ring_running() {
+    let mut h = Harness::new();
+    let good = packet(64);
+    // A slot whose tag is out of step: "pci bus timeout", and the frame is taken.
+    h.complete(1, 9, &good);
+    // Descriptors rtw_rx_query_rx_desc refuses: an FCS alone, a rate past
+    // DESC_RATE_MAX, a driver info size other than the PHY status's, and PHY
+    // status with no driver info.
+    let mut refused = Vec::new();
+    for w0 in [4u32, 64 | (1 << 16), 64 | (1 << 26)] {
+        let mut bytes = packet(64);
+        bytes[..4].copy_from_slice(&w0.to_le_bytes());
+        refused.push(bytes);
+    }
+    let mut rate = packet(64);
+    rate[12] = 0x54;
+    refused.push(rate);
+    for (at, bytes) in refused.iter().enumerate() {
+        h.complete(1, h.ring.expected_tag() + 1 + at as u16, bytes);
+    }
+    h.complete(1, h.ring.expected_tag() + 5, &good);
+    let mut payloads = Vec::new();
+    assert_eq!(
+        h.ring
+            .poll(usize::MAX, |p| payloads.push(p.payload.to_vec()))
+            .unwrap(),
+        6
+    );
+    assert_eq!(payloads, [good[24..].to_vec(), good[24..].to_vec()]);
+    assert_eq!((h.ring.tag_slips(), h.ring.dropped()), (1, 4));
+    assert!(!h.ring.quarantined());
+    assert_eq!(h.device.lock().unwrap().consumer, 6);
+    // Every slot was rearmed, and the expected tag counted on through them.
+    assert_eq!(h.ring.expected_tag(), 6);
+    for index in 0..6 {
+        assert_eq!(&h.descriptor(index)[..4], &[214, 44, 0, 0]);
+    }
+    h.complete(1, 6, &good);
+    assert_eq!(h.ring.poll(1, |_| {}).unwrap(), 1);
+    assert_eq!((h.ring.tag_slips(), h.ring.dropped()), (1, 4));
 }
 #[test]
 fn configuration_publish_unmap_and_callback_uncertainty_keep_owner() {
