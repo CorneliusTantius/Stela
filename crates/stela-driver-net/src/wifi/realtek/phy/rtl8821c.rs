@@ -3,11 +3,12 @@
 //! The RTL8821C's PHY as `rtw8821c.c` sets it: `rtw8821c_phy_set_param` with
 //! the chip's tables on path A, and `rtw8821c_set_channel`.
 use super::{
-    Attempt, Error, Kind, Report,
+    Attempt, Error, FactoryPower, Kind, Report,
     channel::{self, primary_index},
-    channel_power::{Geometry, Width},
+    channel_power::{self, Geometry, Plan, Width},
     walk,
 };
+use crate::wifi::realtek::chip::Txagc;
 use crate::wifi::realtek::{
     efuse::Board,
     identity::{Chip, Profile},
@@ -105,6 +106,8 @@ pub struct Phy {
     cck_pd_default: u8,
     /// `dm_info->default_ofdm_index`.
     default_ofdm_index: u8,
+    /// The board's factory power tables.
+    power: FactoryPower,
 }
 
 impl Phy {
@@ -128,6 +131,40 @@ impl Phy {
     }
     pub fn default_ofdm_index(&self) -> u8 {
         self.default_ofdm_index
+    }
+    pub fn factory_power(&self) -> &FactoryPower {
+        &self.power
+    }
+    /// `rtw8821c_set_tx_power_index` for `plan`.
+    ///
+    /// # Safety
+    /// The Io and report of the boot this PHY came from, with nothing else
+    /// reaching the BB, and `plan` made for the channel just set.
+    pub unsafe fn program_channel_power<I: Io>(
+        &self,
+        io: &mut I,
+        report: &Report,
+        plan: &Plan,
+    ) -> Result<(), Error> {
+        if io.profile() != self.profile || report.profile() != self.profile {
+            return Err(Error::WrongProfile);
+        }
+        if !plan.of(&self.power) {
+            return Err(Error::ChannelPower(channel_power::Error::WrongBoard));
+        }
+        let Some(Txagc::Absolute { base }) = self.profile.rtw88().map(|spec| spec.txagc) else {
+            return Err(Error::WrongProfile);
+        };
+        let mut a = Attempt {
+            io,
+            profile: self.profile,
+            done: false,
+        };
+        a.domain()?;
+        channel_power::program_absolute(&mut a, plan, base)?;
+        a.domain()?;
+        a.done = true;
+        Ok(())
     }
 }
 
@@ -205,6 +242,7 @@ pub async unsafe fn phy_set_param<I: Io>(
         return Err(Error::UnsupportedRfLayout);
     }
     let condition = condition(profile, board, rfe);
+    let power = FactoryPower::prepare(board).map_err(Error::BoardPower)?;
     // Every selected stream is checked before the first write.
     for (table, kind) in tables(rfe) {
         walk(condition, table, |a, v| super::check(kind, a, v))?;
@@ -264,6 +302,7 @@ pub async unsafe fn phy_set_param<I: Io>(
         igi,
         cck_pd_default,
         default_ofdm_index,
+        power,
     })
 }
 

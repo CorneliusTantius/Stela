@@ -59,6 +59,27 @@ pub struct Rtw88 {
     pub rf_sipi: [u32; 2],
     /// `write_rf`.
     pub rf_write: RfWrite,
+    /// `txgi_factor`: TX power index steps a half dB holds.
+    pub txgi_factor: u8,
+    /// `max_power_index`.
+    pub max_power_index: u8,
+    /// `is_pwr_by_rate_dec`: by-rate tables hold BCD.
+    pub power_by_rate_bcd: bool,
+    /// `en_dis_dpd`: the rates sent without predistortion lose 3 dB.
+    pub dpd_rates: bool,
+    /// How `set_tx_power_index` writes the rates' indices.
+    pub txagc: Txagc,
+}
+
+/// A chip's `set_tx_power_index`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Txagc {
+    /// `rtw8822c_set_tx_power_index`: each path's CCK and OFDM reference,
+    /// and every rate as its difference from them, both paths in one word.
+    Differential,
+    /// `rtw8821c_set_tx_power_index`: each rate's index, four to a word,
+    /// from each path's base.
+    Absolute { base: [u32; 2] },
 }
 
 /// A chip's `write_rf`.
@@ -146,6 +167,11 @@ pub static RTL8822C: Spec = Spec {
         rf_base: [0x3c00, 0x4c00],
         rf_sipi: [0x1808, 0x4108],
         rf_write: RfWrite::Mix,
+        txgi_factor: 2,
+        max_power_index: 0x7f,
+        power_by_rate_bcd: false,
+        dpd_rates: true,
+        txagc: Txagc::Differential,
     }),
 };
 
@@ -186,6 +212,13 @@ pub static RTL8821C: Spec = Spec {
         rf_base: [0x2800, 0x2c00],
         rf_sipi: [0xc90, 0xe90],
         rf_write: RfWrite::Sipi,
+        txgi_factor: 1,
+        max_power_index: 0x3f,
+        power_by_rate_bcd: true,
+        dpd_rates: false,
+        txagc: Txagc::Absolute {
+            base: [0x1d00, 0x1d80],
+        },
     }),
 };
 

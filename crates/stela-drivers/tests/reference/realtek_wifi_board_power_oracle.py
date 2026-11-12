@@ -64,6 +64,19 @@ for body,name,ty in [(pg,'PG','u32'),(lmt0,'LIMIT0','i16'),(lmt5,'LIMIT5','i16')
  rust+='pub(super) const '+name+': &[[ '+ty+'; 6]] = &[\n'+''.join('    ['+', '.join(str(v)for v in row)+'],\n'for row in rows)+'];\n'
  manifest.append(dict(export=name,rows=len(rows)))
 data=out/'data.rs';data.write_text(rust);subprocess.run(['rustfmt','--edition','2024',str(data)],check=True)
+# The RTL8821C's PG and its one limit table, compared byte for byte with the
+# committed module.
+pg_8821c=array('rtw8821c_table.c','rtw8821c_bb_pg_type0');lmt_8821c=array('rtw8821c_table.c','rtw8821c_txpwr_lmt_type0')
+rust_8821c='// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause\n// Copyright(c) 2018-2019 Realtek Corporation\n// Factory power reference data from pinned rtw8821c_table.c; no OS authority.\n//! RTL8821C factory power-reference tables from rtw8821c_table.c.\n'
+for body,name,ty in [(pg_8821c,'PG','u32'),(lmt_8821c,'LIMIT0','i16')]:
+ rows=[]
+ for row in re.findall(r'\{([^{}]+)\}',body):
+  values=[int(v.strip(),0)for v in row.split(',')if v.strip()];assert len(values)==6;rows.append(values)
+ rust_8821c+='pub(super) const '+name+': &[[ '+ty+'; 6]] = &[\n'+''.join('    ['+', '.join(str(v)for v in row)+'],\n'for row in rows)+'];\n'
+ manifest.append(dict(export='8821c '+name,rows=len(rows)))
+data_8821c=out/'data_8821c.rs';data_8821c.write_text(rust_8821c);subprocess.run(['rustfmt','--edition','2024',str(data_8821c)],check=True)
+native_8821c=pathlib.Path(__file__).resolve().parents[3]/'stela-driver-net/src/wifi/realtek/phy/board_power/data_8821c.rs'
+assert data_8821c.read_bytes()==native_8821c.read_bytes(),'committed RTL8821C power tables differ from the pinned source export'
 macros='\n'.join(macro('main.h',n)for n in ['RTW_RF_PATH_MAX','RTW_CHANNEL_WIDTH_MAX','RTW_MAX_CHANNEL_NUM_2G','RTW_MAX_CHANNEL_NUM_5G'])
 declarations='\n'.join(extract(f,n,k)for f,n,k in [('main.h','rtw_rate_section','enum'),('main.h','rtw_bandwidth','enum'),('main.h','rtw_trx_desc_rate','enum'),('main.h','rtw_regulatory_domains','enum'),('phy.c','rtw_phy_band_type','enum'),('phy.h','rtw_phy_pg_cfg_pair','struct'),('phy.h','rtw_txpwr_lmt_cfg_pair','struct'),('regd.c','rtw_regd_alternative_t','struct')])
 rates=span('phy.c','const u8 rtw_cck_rates[]','\nenum rtw_phy_band_type','all source rate/section/size arrays')

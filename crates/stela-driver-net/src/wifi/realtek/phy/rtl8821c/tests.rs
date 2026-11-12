@@ -15,6 +15,12 @@ pub(crate) fn board(rfe: u8) -> Board {
     bytes[0xc6] = 3;
     bytes[0xc7] = 6;
     bytes[0xd0..0xd6].copy_from_slice(&[2, 3, 4, 5, 6, 7]);
+    // Path A's indices: CCK 40, 2.4 GHz BW40 42, 5 GHz BW40 38, no
+    // differences.
+    bytes[0x10..0xb8].fill(0);
+    bytes[0x10..0x16].fill(40);
+    bytes[0x16..0x1b].fill(42);
+    bytes[0x22..0x30].fill(38);
     Logical::of(profile, bytes).board()
 }
 
@@ -193,4 +199,68 @@ fn china_takes_the_srrc_cck_filter_and_btg_boards_the_btg_switch() {
         .map(|(_, v)| v)
         .collect();
     assert_eq!(srrc[srrc.len() - 4..], [0x27, 0x27, 0x29, 0x26]);
+}
+
+#[test]
+fn tx_power_reads_bcd_by_rate_and_writes_absolute_indices() {
+    use crate::wifi::realtek::phy::{FactoryBand, FactorySheet, channel_power::Limits};
+    let (mut r, phy, report) = set_up(0);
+    let power = phy.factory_power();
+    // rtw8821c_bb_pg_type0's first row, 0x32343638 in BCD: 1M at 38 over
+    // 11M's 32.
+    assert_eq!(
+        power
+            .reference(FactoryBand::Ghz2, 0, 0)
+            .unwrap()
+            .quarter_dbm(),
+        32
+    );
+    assert_eq!(
+        power.rate_delta(FactoryBand::Ghz2, 0, 0).unwrap().steps(),
+        6
+    );
+    // FCC's CCK limit on channel 1 is 30, 2 under the reference.
+    assert_eq!(
+        power
+            .sheet_delta(FactorySheet::Fcc, FactoryBand::Ghz2, 0, 0, 1)
+            .unwrap()
+            .steps(),
+        -2
+    );
+    let g = Geometry::new(1, Width::Mhz20, None, None).unwrap();
+    let limits = Limits {
+        factory_sheet: FactorySheet::Fcc,
+        max_eirp_mbm: 3000,
+        antenna_and_combining_mbm: [600; 2],
+        sar_quarter_dbm: None,
+        remnant_cck: 0,
+        remnant_ofdm: [0; 2],
+    };
+    let plan = power.plan_channel_power(g, limits).unwrap();
+    // 40 plus the lowest of 6, -2 and 24 - 8 steps of EIRP room.
+    assert_eq!(plan.gain(0, 0), Some(38));
+    assert_eq!(plan.gain(1, 0), None);
+    r.writes.clear();
+    // SAFETY: the register file belongs to this test alone.
+    unsafe { phy.program_channel_power(&mut r, &report, &plan) }.unwrap();
+    let written: alloc::vec::Vec<_> = r
+        .writes
+        .iter()
+        .filter(|w| (0x1d00..0x1e00).contains(&w.1))
+        .map(|w| w.1)
+        .collect();
+    assert_eq!(
+        written,
+        [
+            0x1d00, 0x1d04, 0x1d08, 0x1d0c, 0x1d10, 0x1d2c, 0x1d30, 0x1d34
+        ]
+    );
+    assert_eq!(r.get(0x1d00, 1), 38);
+    for register in written {
+        for byte in r.get(register, 4).to_le_bytes() {
+            assert!(byte <= 0x3f);
+        }
+    }
+    // VHT 1SS MCS8 and MCS9 alone in the last word.
+    assert_eq!(r.get(0x1d34, 4) >> 16, 0);
 }

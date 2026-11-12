@@ -4,7 +4,9 @@
 //! No source sheet, fallback/default lookup seed or raw OTP selects OS country,
 //! radio channel or regulatory/EIRP/TX permission.
 mod data;
+mod data_8821c;
 use super::{Board, Profile};
+use crate::wifi::realtek::{chip::Rtw88, identity::Chip};
 use alloc::vec::Vec;
 const CHANNELS_5G: [u8; 49] = [
     36, 38, 40, 42, 44, 46, 48, 52, 54, 56, 58, 60, 62, 64, 100, 102, 104, 106, 108, 110, 112, 116,
@@ -233,15 +235,26 @@ impl FactoryPower {
     }
     pub(super) fn prepare(board: &Board) -> Result<Self, Error> {
         let rfe = board.raw().rfe_raw;
-        if rfe > 6 {
+        let profile = board.profile();
+        let spec = profile.rtw88().ok_or(Error::UnsupportedRfe(rfe))?;
+        if !spec.rfe_options.contains(&rfe) {
             return Err(Error::UnsupportedRfe(rfe));
         }
-        Self::from_tables(
-            board,
-            rfe,
-            data::PG,
-            if rfe == 5 { data::LIMIT5 } else { data::LIMIT0 },
-        )
+        // The chip's `rfe_defs`: its PG table and the RFE's limit table.
+        let (pg, limits) = match profile.chip() {
+            Chip::Rtl8821C => (data_8821c::PG, data_8821c::LIMIT0),
+            _ if rfe == 5 => (data::PG, data::LIMIT5),
+            _ => (data::PG, data::LIMIT0),
+        };
+        Self::from_tables(board, rfe, pg, limits)
+    }
+    /// The chip facts the tables are read with.
+    pub(super) fn spec(&self) -> &'static Rtw88 {
+        self.profile.rtw88().expect("prepared for an rtw88 chip")
+    }
+    /// `max_power_index`.
+    pub fn max_index(&self) -> u8 {
+        self.spec().max_power_index
     }
     fn from_tables(
         board: &Board,
@@ -268,6 +281,8 @@ impl FactoryPower {
                 return Err(Error::InvalidTable);
             }
         }
+        let spec = board.profile().rtw88().ok_or(Error::InvalidTable)?;
+        let max = spec.max_power_index as i8;
         let mut out = Self {
             profile: board.profile(),
             rfe,
@@ -282,13 +297,19 @@ impl FactoryPower {
             limit
                 .try_reserve_exact(len)
                 .map_err(|_| Error::Allocation)?;
-            limit.resize(len, 127);
+            limit.resize(len, max);
         }
         for &[band, path, _tx, address, _mask, value] in pg {
             let first = pg_first_rate(address).ok_or(Error::InvalidTable)?;
             for i in 0..4 {
-                out.by_rate[band as usize][path as usize][first + i] =
-                    (value >> (i * 8)) as u8 as i8;
+                let byte = (value >> (i * 8)) as u8;
+                // tbl_to_dec_pwr_by_rate.
+                let byte = if spec.power_by_rate_bcd {
+                    (byte >> 4) * 10 + (byte & 15)
+                } else {
+                    byte
+                };
+                out.by_rate[band as usize][path as usize][first + i] = byte as i8;
             }
         }
         let mut present = 0u16;
@@ -301,7 +322,7 @@ impl FactoryPower {
             );
             present |= 1 << sheet;
             let ch = channel_index(band, channel as u8).ok_or(Error::InvalidTable)?;
-            let value = (value as i8).clamp(-127, 127);
+            let value = (value as i8).clamp(-max, max);
             out.limits[band][index(band, sheet, width, section, ch)] = value;
             let world = index(band, WORLD, width, section, ch);
             out.limits[band][world] = out.limits[band][world].min(value);
@@ -326,9 +347,9 @@ impl FactoryPower {
                         let v = index(1, sheet, width, vht, ch);
                         let (hv, vv) = (out.limits[1][h], out.limits[1][v]);
                         if hv != vv {
-                            if hv == 127 {
+                            if hv == max {
                                 out.limits[1][h] = vv;
-                            } else if vv == 127 {
+                            } else if vv == max {
                                 out.limits[1][v] = hv;
                             }
                         }

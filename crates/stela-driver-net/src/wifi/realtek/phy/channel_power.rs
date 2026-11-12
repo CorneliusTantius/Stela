@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // Copyright(c) 2018-2021 Realtek Corporation
-//! RTL8822C calibrated channel/rate gains and source TXAGC programming.
-//! Calculations are observations, not OS/location, antenna or SAR permission.
+//! Calibrated channel/rate gains (`rtw_phy_get_tx_power_index`) and the
+//! chip's TXAGC programming. Calculations are observations, not
+//! OS/location, antenna or SAR permission.
 use super::{Attempt, FactoryBand, FactoryPower, FactorySheet, Io, PhyInitialized, Report};
+use crate::wifi::realtek::chip::Txagc;
 
 const SECTIONS: [(u8, u8); 6] = [(0, 4), (4, 8), (12, 8), (20, 8), (44, 10), (54, 10)];
-const MAX_GAIN: i32 = 127;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Error {
     Geometry,
@@ -143,6 +144,7 @@ pub struct Limits {
 #[derive(Debug)]
 pub struct Plan {
     profile: super::Profile,
+    paths: u8,
     rfe: u8,
     nvm: [u8; 168],
     geometry: Geometry,
@@ -151,6 +153,12 @@ pub struct Plan {
     words: [u32; 12],
 }
 impl Plan {
+    /// Whether the plan was made from `power`'s board.
+    pub(super) fn of(&self, power: &FactoryPower) -> bool {
+        self.profile == power.profile()
+            && self.rfe == power.rfe()
+            && &self.nvm == power.raw_gain_calibration()
+    }
     pub fn geometry(&self) -> Geometry {
         self.geometry
     }
@@ -160,7 +168,7 @@ impl Plan {
     /// Only two-path hardware sections are present; 5 GHz CCK and
     /// unsupported 3/4-stream slots remain absent rather than valid zero gains.
     pub fn gain(&self, path: u8, rate: u8) -> Option<u8> {
-        if path >= 2
+        if path >= self.paths
             || rate_section(rate)? >= 6
             || (self.geometry.band == FactoryBand::Ghz5 && rate < 4)
         {
@@ -175,8 +183,12 @@ impl FactoryPower {
     /// and SAR ceilings all participate. This function does not authenticate
     /// its inputs, select a country, tune a channel or grant TX permission.
     pub fn plan_channel_power(&self, geometry: Geometry, limits: Limits) -> Result<Plan, Error> {
+        let spec = self.spec();
+        let factor = i32::from(spec.txgi_factor);
+        let max_gain = i32::from(spec.max_power_index);
         let mut out = Plan {
             profile: self.profile(),
+            paths: spec.rf_paths,
             rfe: self.rfe(),
             nvm: *self.raw_gain_calibration(),
             geometry,
@@ -184,13 +196,16 @@ impl FactoryPower {
             gains: [[0; 84]; 2],
             words: [0; 12],
         };
-        for path in 0..2 {
+        for path in 0..usize::from(spec.rf_paths) {
+            // An index step is a half dB over the chip's factor.
             let eirp = limits
                 .max_eirp_mbm
                 .checked_sub(limits.antenna_and_combining_mbm[path])
                 .ok_or(Error::Arithmetic)?
-                .div_euclid(25);
-            let absolute = limits.sar_quarter_dbm.map_or(eirp, |s| eirp.min(s[path]));
+                .div_euclid(50 / factor);
+            let absolute = limits
+                .sar_quarter_dbm
+                .map_or(eirp, |s| eirp.min(s[path].div_euclid(2 / factor)));
             for (section, &(first, count)) in SECTIONS.iter().enumerate() {
                 if geometry.band == FactoryBand::Ghz5 && section == 0 {
                     continue;
@@ -200,6 +215,7 @@ impl FactoryPower {
                         &self.raw_gain_calibration()[path * 42..path * 42 + 42],
                         geometry,
                         rate,
+                        factor,
                     )?;
                     // Source uses u8 at each addition; reject a final base wrap
                     // instead of letting a negative calibration become high.
@@ -235,13 +251,17 @@ impl FactoryPower {
                     // High source SAR clamp is conservative. Never narrow or
                     // clamp upward a low ceiling before subtracting reference.
                     let ceiling = absolute
-                        .min(MAX_GAIN)
+                        .min(max_gain)
                         .checked_sub(reference)
                         .ok_or(Error::Arithmetic)?;
                     let offset = by_rate
                         .min(factory)
                         .min(ceiling)
-                        .checked_sub(if dpd_rate(rate) { 12 } else { 0 })
+                        .checked_sub(if spec.dpd_rates && dpd_rate(rate) {
+                            6 * factor
+                        } else {
+                            0
+                        })
                         .ok_or(Error::Arithmetic)?;
                     let remnant = if section == 0 {
                         limits.remnant_cck
@@ -258,9 +278,12 @@ impl FactoryPower {
                             rate,
                         });
                     }
-                    out.gains[path][rate as usize] = gain.min(MAX_GAIN) as u8;
+                    out.gains[path][rate as usize] = gain.min(max_gain) as u8;
                 }
             }
+        }
+        if spec.txagc != Txagc::Differential {
+            return Ok(out);
         }
         for (i, rate) in (0..28).chain(44..64).step_by(4).enumerate() {
             let mut bytes = [0; 4];
@@ -372,6 +395,29 @@ pub(super) fn program_registers<I: Io>(
     }
     Ok(())
 }
+/// `rtw8821c_set_tx_power_index`: path by path, the CCK, OFDM, HT 1SS and
+/// VHT 1SS indices, four rates a word at the path's base plus the first
+/// rate's index, VHT 1SS MCS9's word holding MCS8 and MCS9 alone.
+pub(super) fn program_absolute<I: Io>(
+    a: &mut Attempt<'_, I>,
+    plan: &Plan,
+    base: [u32; 2],
+) -> Result<(), super::Error> {
+    for (path, base) in base.into_iter().enumerate().take(usize::from(plan.paths)) {
+        for (first, count) in [(0u8, 4u8), (4, 8), (12, 8), (44, 10)] {
+            let mut word = 0;
+            for rate in first..first + count {
+                let shift = rate & 3;
+                word |= u32::from(plan.gains[path][usize::from(rate)]) << (shift * 8);
+                if shift == 3 || rate == 53 {
+                    a.io.write32(base + u32::from(rate & 0xfc), word)?;
+                    word = 0;
+                }
+            }
+        }
+    }
+    Ok(())
+}
 pub(super) fn rate_section(rate: u8) -> Option<u8> {
     Some(match rate {
         0..=3 => 0,
@@ -424,7 +470,8 @@ fn group(ch: u8, cck: bool) -> Result<usize, Error> {
         _ => return Err(Error::Geometry),
     })
 }
-fn calibration_base(nvm: &[u8], g: Geometry, rate: u8) -> Result<i32, Error> {
+/// The efuse index of `rate` on `g`, its differences in steps of `factor`.
+fn calibration_base(nvm: &[u8], g: Geometry, rate: u8, factor: i32) -> Result<i32, Error> {
     let section = rate_section(rate).ok_or(Error::Rate)?;
     let group = group(g.center(), rate < 4)?;
     let streams = match section {
@@ -438,32 +485,32 @@ fn calibration_base(nvm: &[u8], g: Geometry, rate: u8) -> Result<i32, Error> {
     if g.band == FactoryBand::Ghz2 {
         gain = i32::from(nvm[if rate < 4 { group } else { 6 + group }]);
         if section == 1 {
-            gain += nibble(nvm[11], false) * 2;
+            gain += nibble(nvm[11], false) * factor;
         }
         if mcs {
             if g.width == Width::Mhz20 {
-                gain += nibble(nvm[11], true) * 2;
+                gain += nibble(nvm[11], true) * factor;
             }
             for s in 2..=streams {
-                gain += nibble(nvm[12 + (s - 2) * 2], g.width == Width::Mhz40) * 2;
+                gain += nibble(nvm[12 + (s - 2) * 2], g.width == Width::Mhz40) * factor;
             }
         }
     } else {
         let n = &nvm[18..];
         gain = i32::from(n[group]);
         if !mcs {
-            gain += nibble(n[14], false) * 2;
+            gain += nibble(n[14], false) * factor;
         } else {
             match g.width {
                 Width::Mhz20 => {
-                    gain += nibble(n[14], true) * 2;
+                    gain += nibble(n[14], true) * factor;
                     for s in 2..=streams {
-                        gain += nibble(n[13 + s], false) * 2;
+                        gain += nibble(n[13 + s], false) * factor;
                     }
                 }
                 Width::Mhz40 => {
                     for s in 2..=streams {
-                        gain += nibble(n[13 + s], true) * 2;
+                        gain += nibble(n[13 + s], true) * factor;
                     }
                 }
                 Width::Mhz80 => {
@@ -471,7 +518,7 @@ fn calibration_base(nvm: &[u8], g: Geometry, rate: u8) -> Result<i32, Error> {
                         + i32::from(*n.get(group + 1).ok_or(Error::Geometry)?))
                         / 2;
                     for s in 1..=streams {
-                        gain += nibble(n[19 + s], true) * 2;
+                        gain += nibble(n[19 + s], true) * factor;
                     }
                 }
             }
@@ -644,7 +691,7 @@ mod tests {
                 },
             };
             assert_eq!(
-                calibration_base(&n, g, rate).unwrap() as u8,
+                calibration_base(&n, g, rate, 2).unwrap() as u8,
                 bytes[offset],
                 "packed {c}"
             );
