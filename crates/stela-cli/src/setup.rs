@@ -475,7 +475,7 @@ impl InstallMedium {
             stela_formats::payload::MANIFEST_FILE
         );
         if expected.sha1.is_none() {
-            println!("warning: no download receipt; IPSW checked against its BuildManifest only");
+            warning!("no download receipt; IPSW checked against its BuildManifest only");
         }
         Ok(())
     }
@@ -893,7 +893,7 @@ impl Request {
                         &record.esp,
                         &mount_image,
                     )? {
-                        report.push_str(&format!("Note: {note}\n"));
+                        report.push_str(&format!("note: {note}\n"));
                     }
                     report.push_str("Done.\n");
                     return Ok(report);

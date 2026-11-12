@@ -1,13 +1,19 @@
-//! Terminal-only progress; redirected commands keep their ordinary output.
-//! Once the setup wizard has drawn its timeline, each phase continues it: a
-//! running step on the rail, then the finished step it leaves behind.
+//! Progress: on a terminal, one updating line per phase that leaves one
+//! finished line behind with its size and time; redirected, only that
+//! finished line, for a phase with a size. Once the setup wizard has drawn
+//! its timeline, each phase continues it: a running step on the rail, then
+//! the finished step it leaves behind.
 use indicatif::{HumanBytes, ProgressBar, ProgressStyle};
 use std::{
     io::{self, IsTerminal, Read, Write},
     path::Path,
     sync::OnceLock,
-    time::Duration,
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant},
 };
+
+/// A spinner's total: it moves no counted bytes.
+const UNSIZED: u64 = u64::MAX;
 
 /// The wizard timeline's styled glyphs: a running, finished and stopped
 /// step, and the rail between steps.
@@ -46,6 +52,18 @@ pub(crate) struct Phase {
     bar: Option<ProgressBar>,
     label: String,
     finished: bool,
+    started: Instant,
+    /// The bytes a sized phase moves, for its finished line off a
+    /// terminal; [`UNSIZED`] for a spinner.
+    total: AtomicU64,
+}
+
+/// `seconds` as a phase's finished line gives it: tenths below 10 s.
+fn elapsed(time: Duration) -> String {
+    match time.as_secs() {
+        0..10 => format!("{:.1} s", time.as_secs_f64()),
+        seconds => format!("{seconds} s"),
+    }
 }
 
 impl Phase {
@@ -71,6 +89,8 @@ impl Phase {
             bar,
             label,
             finished: false,
+            started: Instant::now(),
+            total: AtomicU64::new(bytes),
         }
     }
 
@@ -89,6 +109,8 @@ impl Phase {
             bar,
             label,
             finished: false,
+            started: Instant::now(),
+            total: AtomicU64::new(UNSIZED),
         }
     }
 
@@ -109,9 +131,19 @@ impl Phase {
         if let Some(bar) = &self.bar {
             bar.set_length(bar.length().unwrap_or(0).saturating_add(bytes));
         }
+        let total = self.total.load(Ordering::Relaxed);
+        if total != UNSIZED {
+            let total = total.saturating_add(bytes).min(UNSIZED - 1);
+            self.total.store(total, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn finish(mut self) {
+        let time = elapsed(self.started.elapsed());
+        let total = self.total.load(Ordering::Relaxed);
+        if self.bar.is_none() && total != UNSIZED {
+            eprintln!("{}: {}, {time}", self.label, HumanBytes(total));
+        }
         if let Some(bar) = &self.bar {
             // A one-line summary replaces the finished timers. Off the
             // timeline, a step without a size leaves nothing behind.
@@ -123,7 +155,11 @@ impl Phase {
                 }
                 (Some(total), _) => {
                     bar.set_style(summary(|rail| &rail.done));
-                    bar.finish_with_message(format!("{} · {}", self.label, HumanBytes(total)));
+                    bar.finish_with_message(format!(
+                        "{} · {} · {time}",
+                        self.label,
+                        HumanBytes(total)
+                    ));
                 }
             }
         }

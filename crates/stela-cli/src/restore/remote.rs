@@ -96,8 +96,8 @@ impl Remote {
         for attempt in 0..ATTEMPTS {
             if attempt > 0 {
                 let wait = Duration::from_secs(1 << attempt).min(MAX_WAIT);
-                eprintln!(
-                    "note: bytes {start}-{end} of {}: {}; trying again in {} s",
+                note!(
+                    "bytes {start}-{end} of {}: {}; trying again in {} s",
                     self.url,
                     last.as_ref()
                         .map_or(String::new(), |e: &anyhow::Error| format!("{e:#}")),

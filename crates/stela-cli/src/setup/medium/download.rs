@@ -180,8 +180,8 @@ fn write_from(
     );
     let offset: u64 = pieces.iter().map(|piece| piece.bytes).sum();
     if offset > 0 {
-        eprintln!(
-            "note: going on with the macOS download at {:.1} of {:.1} GB",
+        note!(
+            "going on with the macOS download at {:.1} of {:.1} GB",
             offset as f64 / 1e9,
             total as f64 / 1e9
         );

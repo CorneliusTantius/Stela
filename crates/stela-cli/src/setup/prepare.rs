@@ -71,8 +71,8 @@ pub(super) fn supported(environment: &Environment<'_>, ipsw: &Path, build: &str)
     let entry = builds::find_in(environment.builds, build)
         .map_err(|error| anyhow::anyhow!("{}: {error}", ipsw.display()))?;
     if entry.build != build {
-        eprintln!(
-            "note: macOS build {build} is not tested yet; Stela uses build {}'s device \
+        note!(
+            "macOS build {build} is not tested yet; Stela uses build {}'s device \
              interfaces for it",
             entry.build
         );

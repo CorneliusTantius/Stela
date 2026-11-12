@@ -79,7 +79,7 @@ impl Drop for Attachment {
             .output()
             .is_ok_and(|output| output.status.success());
         if !detached {
-            eprintln!("warning: could not detach {}", self.device);
+            warning!("could not detach {}", self.device);
         }
     }
 }

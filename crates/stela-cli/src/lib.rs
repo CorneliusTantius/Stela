@@ -4,6 +4,49 @@
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 
+/// A message beside the command's progress, in one of three forms on
+/// standard error: `note:` (something to know, the command goes on),
+/// `warning:` (something may be wrong, the command goes on) and `error:`
+/// (the command stopped; [`main`] prints it, ending with the command that
+/// fixes it when there is one). The label is coloured only on a terminal
+/// that takes colour.
+pub(crate) fn say(label: Label, text: std::fmt::Arguments<'_>) {
+    eprintln!("{} {text}", label.styled());
+}
+
+/// The three message labels ([`say`]).
+#[derive(Clone, Copy)]
+pub(crate) enum Label {
+    Note,
+    Warning,
+    Error,
+}
+
+impl Label {
+    fn styled(self) -> console::StyledObject<&'static str> {
+        let (text, color) = match self {
+            Label::Note => ("note:", console::Color::Cyan),
+            Label::Warning => ("warning:", console::Color::Yellow),
+            Label::Error => ("error:", console::Color::Red),
+        };
+        console::style(text).for_stderr().fg(color).bold()
+    }
+}
+
+/// `note!(...)`: [`say`] with [`Label::Note`], formatted as `format!`.
+macro_rules! note {
+    ($($arg:tt)*) => {
+        $crate::say($crate::Label::Note, format_args!($($arg)*))
+    };
+}
+
+/// `warning!(...)`: [`say`] with [`Label::Warning`].
+macro_rules! warning {
+    ($($arg:tt)*) => {
+        $crate::say($crate::Label::Warning, format_args!($($arg)*))
+    };
+}
+
 pub mod apfs;
 pub mod args;
 pub mod boot;
@@ -92,10 +135,7 @@ pub fn main() -> ExitCode {
     let code = match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!(
-                "{} {error:#}",
-                console::style("error:").for_stderr().red().bold()
-            );
+            say(Label::Error, format_args!("{error:#}"));
             ExitCode::FAILURE
         }
     };

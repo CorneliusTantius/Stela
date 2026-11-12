@@ -60,8 +60,8 @@ pub(crate) fn send(what: &str, build: impl Fn() -> RequestBuilder) -> Result<Res
                 return Err(anyhow!("{what} failed{tries}: {}", explain(&error)));
             }
         };
-        eprintln!(
-            "note: {what}: {failure}; trying again in {} s",
+        note!(
+            "{what}: {failure}; trying again in {} s",
             wait.as_secs().max(1)
         );
         std::thread::sleep(wait);

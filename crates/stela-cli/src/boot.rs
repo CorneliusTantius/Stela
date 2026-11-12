@@ -935,9 +935,7 @@ impl Prepare {
                     );
                     staged = ticket::staged(&manifest, identity.index, ecid, &bytes)
                         .inspect_err(|error| {
-                            eprintln!(
-                                "note: {error:#}; installing macOS will ask Apple's signing service"
-                            )
+                            note!("{error:#}; installing macOS will ask Apple's signing service")
                         })
                         .ok();
                 }

@@ -171,8 +171,8 @@ fn download_from(
                     if attempt < ATTEMPTS
                         && waited.checked_add(pause).is_some_and(|w| w <= WAIT_BUDGET) =>
                 {
-                    eprintln!(
-                        "note: {} from {host}: {what}; asking again in {} s",
+                    note!(
+                        "{} from {host}: {what}; asking again in {} s",
                         artifact.member,
                         pause.as_secs().max(1)
                     );
@@ -185,7 +185,7 @@ fn download_from(
             }
         };
         if urls.len() > 1 {
-            eprintln!("note: {} from {host}: {last}", artifact.member);
+            note!("{} from {host}: {last}", artifact.member);
         }
         answers.push(format!("{host} {last}"));
     }
@@ -305,22 +305,18 @@ fn prefetch(
         return Ok(0);
     }
     let bytes: usize = wanted.iter().map(|(artifact, _)| artifact.length).sum();
-    eprintln!(
-        "Downloading the firmware bundle: {} files, {:.1} MiB",
-        wanted.len(),
-        bytes as f64 / MIB as f64
+    // One updating line for the whole bundle, not one per file: a file is
+    // named only when its download fails.
+    let progress = crate::progress::Phase::bytes(
+        format!("Downloading the firmware bundle ({} files)", wanted.len()),
+        bytes as u64,
     );
-    for (index, (artifact, _)) in wanted.iter().enumerate() {
-        eprintln!(
-            "  {} ({:.1} MiB), file {} of {}",
-            artifact.member,
-            artifact.length as f64 / MIB as f64,
-            index + 1,
-            wanted.len()
-        );
+    for (artifact, _) in &wanted {
         let bytes = download(artifact)?;
+        progress.advance(bytes.len() as u64);
         store(cache, artifact, &bytes)?;
     }
+    progress.finish();
     Ok(wanted.len())
 }
 

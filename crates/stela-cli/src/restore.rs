@@ -440,7 +440,7 @@ fn download_with_client(image: &Image, output: &Path, client: &Client) -> Result
             // range of it: start over from its first byte.
             drop(response);
             remove_partial(&part, &metadata)?;
-            eprintln!("note: the image changed on Apple's server; downloading it anew");
+            note!("the image changed on Apple's server; downloading it anew");
             return download_with_client(image, output, client);
         }
         if let Some(length) = response.content_length() {
