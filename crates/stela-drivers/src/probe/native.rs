@@ -54,11 +54,17 @@ impl<L: Link> Link for Located<L> {
     fn signals(&self) -> bool {
         self.link.signals()
     }
+    fn due_us(&self) -> Option<u64> {
+        self.link.due_us()
+    }
     fn transmit(&mut self, frame: &[u8]) -> Result<(), LinkError> {
         self.link.transmit(frame)
     }
     fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
         self.link.receive()
+    }
+    fn receive_reusing(&mut self, frame: &mut Vec<u8>) -> Result<bool, LinkError> {
+        self.link.receive_reusing(frame)
     }
 }
 
@@ -1406,6 +1412,44 @@ mod tests {
             device: 0,
             function: 0,
         }
+    }
+
+    /// A located link is its driver's link: a station's timer deadline and
+    /// its reused receive buffer pass through, so a Wi-Fi link that signals
+    /// still wakes the stack for its timers.
+    #[test]
+    fn a_located_link_passes_its_deadline_and_reused_buffer_through() {
+        struct Timed;
+        impl Link for Timed {
+            fn mac(&self) -> Mac {
+                Mac([2, 0, 0, 0, 0, 1])
+            }
+            fn signals(&self) -> bool {
+                true
+            }
+            fn due_us(&self) -> Option<u64> {
+                Some(1234)
+            }
+            fn transmit(&mut self, _: &[u8]) -> Result<(), LinkError> {
+                Ok(())
+            }
+            fn receive(&mut self) -> Result<Option<Vec<u8>>, LinkError> {
+                Ok(None)
+            }
+            fn receive_reusing(&mut self, frame: &mut Vec<u8>) -> Result<bool, LinkError> {
+                frame.clear();
+                frame.push(7);
+                Ok(true)
+            }
+        }
+        let mut located = Located {
+            location: String::from("0000:04:00.0"),
+            link: Timed,
+        };
+        assert_eq!(located.due_us(), Some(1234));
+        let mut frame = Vec::new();
+        assert_eq!(located.receive_reusing(&mut frame), Ok(true));
+        assert_eq!(frame, [7]);
     }
 
     #[test]
