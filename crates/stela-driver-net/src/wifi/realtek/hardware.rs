@@ -16,7 +16,7 @@ use super::{
     dynamic::{self, Dynamic, set_mask},
     features,
     firmware_control::{self, Control},
-    interrupt::Controller,
+    interrupt::{self, Controller},
     io::{Bar, Io},
     link::Link,
     phy::{
@@ -989,6 +989,16 @@ impl Device for Hardware {
 
     fn limitation(&mut self) -> Option<&'static str> {
         self.limitations.pop()
+    }
+
+    /// Any owner of the function quarantined, or a PHY a channel change left
+    /// part way: each refuses every later call.
+    fn lost(&self) -> bool {
+        self.control.quarantined()
+            || self.receive.quarantined()
+            || self.transmit.quarantined()
+            || self.interrupts.state() == interrupt::State::Quarantined
+            || self.phy.is_none()
     }
 }
 

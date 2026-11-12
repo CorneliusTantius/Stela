@@ -88,6 +88,9 @@ struct Air {
     tkip: bool,
     /// The SSID of each probe.
     probe_names: Vec<Vec<u8>>,
+    /// The device quarantined itself, and each look for frames since.
+    lost: bool,
+    looks: usize,
 }
 
 impl Air {
@@ -184,6 +187,10 @@ impl Device for Model {
     }
     fn receive(&mut self, sink: &mut dyn FnMut(Incoming)) -> Result<(), String> {
         let mut air = self.0.borrow_mut();
+        air.looks += 1;
+        if air.lost {
+            return Err(String::from("receive ring: Quarantined"));
+        }
         if !air.quiet && air.tuned.last() == Some(&(air.channel, false)) {
             let beacon = advertised(&air, air.channel as u8);
             air.hear(beacon, false);
@@ -245,6 +252,9 @@ impl Device for Model {
     fn scanning(&mut self, scanning: bool) -> Result<(), String> {
         self.0.borrow_mut().scans.push(scanning);
         Ok(())
+    }
+    fn lost(&self) -> bool {
+        self.0.borrow().lost
     }
 }
 
@@ -796,6 +806,31 @@ fn a_refused_frame_between_good_ones_is_dropped_and_counted_and_the_rest_arrive(
     assert_eq!(values, [0x45, 0x45]);
     assert!(wifi.radio().dropped() > before);
     assert!(wifi.carrier());
+}
+
+#[test]
+fn a_quarantined_device_is_reported_once_and_the_keeper_stops() {
+    let (mut wifi, model) = connected();
+    model.0.borrow_mut().lost = true;
+    let error = wifi.receive().expect_err("the link is gone");
+    assert!(matches!(&error, LinkError::Adapter(reason) if reason.contains("Quarantined")));
+    let looks = model.0.borrow().looks;
+    assert!(!wifi.carrier());
+    assert_eq!(wifi.receive(), Err(error.clone()));
+    assert_eq!(wifi.transmit(&[0; 60]), Err(error));
+    assert_eq!(
+        model.0.borrow().looks,
+        looks,
+        "nothing reaches the device again"
+    );
+    let notices = core::iter::from_fn(|| wifi.take_diagnostic()).collect::<Vec<_>>();
+    assert_eq!(
+        notices
+            .iter()
+            .filter(|notice| notice.contains("Quarantined"))
+            .count(),
+        1
+    );
 }
 
 /// Fragment `number` of frame `sequence` under the pairwise key at packet
