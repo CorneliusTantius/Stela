@@ -165,14 +165,14 @@ fn pnvm_wrong_short_and_failed_doorbell_never_release_or_synthesize_status() {
 }
 
 #[test]
-fn ax210_fragmented_wide_invalid_and_duplicate_completions_never_release_iml() {
+fn ax210_wide_invalid_and_duplicate_completions_never_release_iml() {
     if crate::test_process::isolate_model() {
         return;
     }
     let bytes = ax210_bytes();
     let catalog = catalog_for(&ax210_profile(), Family::Ax210.firmware_name(), &bytes);
     let (observation, step_catalog) = step_fixture();
-    for mode in 0..5 {
+    for mode in 1..5 {
         let source = Source::default();
         let domain = Arc::new(Domain::default());
         let state = ax210_state();
@@ -189,10 +189,6 @@ fn ax210_fragmented_wide_invalid_and_duplicate_completions_never_release_iml() {
         boot.poll().unwrap();
         let live = domain.records.lock().unwrap().live.len();
         match mode {
-            0 => {
-                complete(&boot, &domain, 0, 1, &rx_packet(1, 0xcafe, 0));
-                device_write(&domain, boot.used.region().address, 6, &[1, 0], false);
-            }
             1 | 2 => {
                 device_write(
                     &domain,

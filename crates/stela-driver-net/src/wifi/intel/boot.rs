@@ -213,7 +213,6 @@ pub enum Error {
     DeviceError(u32),
     CompletionId(u16),
     CompletionCredit,
-    Fragmented,
 }
 impl From<crate::bus::dma::mapping::DmaError> for Error {
     fn from(e: crate::bus::dma::mapping::DmaError) -> Self {
@@ -356,6 +355,8 @@ pub struct RomBoot<'a, Q: BootIo> {
     entries: u16,
     read: u16,
     credits: u16,
+    /// `next_rb_is_fragment`: the last RB continues in the next one.
+    next_fragment: bool,
     // Original MVM quota cache spans MAC/PHY/power continuations in this
     // firmware epoch. Only a real completed empty command establishes it.
     empty_quotas_applied: bool,
@@ -616,6 +617,7 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
             entries,
             read: 0,
             credits: 0,
+            next_fragment: false,
             empty_quotas_applied: false,
             coexistence: coexistence::Coexistence::new(),
             state: State::Prepared,
@@ -897,7 +899,22 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
             self.write(0x1c80, u32::from(write))
         }
     }
+    /// The next completed RB that holds whole packets. As `iwl_pcie_rx_handle`
+    /// does, an RB the device marks as continued in the next one is dropped
+    /// with that next one, and both go back to the free ring.
     fn completed_buffer(&mut self) -> Result<Option<Vec<u8>>, Error> {
+        loop {
+            let Some((bytes, fragmented)) = self.completed_rb()? else {
+                return Ok(None);
+            };
+            let dropped = fragmented || self.next_fragment;
+            self.next_fragment = fragmented;
+            if !dropped {
+                return Ok(Some(bytes));
+            }
+        }
+    }
+    fn completed_rb(&mut self) -> Result<Option<(Vec<u8>, bool)>, Error> {
         // SAFETY: start checked shared coherent producer polling, kept
         // pins/domain/CPU view, aligned width; this is NOT streaming sync_cpu.
         let family = self.profile.family();
@@ -931,9 +948,6 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
             );
         }
         let used = receive::used_descriptor(family, &descriptor[..stride])?;
-        if used.fragmented {
-            return Err(Error::Fragmented);
-        }
         let buffer = self
             .buffers
             .get_mut(usize::from(used.id - 1))
@@ -949,7 +963,7 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
         // allowed after this visibility/copy completes successfully.
         let bytes = unsafe { buffer.allocation.snapshot_completed()? };
         self.receive_ring.complete(used.id)?;
-        Ok(Some(bytes))
+        Ok(Some((bytes, used.fragmented)))
     }
     fn receive(&mut self) -> Result<Option<AliveReport>, Error> {
         let family = self.profile.family();

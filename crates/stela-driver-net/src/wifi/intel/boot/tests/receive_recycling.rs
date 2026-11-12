@@ -69,6 +69,44 @@ fn rx_recycling_waits_for_target_slot_completion_when_payloads_complete_out_of_o
     assert!(domain.records.lock().unwrap().live.is_empty());
 }
 
+/// `iwl_pcie_rx_handle`: an RB the device marks as continued in the next one
+/// is dropped with that next one, and reception carries on after them.
+#[test]
+fn a_fragmented_rb_and_its_continuation_are_dropped_and_reception_continues() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    let bytes = ax210_bytes();
+    let catalog = catalog_for(&ax210_profile(), Family::Ax210.firmware_name(), &bytes);
+    let (observation, step_catalog) = step_fixture();
+    let source = Source::default();
+    let domain = Arc::new(Domain::default());
+    let state = ax210_state();
+    let drops = Arc::new(AtomicUsize::new(0));
+    let mut boot = start_ax210(
+        &catalog,
+        crate::wifi::intel::platform::load_step(observation, &step_catalog).unwrap(),
+        &source,
+        &domain,
+        &state,
+        &drops,
+    );
+    event(&state, 1);
+    boot.poll().unwrap();
+    let alive = rx_packet(1, 0xcafe, 0);
+    complete(&boot, &domain, 0, 1, &alive);
+    // The fragmented-RB flag of the AX210 completion descriptor.
+    device_write(&domain, boot.used.region().address, 6, &[1], false);
+    complete(&boot, &domain, 1, 2, &alive);
+    assert!(boot.poll().unwrap().is_none(), "both halves are dropped");
+    assert!(!boot.buffers[0].device_owned && !boot.buffers[1].device_owned);
+    complete(&boot, &domain, 2, 3, &alive);
+    assert!(boot.poll().unwrap().is_some());
+    boot.stop().unwrap();
+    drop(boot);
+    assert!(domain.records.lock().unwrap().live.is_empty());
+}
+
 #[test]
 fn rx_recycling_faults_keep_dma_and_requester() {
     if crate::test_process::isolate_model() {
