@@ -147,9 +147,10 @@ const RF_AAC_CTRL: u8 = 0xca;
 const RF_SYN_AAC: u8 = 0xc9;
 const RF_FAST_LCK: u8 = 0xcc;
 const RF_WHOLE: u32 = 0xfffff;
-/// `read_poll_timeout`'s step and how many fit its 100 ms.
+/// `read_poll_timeout`'s step, and 20 of rtw88's 100: the lock runs from the
+/// watchdog, whose caller this must not hold, and settles in a few steps.
 const LCK_POLL_US: u64 = 1000;
-const LCK_POLLS: usize = 100;
+const LCK_POLLS: usize = 20;
 /// `RTW_TP_SHIFT` and `DECLARE_EWMA(tp, 10, 2)`.
 const MBPS_SHIFT: u32 = 18;
 const THROUGHPUT_WEIGHT: u32 = 1;
@@ -500,6 +501,8 @@ struct Thermal {
     internal: [u64; 2],
     averages: [u8; 2],
     lck_reference: u8,
+    /// A synthesizer lock went on unsettled, not yet told.
+    lock_unsettled: bool,
 }
 
 /// `rtw_phy_pwrtrack_get_pwridx`.
@@ -521,16 +524,19 @@ fn swing(band: Band, cck: bool) -> (&'static [Swing; 2], &'static [Swing; 2]) {
     }
 }
 
-/// `rtw8822c_do_lck`.
-fn lock_synthesizer<I: Io>(rf: &mut rf::Registers<'_, I>) -> Result<(), rf::Error> {
+/// `rtw8822c_do_lck`: whether the lock settled within its wait. rtw88 goes
+/// on either way, as this does.
+fn lock_synthesizer<I: Io>(rf: &mut rf::Registers<'_, I>) -> Result<bool, rf::Error> {
     rf.write(Path::A, RF_SYN_CTRL, RF_WHOLE, 0x80010)?;
     rf.write(Path::A, RF_SYN_PFD, RF_WHOLE, 0x1f0fa)?;
     rf.table_delay_us(1)?;
     rf.write(Path::A, RF_AAC_CTRL, RF_WHOLE, 0x80000)?;
     rf.write(Path::A, RF_SYN_AAC, RF_WHOLE, 0x80001)?;
+    let mut settled = false;
     for _ in 0..LCK_POLLS {
         rf.table_delay_us(LCK_POLL_US)?;
         if rf.read(Path::A, RF_AAC_CTRL, 0x1000)? != 1 {
+            settled = true;
             break;
         }
     }
@@ -539,7 +545,8 @@ fn lock_synthesizer<I: Io>(rf: &mut rf::Registers<'_, I>) -> Result<(), rf::Erro
     rf.write(Path::A, RF_FAST_LCK, RF_WHOLE, 0x0f000)?;
     rf.write(Path::A, RF_FAST_LCK, RF_WHOLE, 0x4f000)?;
     rf.table_delay_us(1)?;
-    rf.write(Path::A, RF_FAST_LCK, RF_WHOLE, 0x0f000)
+    rf.write(Path::A, RF_FAST_LCK, RF_WHOLE, 0x0f000)?;
+    Ok(settled)
 }
 
 /// `rtw_dm_info`'s tracking state, with the peer's `rtw_sta_info`.
@@ -618,6 +625,7 @@ impl Dynamic {
                 internal: [0; 2],
                 averages: [0; 2],
                 lck_reference: initial.lck_reference,
+                lock_unsettled: false,
             },
             energy_threshold: match initial.dfs_region {
                 DFS_ETSI => Some(EDCCA_ETSI),
@@ -957,7 +965,7 @@ impl Dynamic {
             }
             if thermal.averages[0].abs_diff(thermal.lck_reference) >= LCK_THRESHOLD {
                 thermal.lck_reference = thermal.averages[0];
-                lock_synthesizer(&mut rf)?;
+                thermal.lock_unsettled |= !lock_synthesizer(&mut rf)?;
             }
         }
         let (raise, lower) = swing(band, self.tx_rate <= LAST_CCK_RATE);
@@ -1003,6 +1011,11 @@ impl Dynamic {
     /// `ewma_rssi_read`.
     pub fn rssi(&self) -> u8 {
         (self.average >> AVERAGE_PRECISION) as u8
+    }
+
+    /// Whether a synthesizer lock went on before it settled, once each time.
+    pub fn take_unsettled_lock(&mut self) -> bool {
+        core::mem::take(&mut self.thermal.lock_unsettled)
     }
 
     /// `si->rssi_level`.
@@ -1473,6 +1486,85 @@ mod tests {
         assert_eq!(bus.get(0x820) & 0xff, 0x31);
         assert_eq!(bus.get(0x1e2c) & 0xffff, 0x0400);
         assert_eq!(bus.get(0x824), 0x0303_0000);
+    }
+
+    /// A radio whose synthesizer lock stays busy or not, counting its delays.
+    struct Synthesizer {
+        bus: Bus,
+        busy: bool,
+        delays: usize,
+    }
+
+    // SAFETY: nothing here reaches hardware; this is a map of words.
+    unsafe impl Io for Synthesizer {
+        fn profile(&self) -> Profile {
+            profile()
+        }
+        fn read8(&mut self, register: u32) -> Result<u8, io::Error> {
+            self.bus.read8(register)
+        }
+        fn read16(&mut self, register: u32) -> Result<u16, io::Error> {
+            self.bus.read16(register)
+        }
+        fn read32(&mut self, register: u32) -> Result<u32, io::Error> {
+            let value = self.bus.read32(register)?;
+            let lock = 0x3c00 + u32::from(RF_AAC_CTRL) * 4;
+            Ok(if register == lock && self.busy {
+                value | 0x1000
+            } else {
+                value
+            })
+        }
+        fn write8(&mut self, register: u32, value: u8) -> Result<(), io::Error> {
+            self.bus.write8(register, value)
+        }
+        fn write16(&mut self, register: u32, value: u16) -> Result<(), io::Error> {
+            self.bus.write16(register, value)
+        }
+        fn write32(&mut self, register: u32, value: u32) -> Result<(), io::Error> {
+            self.bus.write32(register, value)
+        }
+        fn delay_us(&mut self, microseconds: u64) {
+            if microseconds == LCK_POLL_US {
+                self.delays += 1;
+            }
+        }
+        fn submit_beacon(&mut self, _: &[u8]) -> Result<(), io::Error> {
+            Ok(())
+        }
+        unsafe fn beacon_consumed(&mut self) -> Result<(), io::Error> {
+            Ok(())
+        }
+        fn quarantine(&mut self) {}
+    }
+
+    #[test]
+    fn a_synthesizer_lock_waits_20_ms_at_most_and_says_whether_it_settled() {
+        use crate::wifi::realtek::registers::{
+            FW_READY, REG_MCUFW_CTRL, REG_RF_CTRL, REG_SYS_CFG1, REG_SYS_FUNC_EN, REG_WLRF1,
+        };
+        for busy in [false, true] {
+            let mut bus = Bus::default();
+            bus.0.insert(REG_SYS_CFG1, profile().observed().sys_cfg1);
+            bus.0.insert(REG_MCUFW_CTRL, FW_READY.into());
+            bus.0.insert(REG_SYS_FUNC_EN, 3);
+            bus.0.insert(REG_RF_CTRL, 7);
+            bus.0.insert(REG_WLRF1, 0x0700_0000);
+            let mut radio = Synthesizer {
+                bus,
+                busy,
+                delays: 0,
+            };
+            let report = Features::of_two_paths(profile());
+            // SAFETY: the model radio belongs to this test alone.
+            let mut rf = unsafe { rf::Registers::new(&mut radio, &report) }.unwrap();
+            assert_eq!(lock_synthesizer(&mut rf).unwrap(), !busy);
+            drop(rf);
+            assert_eq!(radio.delays, if busy { LCK_POLLS } else { 1 });
+            // The lock ends as rtw88 ends it, settled or not.
+            let fast = 0x3c00 + u32::from(RF_FAST_LCK) * 4;
+            assert_eq!(radio.bus.get(fast) & RF_WHOLE, 0x0f000);
+        }
     }
 
     #[test]
