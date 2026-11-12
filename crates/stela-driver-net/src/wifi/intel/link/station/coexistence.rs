@@ -245,7 +245,7 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
     pub(super) fn run_coexistence(&mut self, queue: &mut Queue<Q, B>) -> Result<(), Error> {
         let family = queue.family();
         let client = &self.client;
-        if !matches!(family, Family::Ax200 | Family::Ax210) || !client.idle() || client.leaving {
+        if !client.idle() || client.leaving {
             return Ok(());
         }
         let associated = client.station.phase() == Peering::Associated;
@@ -256,6 +256,14 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
                 commands::SYSTEM_STATISTICS.opcode,
             )
             .is_some_and(|version| version.command_version != u8::MAX);
+        if !matches!(family, Family::Ax200 | Family::Ax210) {
+            // `iwl_mld_vif_cfg_changed`: iwlmld clears the counters and asks
+            // for periodic reports on every association, a single link's too.
+            if associated && system_statistics && !client.statistics.watching() {
+                self.client.watch_statistics();
+            }
+            return Ok(());
+        }
         if associated
             && system_statistics
             && !client.statistics.watching()

@@ -109,7 +109,7 @@ impl Device<'_> {
     fn inject(&mut self, rom: &RomBoot<'_, Model>, packet: &[u8]) {
         let converted;
         let packet = if self.native.ax210 && packet[4..6] == [0xc1, 0] {
-            converted = ax210_mpdu(packet);
+            converted = ax210_mpdu(packet, self.native.be200);
             &converted[..]
         } else {
             packet
@@ -627,8 +627,16 @@ fn ax210_image(mut image: Vec<u8>) -> Vec<u8> {
 }
 
 /// An AX210 fixture image as a BE200 one: its API 106 header and the
-/// command versions iwlmld takes, rate format 3 among them.
+/// command versions iwlmld takes: RX MPDU 6 and TX 11 with rate format 3,
+/// TLC 4, and the system statistics command with its operational report 4.
 fn be200_image(image: Vec<u8>) -> Vec<u8> {
+    const VERSIONS: [[u8; 4]; 5] = [
+        [0xc1, 0, 0xff, 6],
+        [0x1c, 1, 11, 9],
+        [0xf7, 5, 0xff, 4],
+        [0x0f, 2, 1, 0xff],
+        [0, 0x10, 0xff, 4],
+    ];
     let mut image = ax210_image(image);
     image[72..76].copy_from_slice(&(106u32 << 8).to_le_bytes());
     let mut at = 88;
@@ -636,19 +644,17 @@ fn be200_image(image: Vec<u8>) -> Vec<u8> {
         let word = |at: usize| u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
         let (kind, length) = (word(at), word(at + 4) as usize);
         if kind == 48 {
-            let mut tlc = false;
-            for entry in image[at + 8..at + 8 + length].as_chunks_mut::<4>().0 {
-                match entry[..2] {
-                    [0xc1, 0] => entry[3] = 6,
-                    [0x1c, 1] => (entry[2], entry[3]) = (11, 9),
-                    [0xf7, 5] => (tlc, entry[3]) = (true, 4),
-                    _ => {}
-                }
-            }
-            if !tlc {
-                image.splice(at + 8 + length..at + 8 + length, [0xf7, 5, 0, 4]);
-                image[at + 4..at + 8].copy_from_slice(&((length + 4) as u32).to_le_bytes());
-            }
+            let mut versions: Vec<u8> = image[at + 8..at + 8 + length]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|entry| !VERSIONS.iter().any(|bz| entry[..2] == bz[..2]))
+                .flatten()
+                .copied()
+                .collect();
+            versions.extend(VERSIONS.as_flattened());
+            image[at + 4..at + 8].copy_from_slice(&(versions.len() as u32).to_le_bytes());
+            image.splice(at + 8..at + 8 + length, versions);
             break;
         }
         at += 8 + length.next_multiple_of(4);
@@ -656,10 +662,27 @@ fn be200_image(image: Vec<u8>) -> Vec<u8> {
     image
 }
 
+/// `iwl_system_statistics_notif_oper` of version 4, which iwlmld reads on
+/// Bz: link 0 heard at `-energy` dBm with `air_us` used, its PHY's
+/// 104-byte record.
+fn bz_report(stamp: u32, energy: u32, air_us: u32) -> Vec<u8> {
+    let mut body = vec![0; 4 + 4 * 28 + 3 * 104 + 16 * 4];
+    body[..4].copy_from_slice(&stamp.to_le_bytes());
+    body[4..8].copy_from_slice(&energy.to_le_bytes());
+    body[8..12].copy_from_slice(&air_us.to_le_bytes());
+    let statistics = Id {
+        group: 0x10,
+        opcode: 0,
+        version: 0,
+    };
+    command_packet(statistics, 0x8000, &body)
+}
+
 /// An AX200 RX MPDU packet as an AX210 reports it: `iwl_rx_mpdu_desc`'s
 /// 64-byte form, its rate, energy, GP2 and TSF words moved past the PHY
-/// data that the AX210 adds.
-fn ax210_mpdu(packet: &[u8]) -> Vec<u8> {
+/// data that the AX210 adds. With `bz`, the rate is in format 3, as a Bz
+/// radio's RX MPDU 6 has it: legacy OFDM at 6 Mb/s, on the same chains.
+fn ax210_mpdu(packet: &[u8], bz: bool) -> Vec<u8> {
     let length = (u32::from_le_bytes(packet[..4].try_into().unwrap()) & 0x3fff) as usize - 4;
     let payload = &packet[8..8 + length];
     let (old, frame) = payload.split_at(48);
@@ -669,6 +692,12 @@ fn ax210_mpdu(packet: &[u8]) -> Vec<u8> {
     descriptor[20..24].copy_from_slice(&old[24..28]);
     descriptor[36..48].copy_from_slice(&old[28..40]);
     descriptor[48..56].copy_from_slice(&old[40..48]);
+    if bz {
+        // `RATE_MCS_MOD_TYPE_MSK`'s legacy OFDM, rate index 0, and
+        // `RATE_MCS_ANT_AB_MSK` kept.
+        let rate = u32::from_le_bytes(descriptor[36..40].try_into().unwrap());
+        descriptor[36..40].copy_from_slice(&((rate & 3 << 14) | 1 << 8).to_le_bytes());
+    }
     descriptor.extend(frame);
     let mpdu = Id {
         group: 0,
@@ -2019,11 +2048,21 @@ fn a_be200_boots_with_its_pnvm_joins_and_carries_data() {
         crate::wifi::intel::firmware::Family::Bz
     );
     assert!(device.pnvm_loaded, "the PNVM went to the firmware");
+    // iwlmld asks for periodic statistics on association, whose reports
+    // come in Bz's own layout.
+    settle(&mut wifi, &mut device);
+    assert!(device.commands.contains(&(2, 0x0f)), "firmware reports");
+    device.inject(wifi.radio().rom().unwrap(), &bz_report(1_000_000, 60, 0));
     device.inject(
         wifi.radio().rom().unwrap(),
         &data(LOCAL, false, [8, 0], &[0x45; 46], Some((0, 1))),
     );
     settle(&mut wifi, &mut device);
+    let notices: Vec<_> = core::iter::from_fn(|| wifi.take_diagnostic()).collect();
+    assert!(
+        !notices.iter().any(|notice| notice.contains("statistics")),
+        "{notices:?}"
+    );
     let ethernet = wifi.receive().unwrap().expect("the AP's frame");
     assert_eq!(ethernet[..6], LOCAL);
     assert_eq!(ethernet[14..], [0x45; 46]);

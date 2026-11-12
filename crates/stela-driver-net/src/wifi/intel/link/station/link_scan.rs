@@ -45,7 +45,7 @@ impl Client {
     /// The port opened on the active link: the join's scan chooses at first.
     pub(super) fn link_authorized(&mut self, now: u64) {
         self.reselect = true;
-        if self.dormant.is_some() {
+        if self.dormant.is_some() && !self.statistics.watching() {
             self.watch_statistics();
         }
         self.link_scan.started = Some(now.saturating_sub(JOIN_SCAN_US));
