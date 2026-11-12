@@ -1,19 +1,22 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 // Copyright(c) 2018-2019 Realtek Corporation
-//! An RTL8822C's registers and rings beneath its [`Rtl8822c`] station: what
-//! rtw88's `mac80211.c`, `pci.c`, `sec.c` and `rtw_set_channel` do for
-//! mac80211. Each step takes the radio's only worker, so nothing here locks.
+//! An rtw88 chip's registers and rings beneath its [`Rtl8822c`] station:
+//! what rtw88's `mac80211.c`, `pci.c`, `sec.c` and `rtw_set_channel` do for
+//! mac80211, with the chip's own runtime operations (rtw88's `rtw_chip_ops`)
+//! behind [`Radio`]. Each step takes the radio's only worker, so nothing here
+//! locks.
 //!
 //! [`Rtl8822c`]: super::station::Rtl8822c
 use super::{
     bootstrap::{self, Claim, Native, Up},
     calibrate::{Calibration, DpkRun, GapkRun},
+    chip::Rtw88,
     coex::{Coex, Event, Order, Wifi},
     commands::{self, Report},
     deep::Deep,
     descriptor::Packet,
     download,
-    dynamic::{self, Dynamic, set_mask},
+    dynamic::{self, Alarms, CckPd, Dynamic, StatusFormat, set_mask},
     features,
     firmware_control::{self, Control, IqkWait},
     interrupt::{self, Controller},
@@ -21,7 +24,11 @@ use super::{
     link::Link,
     phy::{
         FactorySheet, Initialized, PhyInitialized,
-        channel_power::{Geometry, Limits, Width as ChannelWidth},
+        channel_power::{Geometry, Limits, Plan, Width as ChannelWidth},
+        rtl8821c::{
+            self, IQK_POLL_US, Iqk, IqkProgress,
+            runtime::{Tracked, Tracking},
+        },
     },
     receive::{self, Ring},
     regd,
@@ -42,7 +49,7 @@ use crate::{
     },
     wifi::stepped::{Stepped, block_on},
 };
-use alloc::{collections::VecDeque, format, string::String, vec::Vec};
+use alloc::{boxed::Box, collections::VecDeque, format, string::String, vec::Vec};
 use core::{fmt::Debug, task::Poll};
 
 /// `REG_TCR`'s `BIT_PWRMGT_HWDATA_EN` and `BIT_TCR_UPDATE_TIMIE`.
@@ -81,9 +88,6 @@ const REG_NCTL0: u32 = 0x1b00;
 const SELECT_PATH: u32 = 3 << 1;
 const REG_DPD_CTL1: u32 = 0x1b08;
 const POWER_SAVE: u32 = 1 << 7;
-/// `rtw8822c_dig`: each path's gain within one register.
-const REG_GAIN: u32 = 0x1d70;
-const GAIN_MASKS: [u32; 2] = [0x7f, 0x7f00];
 /// `rtw8822c_false_alarm_statistics`' counters, their resets and clock gate.
 const REG_CCK_ENABLE: u32 = 0x1c3c;
 const CCK_BLOCK: u32 = 1 << 1;
@@ -114,9 +118,10 @@ const RESPONSE_RATES_5GHZ: u32 = 0x150;
 /// ring's own size.
 const RECEIVE_BUDGET: usize = 512;
 /// `DBI_TO_MBI(6)`, the antenna gain cfg80211 reads regulatory.db's EIRP under,
-/// and the 3 dB of two chains sending one frame. rtw88 keeps to the sheet
-/// alone; a board's real antennas are not known here.
-const ANTENNA_AND_COMBINING_MBM: i32 = 600 + 301;
+/// and the 3 dB of two chains sending one frame, on a chip with two. rtw88
+/// keeps to the sheet alone; a board's real antennas are not known here.
+const ANTENNA_MBM: i32 = 600;
+const COMBINING_MBM: i32 = 301;
 
 /// What the station goes without when config space stops answering the chip.
 const LINK_SILENT: &str = "PCIe link power save, for a config space bridge that did not finish";
@@ -126,6 +131,8 @@ const RECEIVE_TAG_SLIPPED: &str =
     "received buffers whose DMA tag was out of step (PCIe bus timeouts), which are still taken";
 /// rtw88's "failed to poll iqk status bit", after which it goes on.
 const IQK_UNFINISHED: &str = "an IQK calibration firmware did not report done within 300 ms";
+/// `rtw8821c_do_iqk`'s 300 looks ran out, after which rtw88 goes on.
+const IQK_LOOKS_RAN_OUT: &str = "an IQK calibration firmware did not report done within 6 s";
 /// rtw88's "failed to send h2c command", after which it goes on.
 const MAILBOX_BUSY: &str = "firmware commands dropped while its mailbox stayed busy";
 /// rtw88's "firmware failed to leave lps state", after which it clears the
@@ -165,19 +172,51 @@ fn geometry(definition: &ChannelDefinition) -> Result<Geometry, String> {
             };
             (ChannelWidth::Mhz80, Some(forty), Some(center))
         }
-        _ => return Err(String::from("a channel wider than the RTL8822C's 80 MHz")),
+        _ => return Err(String::from("a channel wider than the chip's 80 MHz")),
     };
     Geometry::new(primary, width, forty, eighty).map_err(failed("channel"))
 }
 
-/// The hardware an attached RTL8822C station runs on.
+/// A chip's PHY at runtime, and what its own operations keep. Each PHY is
+/// taken while a channel changes, and gone if one failed part way.
+enum Radio {
+    Rtl8822C {
+        phy: Option<Box<PhyInitialized>>,
+    },
+    Rtl8821C {
+        phy: Option<Box<rtl8821c::Phy>>,
+        /// The channel's TX power indices, which power tracking reads.
+        plan: Option<Box<Plan>>,
+        tracking: Tracking,
+    },
+}
+
+impl Radio {
+    fn phy_gone(&self) -> bool {
+        match self {
+            Self::Rtl8822C { phy } => phy.is_none(),
+            Self::Rtl8821C { phy, .. } => phy.is_none(),
+        }
+    }
+}
+
+/// A chip's `phy_calibration` under way, a step each poll.
+enum Calibrating {
+    /// `rtw8822c_phy_calibration`.
+    Rtl8822C(rfk::Run<Hardware>),
+    /// `rtw8821c_do_iqk`'s looks, the next one due at `next`.
+    Rtl8821C { iqk: Iqk, next: u64 },
+}
+
+/// The hardware an attached rtw88 station runs on.
 pub struct Hardware {
     control: Control<Native>,
     interrupts: Controller<Bar>,
     receive: Ring<Bar>,
     transmit: Rings<Bar>,
-    /// Taken while a channel changes; gone if one failed part way.
-    phy: Option<PhyInitialized>,
+    radio: Radio,
+    /// The chip's `rtw_chip_info`.
+    spec: &'static Rtw88,
     coex: Coex,
     report: features::Report,
     pages: &'static dyn PageSource,
@@ -187,6 +226,8 @@ pub struct Hardware {
     sheets: (FactorySheet, FactorySheet),
     /// `rtwdev->need_rfk`: the channel changed outside a scan.
     calibrate: bool,
+    /// The RTL8822C's GAPK and predistortion results; the RTL8821C runs
+    /// neither, so its stay empty.
     calibration: Calibration,
     band: Band,
     /// `hal.current_channel` and `current_band_width`.
@@ -208,8 +249,8 @@ pub struct Hardware {
     address: Mac,
     bssid: Mac,
     dynamic: Dynamic,
-    /// `dm_info->cck_gi_u_bnd` and `cck_gi_l_bnd`.
-    cck_bounds: [u8; 2],
+    /// How the chip's `query_phy_status` reads a frame.
+    status: StatusFormat,
     /// `fw->feature`.
     features: u32,
     deep: Deep,
@@ -225,8 +266,8 @@ pub struct Hardware {
     limitations: Vec<&'static str>,
     /// Limitations already told once, which a repeat does not tell again.
     reported: Vec<&'static str>,
-    /// `rtw8822c_phy_calibration` under way, a step each poll.
-    rfk: Option<rfk::Run<Hardware>>,
+    /// The chip's `phy_calibration` under way, a step each poll.
+    rfk: Option<Calibrating>,
     /// `rtw_leave_lps`'s wait for firmware to clear the power bit, until.
     leaving: Option<u64>,
     /// Bluetooth's reports while a calibration holds the arbiter, as rtw88's
@@ -253,6 +294,7 @@ impl Hardware {
         vector: bool,
     ) -> Result<Self, String> {
         let Up {
+            profile,
             mut control,
             mut interrupts,
             receive,
@@ -270,22 +312,51 @@ impl Hardware {
             claim,
             ..
         } = up;
-        let phy = match phy {
-            Initialized::Rtl8822C(phy) => *phy,
-            Initialized::Rtl8821C(_) => {
-                return Err("the RTL8821C's station runtime is not ported".into());
+        let spec = profile.rtw88().ok_or("a chip rtw88 does not drive")?;
+        let raw = board.raw();
+        let calibration = Calibration::new(raw.power_track_raw);
+        let (radio, gains, crystal_cap, lck_reference, status, cck) = match phy {
+            Initialized::Rtl8822C(phy) => {
+                let initial = phy.factory().calibration().initial();
+                let gains = initial.igi_history();
+                let crystal_cap = initial.crystal_cap();
+                let cck_bounds = initial.cck_bounds();
+                let lck_reference = phy.tracking().lck_reference;
+                (
+                    Radio::Rtl8822C { phy: Some(phy) },
+                    gains,
+                    crystal_cap,
+                    lck_reference,
+                    StatusFormat::Rtl8822C { cck_bounds },
+                    CckPd::Stepped,
+                )
+            }
+            Initialized::Rtl8821C(phy) => {
+                // rtw_phy_init: the gain the tables left, no history.
+                let gains = [phy.initial_igi(), 0, 0, 0];
+                let crystal_cap = phy.crystal_cap();
+                let status = StatusFormat::Rtl8821C { rfe: phy.rfe() };
+                let cck = CckPd::Absolute {
+                    default: phy.cck_pd_default(),
+                };
+                let tracking = Tracking::new(raw.thermal_raw[0], raw.power_track_raw == 0);
+                let radio = Radio::Rtl8821C {
+                    phy: Some(phy),
+                    plan: None,
+                    tracking,
+                };
+                (radio, gains, crystal_cap, 0, status, cck)
             }
         };
-        let initial = phy.factory().calibration().initial();
-        let cck_bounds = initial.cck_bounds();
-        let calibration = Calibration::new(board.raw().power_track_raw);
         let dynamic = Dynamic::new(dynamic::Initial {
-            gains: initial.igi_history(),
-            crystal_cap: initial.crystal_cap(),
-            thermal: board.raw().thermal_raw,
-            power_tracked: board.raw().power_track_raw == 0,
-            lck_reference: phy.tracking().lck_reference,
+            gains,
+            crystal_cap,
+            thermal: raw.thermal_raw,
+            power_tracked: raw.power_track_raw == 0,
+            lck_reference,
             dfs_region,
+            dig_min: spec.dig_min,
+            cck,
         });
         let mut limitations = Vec::new();
         if !link.answered() {
@@ -305,7 +376,8 @@ impl Hardware {
             interrupts,
             receive,
             transmit,
-            phy: Some(phy),
+            radio,
+            spec,
             coex,
             report,
             pages,
@@ -327,9 +399,9 @@ impl Hardware {
             address: mac,
             bssid: Mac([0; 6]),
             dynamic,
-            cck_bounds,
+            status,
             features,
-            deep: Deep::new(features, !disabled.lps_deep),
+            deep: Deep::new(features, !disabled.lps_deep, spec.lps_deep_power_gate),
             link,
             templates: None,
             power_gate_pages: None,
@@ -445,8 +517,12 @@ impl Hardware {
                 Order::Wake => self.set_power_save(false)?,
                 Order::SingleStream(single) if single != self.single_stream => {
                     self.single_stream = single;
-                    let io = self.control.io().map_err(failed("registers"))?;
-                    Dynamic::set_paths(io, single).map_err(failed("paths"))?;
+                    // A one-path chip receives and sends on path A alone
+                    // whatever the arbiter asks.
+                    if self.spec.rf_paths > 1 {
+                        let io = self.control.io().map_err(failed("registers"))?;
+                        Dynamic::set_paths(io, single).map_err(failed("paths"))?;
+                    }
                     self.stream_changes.push_back(single);
                 }
                 Order::SingleStream(_) => {}
@@ -567,20 +643,63 @@ impl Hardware {
     }
 
     fn step_calibration(&mut self, hurry: bool) -> Result<(), String> {
-        let Some(mut run) = self.rfk.take() else {
+        let Some(run) = self.rfk.take() else {
             return Ok(());
         };
-        match run.step(self, hurry)? {
-            Progress::Running => self.rfk = Some(run),
-            Progress::Done { hurried } => {
-                self.limitations.extend(self.calibration.take_shortfalls());
-                if hurried {
-                    self.calibrate = true;
-                    self.limit_once(CALIBRATION_CUT_SHORT);
+        match run {
+            Calibrating::Rtl8822C(mut run) => match run.step(self, hurry)? {
+                Progress::Running => self.rfk = Some(Calibrating::Rtl8822C(run)),
+                Progress::Done { hurried } => {
+                    self.limitations.extend(self.calibration.take_shortfalls());
+                    if hurried {
+                        self.calibrate = true;
+                        self.limit_once(CALIBRATION_CUT_SHORT);
+                    }
+                }
+            },
+            Calibrating::Rtl8821C { mut iqk, next } => {
+                let io = self.control.io().map_err(failed("registers"))?;
+                let now = io.now_us().map_err(failed("clock"))?;
+                if !hurry && now < next {
+                    self.rfk = Some(Calibrating::Rtl8821C { iqk, next });
+                    return Ok(());
+                }
+                // SAFETY: this worker owns the radio, and frames wait for it.
+                match unsafe { iqk.poll(io, &self.report, hurry) }.map_err(failed("iqk"))? {
+                    IqkProgress::Pending => {
+                        let next = now.saturating_add(IQK_POLL_US);
+                        self.rfk = Some(Calibrating::Rtl8821C { iqk, next });
+                    }
+                    IqkProgress::Done { finished: true, .. } => {}
+                    IqkProgress::Done { .. } if hurry => {
+                        self.calibrate = true;
+                        self.limit_once(CALIBRATION_CUT_SHORT);
+                    }
+                    IqkProgress::Done { .. } => self.limit_once(IQK_LOOKS_RAN_OUT),
                 }
             }
         }
         Ok(())
+    }
+
+    /// The chip's `phy_calibration`, begun: the first step of the RTL8822C's
+    /// run, or the RTL8821C's IQK command, `segment` when associated.
+    fn start_calibration(&mut self, segment: bool) -> Result<Calibrating, String> {
+        match self.radio {
+            Radio::Rtl8822C { .. } => Ok(Calibrating::Rtl8822C(rfk::Run::start(self)?)),
+            Radio::Rtl8821C { .. } => {
+                // SAFETY: the command goes out on this radio's own rings,
+                // and frames wait for the IQK it starts.
+                unsafe { self.transmit.iqk_command(self.pages, false, segment) }
+                    .map_err(failed("iqk"))?;
+                let io = self.control.io().map_err(failed("registers"))?;
+                let now = io.now_us().map_err(failed("clock"))?;
+                Ok(Calibrating::Rtl8821C {
+                    iqk: Iqk::default(),
+                    next: now.saturating_add(IQK_POLL_US),
+                })
+            }
+        }
     }
 
     /// End the calibration under way in a few hurried steps, before work that
@@ -614,44 +733,21 @@ impl Hardware {
         Ok(())
     }
 
-    /// `rtw8822c_false_alarm_statistics`: the total and CCK's own, and a new
-    /// count.
+    /// The chip's `false_alarm_statistics`: the total and CCK's own, and a
+    /// new count of CCK frames.
     fn false_alarms(&mut self) -> Result<(u16, u32), String> {
         let io = self.control.io().map_err(failed("registers"))?;
-        let cck_enabled = io.read32(REG_CCK_ENABLE).map_err(failed("alarms"))? & CCK_BLOCK != 0;
-        let cck = io.read16(REG_CCK_ALARMS).map_err(failed("alarms"))?;
-        let frames = io.read32(REG_CCK_FRAMES).map_err(failed("alarms"))?;
-        self.cck_frames = (frames & 0xffff) + (frames >> 16);
-        let mut counts = [0; 5];
-        for (count, register) in counts.iter_mut().zip(REG_OFDM_ALARMS) {
-            *count = io.read32(register).map_err(failed("alarms"))?;
+        let alarms = match self.radio {
+            Radio::Rtl8822C { .. } => alarms_8822c(io),
+            Radio::Rtl8821C { .. } => rtl8821c::runtime::false_alarms(io),
         }
-        let [one, two, three, four, five] = counts;
-        let (low, high) = (|word: u32| word & 0xffff, |word: u32| word >> 16);
-        let total = high(one)
-            + low(two)
-            + high(two)
-            + low(three)
-            + low(four)
-            + high(four)
-            + low(five)
-            + high(five)
-            + if cck_enabled { u32::from(cck) } else { 0 };
-        let mut reset = |register, mask, value| {
-            set_mask(io, register, mask, value).map_err(failed("alarm reset"))
-        };
-        reset(REG_ALARM_RESET, CCK_ALARM_RESET, 0)?;
-        reset(REG_ALARM_RESET, CCK_ALARM_RESET, 2)?;
-        reset(REG_ALARM_RESET, OFDM_ALARM_RESET, 0)?;
-        reset(REG_ALARM_RESET, OFDM_ALARM_RESET, 2)?;
-        reset(REG_RX_BREAK, RX_CLOCK_GATE, 0)?;
-        reset(REG_COUNTER_CONTROL, ALL_COUNTERS_RESET, 1)?;
-        reset(REG_COUNTER_CONTROL, ALL_COUNTERS_RESET, 0)?;
-        reset(REG_RX_BREAK, RX_CLOCK_GATE, 1)?;
-        Ok((total as u16, u32::from(cck)))
+        .map_err(failed("alarms"))?;
+        self.cck_frames = alarms.cck_frames;
+        Ok((alarms.total, alarms.cck))
     }
 
-    /// `rtw_fw_adaptivity`, or `rtw8822c_adaptivity` on firmware without it.
+    /// `rtw_fw_adaptivity`, or the chip's `adaptivity` on firmware without
+    /// it: `rtw8822c_adaptivity`; the RTL8821C has none.
     fn adapt(&mut self) -> Result<(), String> {
         if self.features & ADAPTIVITY != 0 {
             let (mode, gain, threshold, density) = self.dynamic.adaptivity();
@@ -659,6 +755,9 @@ impl Hardware {
                 commands::adaptivity(mode, gain, threshold, density),
                 "adaptivity",
             );
+        }
+        if let Radio::Rtl8821C { .. } = self.radio {
+            return Ok(());
         }
         let (rising, falling) = self.dynamic.energy_thresholds();
         let io = self.control.io().map_err(failed("registers"))?;
@@ -669,11 +768,66 @@ impl Hardware {
         Ok(())
     }
 
-    /// `rtw_phy_dig_write`.
+    /// `rtw_phy_dig_write`: each path's field of the chip's `dig`.
     fn write_gain(&mut self, gain: u8) -> Result<(), String> {
         let io = self.control.io().map_err(failed("registers"))?;
-        for mask in GAIN_MASKS {
-            set_mask(io, REG_GAIN, mask, u32::from(gain)).map_err(failed("gain"))?;
+        for &(register, mask) in self.spec.dig {
+            set_mask(io, register, mask, u32::from(gain)).map_err(failed("gain"))?;
+        }
+        Ok(())
+    }
+
+    /// What `rtw_phy_dynamic_mechanism` asks of the chip's own operations past
+    /// the gain and CCK detection: the RTL8822C's transmit path
+    /// (`rtw_phy_tx_path_diversity`), crystal (`rtw8822c_cfo_track`),
+    /// predistortion (`rtw8822c_dpk_track`) and `rtw8822c_pwr_track`; the
+    /// RTL8821C's `rtw8821c_pwr_track`, whose IQK runs a step each poll.
+    fn track(&mut self, linked: bool) -> Result<(), String> {
+        let band = self.band;
+        let io = self.control.io().map_err(failed("registers"))?;
+        match &mut self.radio {
+            Radio::Rtl8822C { .. } => {
+                if linked && !self.single_stream {
+                    self.dynamic
+                        .choose_path(io)
+                        .map_err(failed("transmit path"))?;
+                }
+                let bluetooth_off = Coex::bluetooth_off(io).map_err(failed("coex"))?;
+                self.dynamic
+                    .track_frequency(io, linked, bluetooth_off)
+                    .map_err(failed("crystal"))?;
+                // SAFETY: this worker owns the radio and its frames wait for it.
+                unsafe { self.calibration.track(io, &self.report) }
+                    .map_err(failed("predistortion"))?;
+                // SAFETY: as above.
+                unsafe { self.dynamic.track_temperature(io, &self.report, band) }
+                    .map_err(failed("temperature"))?;
+                if self.dynamic.take_unsettled_lock() {
+                    self.limit_once(LOCK_UNSETTLED);
+                }
+            }
+            Radio::Rtl8821C {
+                phy: Some(phy),
+                plan: Some(plan),
+                tracking,
+            } => {
+                // rtw_phy_get_tx_power_index of the peer's rate, or of 6 Mb/s
+                // where the band has no such rate.
+                let rate = self.dynamic.tx_rate();
+                let Some(index) = plan.gain(0, rate).or_else(|| plan.gain(0, 4)) else {
+                    return Ok(());
+                };
+                let channel = self.channel.0;
+                // SAFETY: as above.
+                let tracked =
+                    unsafe { tracking.track(io, &self.report, phy, channel, rate, index) }
+                        .map_err(failed("temperature"))?;
+                if tracked == Tracked::Iqk && self.rfk.is_none() {
+                    self.rfk = Some(self.start_calibration(linked)?);
+                }
+            }
+            // No channel yet: nothing to track against.
+            Radio::Rtl8821C { .. } => {}
         }
         Ok(())
     }
@@ -687,6 +841,42 @@ impl Hardware {
         }
         Ok(())
     }
+}
+
+/// `rtw8822c_false_alarm_statistics`: the counts, then each counter reset.
+fn alarms_8822c(io: &mut Native) -> Result<Alarms, super::io::Error> {
+    let cck_enabled = io.read32(REG_CCK_ENABLE)? & CCK_BLOCK != 0;
+    let cck = io.read16(REG_CCK_ALARMS)?;
+    let frames = io.read32(REG_CCK_FRAMES)?;
+    let mut counts = [0; 5];
+    for (count, register) in counts.iter_mut().zip(REG_OFDM_ALARMS) {
+        *count = io.read32(register)?;
+    }
+    let [one, two, three, four, five] = counts;
+    let (low, high) = (|word: u32| word & 0xffff, |word: u32| word >> 16);
+    let total = high(one)
+        + low(two)
+        + high(two)
+        + low(three)
+        + low(four)
+        + high(four)
+        + low(five)
+        + high(five)
+        + if cck_enabled { u32::from(cck) } else { 0 };
+    let mut reset = |register, mask, value| set_mask(io, register, mask, value);
+    reset(REG_ALARM_RESET, CCK_ALARM_RESET, 0)?;
+    reset(REG_ALARM_RESET, CCK_ALARM_RESET, 2)?;
+    reset(REG_ALARM_RESET, OFDM_ALARM_RESET, 0)?;
+    reset(REG_ALARM_RESET, OFDM_ALARM_RESET, 2)?;
+    reset(REG_RX_BREAK, RX_CLOCK_GATE, 0)?;
+    reset(REG_COUNTER_CONTROL, ALL_COUNTERS_RESET, 1)?;
+    reset(REG_COUNTER_CONTROL, ALL_COUNTERS_RESET, 0)?;
+    reset(REG_RX_BREAK, RX_CLOCK_GATE, 1)?;
+    Ok(Alarms {
+        total: total as u16,
+        cck: u32::from(cck),
+        cck_frames: (frames & 0xffff) + (frames >> 16),
+    })
 }
 
 /// `rtw_vif_write_addr`.
@@ -729,7 +919,7 @@ fn cam_words(key: &CamKey<'_>) -> [u32; 8] {
 /// came in on.
 fn incoming(
     packet: &receive::Packet<'_>,
-    cck_bounds: [u8; 2],
+    format: StatusFormat,
 ) -> Option<(Incoming, Option<dynamic::Signal>)> {
     let facts = &packet.facts;
     if facts.firmware {
@@ -741,7 +931,6 @@ fn incoming(
     // IEEE80211_HW_RX_INCLUDES_FCS.
     let length = packet.payload.len().checked_sub(4)?;
     let signal = if facts.phy_present {
-        let format = dynamic::StatusFormat::Rtl8822C { cck_bounds };
         dynamic::phy_status(packet.driver_info, format, facts.rate_raw)
     } else {
         None
@@ -766,8 +955,12 @@ impl Device for Hardware {
     ) -> Result<(), String> {
         self.rouse()?;
         let geometry = geometry(definition)?;
-        let phy = self.phy.take().ok_or("the PHY failed a channel change")?;
         let band = definition.control.band;
+        let combining = if self.spec.rf_paths > 1 {
+            COMBINING_MBM
+        } else {
+            0
+        };
         let limits = Limits {
             factory_sheet: if band == Band::Ghz2 {
                 self.sheets.0
@@ -775,24 +968,54 @@ impl Device for Hardware {
                 self.sheets.1
             },
             max_eirp_mbm: eirp_mbm,
-            antenna_and_combining_mbm: [ANTENNA_AND_COMBINING_MBM; 2],
+            antenna_and_combining_mbm: [ANTENNA_MBM + combining; 2],
             sar_quarter_dbm: None,
             remnant_cck: 0,
             remnant_ofdm: [0; 2],
         };
-        let plan = phy
-            .factory_power()
-            .plan_channel_power(geometry, limits)
-            .map_err(failed("channel power"))?;
         let io = self.control.io().map_err(failed("registers"))?;
-        // SAFETY: the only worker owns the radio and its frames wait for it.
-        let set =
-            unsafe { phy.set_channel(io, &self.report, geometry) }.map_err(failed("channel"))?;
-        self.band = band;
-        // SAFETY: as above, with `plan` made for this channel.
-        let programmed = unsafe { set.program_channel_power(io, &self.report, plan) }
-            .map_err(failed("transmit power"))?;
-        self.phy = Some(programmed.into_phy());
+        match &mut self.radio {
+            Radio::Rtl8822C { phy: slot } => {
+                let phy = *slot.take().ok_or("the PHY failed a channel change")?;
+                let plan = phy
+                    .factory_power()
+                    .plan_channel_power(geometry, limits)
+                    .map_err(failed("channel power"))?;
+                // SAFETY: the only worker owns the radio and its frames wait for it.
+                let set = unsafe { phy.set_channel(io, &self.report, geometry) }
+                    .map_err(failed("channel"))?;
+                self.band = band;
+                // SAFETY: as above, with `plan` made for this channel.
+                let programmed = unsafe { set.program_channel_power(io, &self.report, plan) }
+                    .map_err(failed("transmit power"))?;
+                *slot = Some(Box::new(programmed.into_phy()));
+            }
+            Radio::Rtl8821C {
+                phy: slot,
+                plan: kept,
+                tracking,
+            } => {
+                let mut phy = slot.take().ok_or("the PHY failed a channel change")?;
+                *kept = None;
+                let plan = phy
+                    .factory_power()
+                    .plan_channel_power(geometry, limits)
+                    .map_err(failed("channel power"))?;
+                // rtw_regd_srrc.
+                let srrc = self.alpha2 == *b"CN";
+                // SAFETY: as above.
+                unsafe { phy.set_channel(io, &self.report, geometry, srrc) }
+                    .map_err(failed("channel"))?;
+                self.band = band;
+                // SAFETY: as above, with `plan` made for this channel.
+                unsafe { phy.program_channel_power(io, &self.report, &plan) }
+                    .map_err(failed("transmit power"))?;
+                // rtw8821c_set_channel_bb_swing's rtw8821c_pwrtrack_init.
+                tracking.reset();
+                *kept = Some(Box::new(plan));
+                *slot = Some(phy);
+            }
+        }
         self.calibrate |= !scanning;
         let width = match definition.width {
             Width::Mhz40 => 1,
@@ -808,7 +1031,8 @@ impl Device for Hardware {
     fn prepare_transmit(&mut self) -> Result<(), String> {
         self.arbitrate(Event::Connecting)?;
         if core::mem::take(&mut self.calibrate) {
-            self.rfk = Some(rfk::Run::start(self)?);
+            // rtw_is_assoc: mac80211 prepares before it authenticates.
+            self.rfk = Some(self.start_calibration(self.connected)?);
         }
         Ok(())
     }
@@ -844,12 +1068,12 @@ impl Device for Hardware {
         if self.vector {
             self.interrupts.capture().map_err(failed("interrupt"))?;
         }
-        let (cck_bounds, address, bssid) = (self.cck_bounds, self.address, self.bssid);
+        let (status, address, bssid) = (self.status, self.address, self.bssid);
         let dynamic = &mut self.dynamic;
         let mut bluetooth = Vec::new();
         self.receive
             .poll(RECEIVE_BUDGET, |packet| {
-                let Some((item, signal)) = incoming(&packet, cck_bounds) else {
+                let Some((item, signal)) = incoming(&packet, status) else {
                     return;
                 };
                 match &item {
@@ -1072,22 +1296,8 @@ impl Device for Hardware {
             };
             io.write32(REG_RRSR, rates & self.dynamic.response_rates())
                 .map_err(failed("response rates"))?;
-            self.dynamic
-                .choose_path(io)
-                .map_err(failed("transmit path"))?;
         }
-        let bluetooth_off = Coex::bluetooth_off(io).map_err(failed("coex"))?;
-        self.dynamic
-            .track_frequency(io, linked, bluetooth_off)
-            .map_err(failed("crystal"))?;
-        // SAFETY: this worker owns the radio and its frames wait for it.
-        unsafe { self.calibration.track(io, &self.report) }.map_err(failed("predistortion"))?;
-        // SAFETY: as above.
-        unsafe { self.dynamic.track_temperature(io, &self.report, band) }
-            .map_err(failed("temperature"))?;
-        if self.dynamic.take_unsettled_lock() {
-            self.limit_once(LOCK_UNSETTLED);
-        }
+        self.track(linked)?;
         self.adapt()?;
         Ok(Watched {
             level: self.dynamic.level(),
@@ -1130,7 +1340,7 @@ impl Device for Hardware {
             || self.receive.quarantined()
             || self.transmit.quarantined()
             || self.interrupts.state() == interrupt::State::Quarantined
-            || self.phy.is_none()
+            || self.radio.phy_gone()
     }
 
     fn recoverable(&self) -> bool {

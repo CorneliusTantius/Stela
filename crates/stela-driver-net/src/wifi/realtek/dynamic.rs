@@ -51,7 +51,6 @@ const LINKED_LOW: u16 = 250;
 const LINKED_HIGH: u16 = 500;
 const LINKED_MAX: u8 = 0x5a;
 const LINKED_MID: u8 = 0x40;
-const LINKED_MIN: u8 = 0x20;
 const COVERAGE_ALARMS: [u16; 3] = [5000, 4000, 2000];
 const COVERAGE_MAX: u8 = 0x2a;
 const COVERAGE_MID: u8 = 0x26;
@@ -71,7 +70,7 @@ pub struct Traffic {
 }
 const RSSI_GAIN_OFFSET: u8 = 15;
 /// `DECLARE_EWMA(rssi, 10, 16)`.
-const AVERAGE_PRECISION: u32 = 10;
+pub(in crate::wifi::realtek) const AVERAGE_PRECISION: u32 = 10;
 const AVERAGE_WEIGHT: u32 = 4;
 /// `rtw_phy_get_rssi_level`'s table and `RA_FLOOR_UP_GAP`.
 const LEVELS: [u8; 7] = [20, 34, 38, 42, 46, 50, 100];
@@ -261,7 +260,7 @@ fn mask_of<I: Io>(io: &mut I, register: u32, mask: u32) -> Result<u32, io::Error
 }
 
 /// `ewma_add`, in ten fraction bits.
-fn average_in(internal: &mut u64, value: u64, weight: u32) {
+pub(in crate::wifi::realtek) fn average_in(internal: &mut u64, value: u64, weight: u32) {
     let value = value << AVERAGE_PRECISION;
     *internal = if *internal == 0 {
         value
@@ -489,6 +488,17 @@ fn response_rates(rate: u8) -> u32 {
     (1 << (order + CCK_ORDERS)) - 1
 }
 
+/// One `false_alarm_statistics` of a chip.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Alarms {
+    /// `total_fa_cnt`.
+    pub total: u16,
+    /// `cck_fa_cnt`.
+    pub cck: u32,
+    /// `cck_ok_cnt + cck_err_cnt`.
+    pub cck_frames: u32,
+}
+
 /// What a station starts tracking from.
 #[derive(Debug)]
 pub struct Initial {
@@ -501,7 +511,29 @@ pub struct Initial {
     pub lck_reference: u8,
     /// regulatory.db's `dfs_region` of the country.
     pub dfs_region: u8,
+    /// The chip's `dig_min`.
+    pub dig_min: u8,
+    /// The chip's `cck_pd_set`.
+    pub cck: CckPd,
 }
+
+/// A chip's `cck_pd_set`: what a new CCK packet detection level writes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CckPd {
+    /// `rtw8822c_phy_cck_pd_set`: the threshold and carrier sense of the
+    /// width and path count in use, each moved by the level's step.
+    Stepped,
+    /// `rtw8821c_phy_cck_pd_set`: `REG_PWRTH`'s threshold from its table and
+    /// `REG_PWRTH2`'s carrier sense ratio two above `default` a level.
+    Absolute { default: u8 },
+}
+
+/// `rtw8821c_phy_cck_pd_set`'s thresholds by level, and their registers.
+const ABSOLUTE_THRESHOLDS: [u32; 5] = [3, 7, 13, 13, 13];
+const REG_PWRTH: u32 = 0xa08;
+const PWRTH: u32 = 0x3f_0000;
+const REG_PWRTH2: u32 = 0xaa8;
+const PWRTH2: u32 = 0x1f_0000;
 
 /// `rtw_cfo_track`.
 #[derive(Debug)]
@@ -617,6 +649,8 @@ pub struct Dynamic {
     /// `cck_fa_avg`, none after each reset.
     cck_average: Option<u32>,
     cck_levels: [[u8; 2]; 2],
+    cck: CckPd,
+    dig_min: u8,
     /// `dm_path_div`.
     tx_path: Path,
     path_sums: [u32; 2],
@@ -656,6 +690,8 @@ impl Dynamic {
             damping_rssi: 0,
             cck_average: None,
             cck_levels: [[0; 2]; 2],
+            cck: initial.cck,
+            dig_min: initial.dig_min,
             tx_path: Path::A,
             path_sums: [0; 2],
             path_counts: [0; 2],
@@ -833,6 +869,15 @@ impl Dynamic {
         let Some(new) = self.cck_level(average, linked) else {
             return Ok(());
         };
+        if let CckPd::Absolute { default } = self.cck {
+            if self.cck_levels[0][0] == new {
+                return Ok(());
+            }
+            self.cck_average = None;
+            self.cck_levels[0][0] = new;
+            set_mask(io, REG_PWRTH, PWRTH, ABSOLUTE_THRESHOLDS[usize::from(new)])?;
+            return set_mask(io, REG_PWRTH2, PWRTH2, u32::from(default + new * 2));
+        }
         let paths = mask_of(io, REG_CCK_PATHS, CCK_PATHS)? as usize;
         let width = mask_of(io, REG_WIDTH, WIDTH)? as usize;
         if width > 1 || paths > 1 {
@@ -1073,6 +1118,11 @@ impl Dynamic {
         self.level
     }
 
+    /// `dm_info->tx_rate`.
+    pub fn tx_rate(&self) -> u8 {
+        self.tx_rate
+    }
+
     pub fn current_gain(&self) -> u8 {
         self.gains[0]
     }
@@ -1159,8 +1209,8 @@ impl Dynamic {
             .find_map(|(threshold, step)| (alarms > threshold).then_some(step))
             .unwrap_or(0);
         let (max, mid, min, floor) = if linked {
-            let floor = self.min_rssi.max(LINKED_MIN);
-            (LINKED_MAX, LINKED_MID, LINKED_MIN, floor)
+            let floor = self.min_rssi.max(self.dig_min);
+            (LINKED_MAX, LINKED_MID, self.dig_min, floor)
         } else {
             (COVERAGE_MAX, COVERAGE_MID, MAX_COVERAGE, MAX_COVERAGE)
         };
@@ -1253,6 +1303,8 @@ mod tests {
             power_tracked: true,
             lck_reference: 0x20,
             dfs_region: 1,
+            dig_min: 0x20,
+            cck: CckPd::Stepped,
         })
     }
 
@@ -1418,6 +1470,38 @@ mod tests {
         dynamic.detect_cck(&mut bus, 700, false).unwrap();
         assert_eq!(dynamic.cck_average, Some(700));
         assert_eq!(dynamic.cck_levels[0][1], 0);
+    }
+
+    #[test]
+    fn an_rtl8821c_level_writes_its_threshold_and_carrier_sense_absolutely() {
+        let mut bus = Bus::default();
+        bus.0.insert(REG_PWRTH, 0xff00_ffff);
+        let mut dynamic = at_gain(0x30);
+        dynamic.cck = CckPd::Absolute { default: 6 };
+        dynamic.heard(30);
+        dynamic.sample(true);
+        // Level two, whatever width or paths the PHY stands at.
+        dynamic.detect_cck(&mut bus, 0, true).unwrap();
+        assert_eq!(bus.get(REG_PWRTH), 0xff0d_ffff);
+        assert_eq!(bus.get(REG_PWRTH2), 10 << 16);
+        assert_eq!(dynamic.cck_average, None);
+        // The same level writes nothing again.
+        bus.0.insert(REG_PWRTH2, 0);
+        dynamic.detect_cck(&mut bus, 0, true).unwrap();
+        assert_eq!(bus.get(REG_PWRTH2), 0);
+        dynamic.detect_cck(&mut bus, 0, false).unwrap();
+        assert_eq!(bus.get(REG_PWRTH), 0xff03_ffff);
+        assert_eq!(bus.get(REG_PWRTH2), 6 << 16);
+    }
+
+    #[test]
+    fn a_linked_gain_keeps_above_the_chips_own_floor() {
+        let mut dynamic = at_gain(0x1c);
+        dynamic.dig_min = 0x1c;
+        dynamic.sample(true);
+        assert_eq!(dynamic.gain(0, true), None, "0x1c is the RTL8821C's floor");
+        dynamic.dig_min = 0x20;
+        assert_eq!(dynamic.gain(0, true), Some(0x20));
     }
 
     #[test]

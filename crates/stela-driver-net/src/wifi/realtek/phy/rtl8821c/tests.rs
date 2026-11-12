@@ -268,7 +268,7 @@ fn tx_power_reads_bcd_by_rate_and_writes_absolute_indices() {
 /// One IQK look on a register file.
 fn poll(iqk: &mut Iqk, r: &mut Regs, report: &Report) -> Result<IqkProgress, Error> {
     // SAFETY: the register file belongs to the calling test alone.
-    unsafe { iqk.poll(r, report) }
+    unsafe { iqk.poll(r, report, false) }
 }
 
 #[test]
@@ -306,4 +306,81 @@ fn firmware_iqk_is_one_look_a_poll_until_done_or_out_of_looks() {
         })
     );
     assert_eq!(r.sipi().last(), Some(&(RF_DTXLOK, 0)));
+}
+
+#[test]
+fn a_hurried_iqk_ends_at_its_next_look() {
+    let (mut r, _, report) = set_up(0);
+    r.set(REG_IQKFAILMSK, 4, 0);
+    let mut iqk = Iqk::default();
+    assert_eq!(poll(&mut iqk, &mut r, &report), Ok(IqkProgress::Pending));
+    // SAFETY: the register file belongs to this test alone.
+    let done = unsafe { iqk.poll(&mut r, &report, true) };
+    assert!(matches!(
+        done,
+        Ok(IqkProgress::Done {
+            finished: false,
+            ..
+        })
+    ));
+    assert_eq!(r.sipi().last(), Some(&(RF_DTXLOK, 0)));
+}
+
+#[test]
+fn false_alarms_count_cck_only_while_it_receives_and_reset_each_counter() {
+    use crate::wifi::realtek::dynamic::Alarms;
+    use runtime::false_alarms;
+    let (mut r, _, _) = set_up(0);
+    r.set(0xa5c, 2, 30);
+    r.set(0xf48, 2, 200);
+    r.set(0xf04, 4, 5 << 16 | 7);
+    r.set(REG_RXPSEL, 4, 0);
+    let alarms = false_alarms(&mut r).unwrap();
+    assert_eq!(
+        alarms,
+        Alarms {
+            total: 200,
+            cck: 30,
+            cck_frames: 12
+        }
+    );
+    r.set(REG_RXPSEL, 4, 1 << 28);
+    assert_eq!(false_alarms(&mut r).unwrap().total, 230);
+    // Each reset pulses and ends where rtw88 leaves it.
+    assert_eq!(r.get(0x9a4, 4) & 1 << 17, 0);
+    assert_ne!(r.get(0xa2c, 4) & 1 << 15, 0);
+    assert_eq!(r.get(0xb58, 4) & 1, 0);
+}
+
+#[test]
+fn power_tracking_asks_then_reads_and_moves_path_as_power_with_the_meter() {
+    use runtime::{Tracked, Tracking};
+    let (mut r, phy, report) = set_up(0);
+    let default = phy.default_ofdm_index();
+    let mut tracking = Tracking::new(0x20, true);
+    let track = |r: &mut Regs, tracking: &mut Tracking| {
+        // SAFETY: the register file belongs to this test alone.
+        unsafe { tracking.track(r, &report, &phy, 1, 4, 0x30) }.unwrap()
+    };
+    // The first run asks the meter.
+    assert_eq!(track(&mut r, &mut tracking), Tracked::Nothing);
+    assert_eq!(r.rf(0x42) >> 16 & 3, 3);
+    // The second reads it: ten over the efuse's, 2.4 GHz OFDM's table
+    // raises the power by three, all within the TXAGC's room.
+    r.set(0x2800 + 0x42 * 4, 4, (r.rf(0x42) & !0xfc00) | 0x2a << 10);
+    assert_eq!(track(&mut r, &mut tracking), Tracked::Iqk);
+    assert_eq!(r.get(0xc94, 4) >> 1 & 0x3f, 3);
+    assert_eq!(
+        r.get(REG_TXSCALE_A, 4) >> 21,
+        TX_SCALE[usize::from(default)]
+    );
+    // An unchanged reading moves nothing and asks no second IQK.
+    r.set(0xc94, 4, 0);
+    assert_eq!(track(&mut r, &mut tracking), Tracked::Nothing);
+    assert_eq!(track(&mut r, &mut tracking), Tracked::Nothing);
+    assert_eq!(r.get(0xc94, 4), 0);
+    // A channel switch starts it again; an untracked board asks nothing.
+    tracking.reset();
+    let mut untracked = Tracking::new(0x20, false);
+    assert_eq!(track(&mut r, &mut untracked), Tracked::Nothing);
 }

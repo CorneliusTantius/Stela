@@ -410,3 +410,144 @@ fn a_dropped_rtl8821c_attempt_is_reset_by_the_next() {
     assert!(longest <= RECOVERY_STEP_US, "a step took {longest} us");
     assert_eq!(model.lock().unwrap().quarantined, quarantined);
 }
+
+/// An RTL8821C brought up through the native register interface at a
+/// modeled BAR, and the station runtime on it.
+struct Attached {
+    chip: Arc<Mutex<Model>>,
+    memory: Arc<Mutex<crate::wifi::realtek::beacon::tests::Model>>,
+    hardware: crate::wifi::realtek::hardware::Hardware,
+    window: core::ptr::NonNull<u8>,
+}
+
+impl Drop for Attached {
+    fn drop(&mut self) {
+        crate::wifi::realtek::io::model::detach(self.window);
+    }
+}
+
+/// A clock at host speed: a counter read is a tenth of a microsecond.
+const HOST_CLOCK: Clock = Clock {
+    ticks_per_microsecond: 1_000,
+};
+
+fn attach_8821c(rfe: u8) -> Attached {
+    use crate::wifi::realtek::{
+        beacon::tests::{Domain, Model as Memory, Source},
+        bootstrap::Claim,
+        hardware::Hardware,
+        io::model,
+    };
+    use alloc::{boxed::Box, rc::Rc};
+    use core::ptr::NonNull;
+    core::mem::forget(crate::test_clock::virtualize());
+    let (chip, profile) = chip_8821c(rfe);
+    let bar: &'static mut [u32] = Box::leak(vec![0; 0x4000].into_boxed_slice());
+    let window = NonNull::new(bar.as_mut_ptr().cast::<u8>()).unwrap();
+    model::attach(
+        window,
+        Rc::new(Registers(RefCell::new(Bus {
+            model: chip.clone(),
+            panic_delay: false,
+            panic_register: None,
+            clock: Some(HOST_CLOCK),
+        }))),
+    );
+    let memory = Arc::new(Mutex::new(Memory::default()));
+    let claim = Claim {
+        window,
+        bytes: 0x10000,
+        owner: Arc::new(()),
+        clock: HOST_CLOCK,
+        pages: &Source,
+        domain: Arc::new(Domain(memory.clone())),
+        firmware: Box::leak(Box::new(catalog_for(profile, legacy_fixture()))),
+        observed: profile.observed(),
+        link_control: 0,
+    };
+    // SAFETY: the modeled BAR, its pages and its domain belong to the
+    // calling test alone; no other driver, worker or DMA touches them.
+    let up = unsafe { bootstrap::bring_up(claim) }.unwrap();
+    // SAFETY: straight from the bring-up, with no MSI.
+    let hardware = unsafe { Hardware::new(up, *b"US", 0, false) }.unwrap();
+    Attached {
+        chip,
+        memory,
+        hardware,
+        window,
+    }
+}
+
+/// `frequency_mhz`'s 20 MHz channel.
+fn channel(frequency_mhz: u16) -> crate::wifi::station::operations::ChannelDefinition {
+    use crate::wifi::{Band, Channel, station::phy::Width};
+    let (band, number) = if frequency_mhz < 5000 {
+        (Band::Ghz2, (frequency_mhz - 2407) / 5)
+    } else {
+        (Band::Ghz5, (frequency_mhz - 5000) / 5)
+    };
+    crate::wifi::station::operations::ChannelDefinition {
+        control: Channel {
+            band,
+            number,
+            frequency_mhz,
+        },
+        width: Width::Mhz20,
+        center1_mhz: u32::from(frequency_mhz),
+        center2_mhz: None,
+        punctured: 0,
+    }
+}
+
+/// RF register `address` of path A, as the model holds it.
+fn rf(a: &Attached, address: u32) -> u32 {
+    a.chip.lock().unwrap().get(0x2800 + address * 4, 4) & 0xfffff
+}
+
+#[test]
+fn an_rtl8821c_station_runtime_tunes_tracks_and_calibrates_on_its_own_registers() {
+    use crate::wifi::realtek::station::Device;
+    let mut a = attach_8821c(0);
+    a.hardware.tune(&channel(2437), false, 2000).unwrap();
+    assert_eq!(rf(&a, 0x18) & 0xff, 6);
+    a.hardware.tune(&channel(5180), true, 2000).unwrap();
+    assert_eq!(rf(&a, 0x18) & 0xff, 36);
+    assert_eq!(rf(&a, 0x18) & (1 << 16 | 1 << 8), 1 << 16 | 1 << 8, "5 GHz");
+    a.hardware.tune(&channel(2412), false, 2000).unwrap();
+    // The join's calibration is firmware's IQK, a look every 20 ms, and
+    // frames wait for it.
+    a.chip.lock().unwrap().set(0x2800 + 0x08 * 4, 4, 0);
+    a.hardware.prepare_transmit().unwrap();
+    assert!(!a.hardware.ready());
+    let mut longest = 0;
+    for look in 0.. {
+        assert!(look < 100, "the IQK never ended");
+        if look == 5 {
+            a.chip.lock().unwrap().set(0x2800 + 0x08 * 4, 4, 0xabcde);
+        }
+        let start = HOST_CLOCK.now_us();
+        a.hardware.receive(&mut |_| {}).unwrap();
+        longest = longest.max(HOST_CLOCK.now_us() - start);
+        if a.hardware.ready() {
+            break;
+        }
+        crate::test_clock::advance(HOST_CLOCK, 20_000);
+    }
+    assert!(longest <= RECOVERY_STEP_US, "a look took {longest} us");
+    assert_eq!(rf(&a, 0x08), 0, "RF_DTXLOK cleared after the IQK");
+    // The watchdog: the gain goes to 0xc50 alone, and power tracking asks
+    // the meter.
+    a.chip.lock().unwrap().set(0xc50, 4, 0x40);
+    a.chip.lock().unwrap().set(0x1d70, 4, 0x1234_5678);
+    a.chip.lock().unwrap().set(0xf48, 2, 6000);
+    a.hardware.watchdog(false, false).unwrap();
+    {
+        let m = a.chip.lock().unwrap();
+        assert_ne!(m.get(0xc50, 4) & 0x7f, 0x40, "rtw_phy_dig moved the gain");
+        assert_eq!(m.get(0x1d70, 4), 0x1234_5678, "no RTL8822C gain register");
+        assert_eq!(m.quarantined, 0);
+    }
+    assert_eq!(rf(&a, 0x42) >> 16 & 3, 3);
+    assert!(!a.hardware.lost());
+    assert!(a.memory.lock().unwrap().mappings.len() > 1);
+}

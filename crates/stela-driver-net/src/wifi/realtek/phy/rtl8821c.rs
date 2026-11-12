@@ -16,6 +16,7 @@ use crate::wifi::realtek::{
     rf::{self, Path},
 };
 mod data;
+pub mod runtime;
 
 const REG_SYS_CTRL: u32 = 0x000;
 const BIT_FEN_EN: u32 = 1 << 26;
@@ -335,8 +336,9 @@ pub struct Iqk {
 }
 
 impl Iqk {
-    /// One look, and the end of the run when firmware is done or the looks
-    /// ran out: `RF_DTXLOK` cleared and the failure mask read.
+    /// One look, and the end of the run when firmware is done, the looks
+    /// ran out or `hurry` makes this look the last: `RF_DTXLOK` cleared and
+    /// the failure mask read.
     ///
     /// # Safety
     /// The Io and report of the boot whose firmware runs the IQK, with
@@ -345,6 +347,7 @@ impl Iqk {
         &mut self,
         io: &mut I,
         report: &Report,
+        hurry: bool,
     ) -> Result<IqkProgress, Error> {
         if io.profile().chip() != Chip::Rtl8821C {
             return Err(Error::WrongProfile);
@@ -353,7 +356,7 @@ impl Iqk {
         let mut rf = unsafe { rf::Registers::new(&mut *io, report) }?;
         let finished = rf.read(Path::A, RF_DTXLOK, 0xfffff)? == IQK_DONE;
         self.polls = self.polls.saturating_add(1);
-        if !finished && self.polls < IQK_POLLS {
+        if !finished && !hurry && self.polls < IQK_POLLS {
             return Ok(IqkProgress::Pending);
         }
         rf.write(Path::A, RF_DTXLOK, 0xfffff, 0)?;

@@ -73,6 +73,13 @@ pub struct Rtw88 {
     pub dpd_rates: bool,
     /// How `set_tx_power_index` writes the rates' indices.
     pub txagc: Txagc,
+    /// `dig`: each path's initial gain field, register and mask.
+    pub dig: &'static [(u32, u32)],
+    /// `dig_min`: the lowest gain `rtw_phy_dig` sets while linked.
+    pub dig_min: u8,
+    /// `lps_deep_mode_supported`'s `LPS_DEEP_MODE_PG`: the chip may gate
+    /// its power in deep power save, not only lower its clock.
+    pub lps_deep_power_gate: bool,
 }
 
 /// A chip's `set_tx_power_index`.
@@ -178,6 +185,9 @@ pub static RTL8822C: Spec = Spec {
         power_by_rate_bcd: false,
         dpd_rates: true,
         txagc: Txagc::Differential,
+        dig: &[(0x1d70, 0x7f), (0x1d70, 0x7f00)],
+        dig_min: 0x20,
+        lps_deep_power_gate: true,
     }),
 };
 
@@ -227,6 +237,9 @@ pub static RTL8821C: Spec = Spec {
         txagc: Txagc::Absolute {
             base: [0x1d00, 0x1d80],
         },
+        dig: &[(0xc50, 0x7f)],
+        dig_min: 0x1c,
+        lps_deep_power_gate: false,
     }),
 };
 
