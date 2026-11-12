@@ -249,6 +249,20 @@ pub enum Transport {
     SdMmc,
 }
 
+impl fmt::Display for Transport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::VirtioBlk => "virtio",
+            Self::Nvme => "NVMe",
+            Self::Ahci => "SATA",
+            Self::Usb => "USB",
+            Self::Ram => "RAM",
+            Self::Firmware => "firmware file",
+            Self::SdMmc => "SD/MMC",
+        })
+    }
+}
+
 /// What a device reports about itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Identity {

@@ -1223,7 +1223,7 @@ pub(super) fn apply(environment: &Environment<'_>, plan: Plan) -> Result<()> {
             )
         })?
     {
-        eprintln!("Note: {note}");
+        note!("{note}");
     }
     Ok(())
 }

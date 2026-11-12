@@ -446,10 +446,10 @@ fn chosen_status(host: &dyn Host, record: &Record, report: &mut Report) {
         Some(search) => {
             if let Some(stale) = Stale::of(search) {
                 report.line(
-                    "",
+                    "note",
                     format!(
-                        "note: {}: if this is the PC that runs macOS, Install macOS will ask \
-                         for a disk again",
+                        "{}: if this is the PC that runs macOS, Install macOS will ask for a \
+                         disk again",
                         stale.case()
                     ),
                 );

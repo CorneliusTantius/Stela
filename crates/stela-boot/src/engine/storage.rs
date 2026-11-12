@@ -839,7 +839,7 @@ impl HostDisks {
         let micros = |ticks: u64| u128::from(ticks) * 1_000_000 / u128::from(tsc_hz.max(1));
         for (serial, disk) in &self.disks {
             let stats = disk.stats();
-            let mut line = format!("HOST DISK IO serial={serial}");
+            let mut line = format!("HOST DISK IO serial={}", output::private(serial));
             for direction in Direction::ALL {
                 let counts = stats.directions[direction as usize];
                 if counts.ios != 0 {
@@ -1504,7 +1504,7 @@ fn account(
                 .blocks
                 .saturating_mul(u64::from(identity.block_size));
             format!(
-                "{:?} {} {} GB {}-byte blocks",
+                "{} {} {} GB {}-byte blocks",
                 identity.transport,
                 identity.model.trim(),
                 bytes / 1_000_000_000,
@@ -1538,8 +1538,8 @@ fn account(
     lines.push(String::from(
         "The boot log on the USB stick does not have this part; this screen is its only record.",
     ));
+    // Each line reaches the log as the screen's note.
     for line in &lines {
-        output::arguments(format_args!("HOST DISKS {line}\n"));
         crate::status::info(line);
     }
 }
