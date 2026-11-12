@@ -5,8 +5,7 @@
 
 A general purpose Apple Silicon layer for x86-64 PCs. It is a UEFI boot
 program with an arm64-to-x86-64 translator, a Metal driver for NVIDIA GPUs and
-a model of Apple silicon hardware. Stela presents a Mac mini (M2) and runs
-macOS 27.
+a model of Apple silicon hardware. Stela currently presents itself as an M2 Mac mini.
 
 > [!WARNING]
 Stela is still in development. It is slow and still may not boot on supported hardware. Fixes are on the way, please submit a GitHub Issue with your boot logs if you encounter an error!
