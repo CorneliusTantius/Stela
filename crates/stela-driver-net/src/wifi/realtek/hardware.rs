@@ -735,7 +735,8 @@ fn incoming(
     // IEEE80211_HW_RX_INCLUDES_FCS.
     let length = packet.payload.len().checked_sub(4)?;
     let signal = if facts.phy_present {
-        dynamic::phy_status(packet.driver_info, cck_bounds, facts.rate_raw)
+        let format = dynamic::StatusFormat::Rtl8822C { cck_bounds };
+        dynamic::phy_status(packet.driver_info, format, facts.rate_raw)
     } else {
         None
     };

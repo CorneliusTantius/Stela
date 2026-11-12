@@ -354,15 +354,37 @@ fn rssi(power: &[i8]) -> u8 {
     linear_2_db(sum >> (power.len() - 1))
 }
 
-/// `query_phy_status` of a frame's driver information, under the upper and
-/// lower CCK gains the PHY's tables left, for a frame at `rate`.
-pub fn phy_status(info: &[u8], [upper, lower]: [u8; 2], rate: u8) -> Option<Signal> {
+/// How a chip's `query_phy_status` reads a frame's PHY status.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StatusFormat {
+    /// rtw8822c's: two paths, and a CCK frame's power corrected by its gain
+    /// outside the upper and lower CCK gains the PHY's tables left.
+    Rtl8822C { cck_bounds: [u8; 2] },
+    /// rtw8821c's: one path, a CCK frame's power from its LNA and VGA
+    /// indices by the board's `lna_gain_table`, and no error vector or
+    /// frequency offset kept.
+    Rtl8821C { rfe: u8 },
+}
+
+/// rtw8821c's `lna_gain_table_0`, for RFE 0, and `lna_gain_table_1`.
+const LNA_GAIN_8821C_RFE0: [i8; 8] = [22, 8, -6, -22, -31, -40, -46, -52];
+const LNA_GAIN_8821C: [i8; 16] = [
+    10, 6, 2, -2, -6, -10, -14, -17, -20, -24, -28, -31, -34, -37, -40, -44,
+];
+
+/// `query_phy_status` of a frame's driver information, in `format`, for a
+/// frame at `rate`.
+pub fn phy_status(info: &[u8], format: StatusFormat, rate: u8) -> Option<Signal> {
     let word_at = |at: usize| {
         let bytes = info.get(at * 4..)?.first_chunk::<4>()?;
         Some(u32::from_le_bytes(*bytes))
     };
     let word = word_at(0)?;
     let reading = |at: u32| (word >> at) as u8 as i8;
+    let [upper, lower] = match format {
+        StatusFormat::Rtl8822C { cck_bounds } => cck_bounds,
+        StatusFormat::Rtl8821C { rfe } => return phy_status_8821c(word, word_at(3), rfe),
+    };
     match word & 15 {
         0 => {
             let gain = ((word >> 16) & 0x3f) as u8;
@@ -395,6 +417,34 @@ pub fn phy_status(info: &[u8], [upper, lower]: [u8; 2], rate: u8) -> Option<Sign
         }
         _ => None,
     }
+}
+
+/// rtw8821c's `query_phy_status`: page 0's `get_cck_rx_pwr`, page 1's
+/// path A, whose bandwidth nothing here reads.
+fn phy_status_8821c(word: u32, word3: Option<u32>, rfe: u8) -> Option<Signal> {
+    let power = match word & 15 {
+        0 => {
+            let word3 = word3?;
+            let vga = ((word3 >> 8) & 0x1f) as u8;
+            let lna = (((word3 >> 23) & 1) << 3 | ((word3 >> 13) & 7)) as usize;
+            let table: &[i8] = if rfe == 0 {
+                &LNA_GAIN_8821C_RFE0
+            } else {
+                &LNA_GAIN_8821C
+            };
+            // An index past the table is rtw88's warning and -120 dBm.
+            table
+                .get(lna)
+                .map_or(-120, |&gain| gain.wrapping_sub((vga << 1) as i8))
+        }
+        1 => ((word >> 8) as u8 as i8).wrapping_sub(110).max(-120),
+        _ => return None,
+    };
+    Some(Signal {
+        rssi: rssi(&[power]),
+        power_dbm: power,
+        ofdm: None,
+    })
 }
 
 /// `query_phy_status_page1`'s reading of an error vector.
@@ -1220,15 +1270,56 @@ mod tests {
         // Page 0, power 70, gain 10 under a lower bound of 12.
         info[1] = 70;
         info[2] = 10;
-        let signal = phy_status(&info, [30, 12], 0).unwrap();
+        let signal = phy_status(
+            &info,
+            StatusFormat::Rtl8822C {
+                cck_bounds: [30, 12],
+            },
+            0,
+        )
+        .unwrap();
         assert_eq!(signal.power_dbm, 70 + 4 - 110);
         assert_eq!(signal.rssi, 64);
         // Gain 34 over an upper bound of 30.
         info[2] = 34;
         assert_eq!(
-            phy_status(&info, [30, 12], 0).unwrap().power_dbm,
+            phy_status(
+                &info,
+                StatusFormat::Rtl8822C {
+                    cck_bounds: [30, 12]
+                },
+                0
+            )
+            .unwrap()
+            .power_dbm,
             70 - 8 - 110
         );
+    }
+
+    #[test]
+    fn an_rtl8821c_reads_cck_power_from_its_lna_table_and_ofdm_from_path_a() {
+        let format = |rfe| StatusFormat::Rtl8821C { rfe };
+        let mut info = [0; 16];
+        // Page 0, LNA 0b1010 (high bit 23, low bits 15:13), VGA 6.
+        info[12..16].copy_from_slice(&((1 << 23) | (2 << 13) | (6 << 8) as u32).to_le_bytes());
+        let signal = phy_status(&info, format(2), 0).unwrap();
+        assert_eq!(signal.power_dbm, -28 - 12);
+        assert_eq!(signal.rssi, rssi(&[-40]));
+        // RFE 0's table has eight entries: index 10 is past it.
+        assert_eq!(phy_status(&info, format(0), 0).unwrap().power_dbm, -120);
+        info[12..16].copy_from_slice(&((1 << 13) | (3 << 8) as u32).to_le_bytes());
+        assert_eq!(phy_status(&info, format(0), 0).unwrap().power_dbm, 8 - 6);
+        assert_eq!(phy_status(&info[..8], format(0), 0), None, "short");
+        // Page 1: path A's power alone, no error vector or offsets kept.
+        let mut info = [0; 4];
+        info[0] = 1;
+        info[1] = 60;
+        info[2] = 100;
+        let signal = phy_status(&info, format(0), 0).unwrap();
+        assert_eq!(signal.power_dbm, -50);
+        assert_eq!(signal.ofdm, None);
+        info[0] = 2;
+        assert_eq!(phy_status(&info, format(0), 0), None);
     }
 
     #[test]
@@ -1237,10 +1328,21 @@ mod tests {
         info[0] = 1;
         info[1] = 60;
         info[2] = 70;
-        assert_eq!(phy_status(&info, [0, 0], 0).unwrap().power_dbm, -40);
+        assert_eq!(
+            phy_status(&info, StatusFormat::Rtl8822C { cck_bounds: [0, 0] }, 0)
+                .unwrap()
+                .power_dbm,
+            -40
+        );
         info[0] = 2;
-        assert_eq!(phy_status(&info, [0, 0], 0), None);
-        assert_eq!(phy_status(&[1, 2], [0, 0], 0), None);
+        assert_eq!(
+            phy_status(&info, StatusFormat::Rtl8822C { cck_bounds: [0, 0] }, 0),
+            None
+        );
+        assert_eq!(
+            phy_status(&[1, 2], StatusFormat::Rtl8822C { cck_bounds: [0, 0] }, 0),
+            None
+        );
     }
 
     #[test]
