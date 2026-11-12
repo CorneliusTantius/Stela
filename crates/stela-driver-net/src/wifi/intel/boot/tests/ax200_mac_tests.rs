@@ -17,6 +17,8 @@ pub(super) struct Native {
     pub(super) firmware: Option<Vec<u8>>,
     /// What firmware reports of each of its transmit FIFOs.
     pub(super) transmit_fifo: core::sync::atomic::AtomicU32,
+    /// The function is an AX210, which boots with its PNVM file.
+    pub(super) ax210: bool,
 }
 impl Default for Native {
     fn default() -> Self {
@@ -30,6 +32,7 @@ impl Default for Native {
             host_chains: false,
             firmware: None,
             transmit_fifo: core::sync::atomic::AtomicU32::new(0),
+            ax210: false,
         }
     }
 }

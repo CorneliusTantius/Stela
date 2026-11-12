@@ -109,8 +109,7 @@ impl<'a, Q: BootIo, B: BiosIo> LariRadio<'a, Q, B> {
         self,
         options: Ax200SetupOptions,
     ) -> Result<Ax200Setup<'a, Q, B>, Box<Self>> {
-        if self.radio.initialized.boot.profile.family() != Family::Ax200
-            || self.phase() != LariPhase::RxQueueConfigurationRequired
+        if self.phase() != LariPhase::RxQueueConfigurationRequired
             || self.radio.initialized.boot.state != State::PnvmObserved
             || options.clock.ticks_per_microsecond == 0
             || !(1..=60_000_000).contains(&options.command_timeout_us)
@@ -179,14 +178,18 @@ impl<Q: BootIo, B: BiosIo> Ax200Setup<'_, Q, B> {
     }
     fn prepare(&mut self) -> Result<(), Ax200SetupError> {
         let boot = &self.lari.radio.initialized.boot;
-        // RomBoot::start has precisely one AX200 free/used/status queue in
+        // RomBoot's start has precisely one free/used/status queue in
         // context, with no auxiliary queue constructor or registration path.
         // RXQ/RSS helpers therefore take their num_rxqs==1 branches.
         let entries = usize::from(boot.entries);
-        if boot.ax210.is_some()
-            || boot.free.region().bytes != entries * 8
-            || boot.used.region().bytes != entries * 4
-            || boot.status.region().bytes != 12
+        let family = boot.profile.family();
+        let (free, used, status) = match family {
+            Family::Ax200 => (8, 4, 12),
+            _ => (16, crate::wifi::intel::receive::used_stride(family), 2),
+        };
+        if boot.free.region().bytes != entries * free
+            || boot.used.region().bytes != entries * used
+            || boot.status.region().bytes != status
         {
             return Err(Ax200SetupError::QueueLayout);
         }

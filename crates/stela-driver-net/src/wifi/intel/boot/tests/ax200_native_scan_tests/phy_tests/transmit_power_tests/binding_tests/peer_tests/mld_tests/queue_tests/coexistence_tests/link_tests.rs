@@ -64,8 +64,9 @@ struct Device<'n> {
     countries: Vec<[u8; 2]>,
     /// Every command the firmware answered, as group and opcode.
     commands: Vec<(u8, u8)>,
-    /// Each scheduler queue: its TID, identity, descriptors and next index.
-    queues: Vec<(u8, u16, u64, u16)>,
+    /// Each scheduler queue: its TID, identity, descriptors, next index and
+    /// slots.
+    queues: Vec<(u8, u16, u64, u16, u16)>,
     /// Each frame the air carried, by the station's queues.
     air: Vec<Vec<u8>>,
     /// Whether the AP advertises WMM.
@@ -98,15 +99,26 @@ struct Device<'n> {
     other: Option<(Vec<u8>, Vec<u8>)>,
     /// A scan of an association's links runs until it is told to stop.
     holds_link_scan: bool,
+    /// The PNVM-loaded notification went out after the PNVM doorbell.
+    pnvm_loaded: bool,
 }
 
 impl Device<'_> {
     fn inject(&mut self, rom: &RomBoot<'_, Model>, packet: &[u8]) {
+        let converted;
+        let packet = if self.native.ax210 && packet[4..6] == [0xc1, 0] {
+            converted = ax210_mpdu(packet);
+            &converted[..]
+        } else {
+            packet
+        };
         let slot = self.entry & (rom.entries - 1);
+        // An AX210's free descriptor is 16 bytes, its buffer ID first.
+        let stride = if self.native.ax210 { 16 } else { 8 };
         let raw = device_read(
             &self.native.domain,
             rom.free.region().address,
-            usize::from(slot) * 8,
+            usize::from(slot) * stride,
             8,
         );
         let vid = (u64::from_le_bytes(raw.try_into().unwrap()) & 0xfff) as u16;
@@ -117,6 +129,11 @@ impl Device<'_> {
 
     /// Answer the command awaiting a response, once.
     fn respond(&mut self, rom: &RomBoot<'_, Model>) {
+        if self.native.ax210 && !self.pnvm_loaded && pnvm_rang(&self.native.state) {
+            self.pnvm_loaded = true;
+            self.inject(rom, &pnvm_packet(0));
+            return;
+        }
         let Some(slot) = rom.hcmd.awaiting() else {
             return;
         };
@@ -181,7 +198,8 @@ impl Device<'_> {
             (5, 0x17) if request[0] == 0 => {
                 let queue = 511 - self.queues.len() as u16;
                 let descriptors = u64::from_le_bytes(request[28..36].try_into().unwrap());
-                self.queues.push((request[8], queue, descriptors, 0));
+                let slots = 1 << (u32::from_le_bytes(request[16..20].try_into().unwrap()) + 3);
+                self.queues.push((request[8], queue, descriptors, 0, slots));
                 let mut answer = reply(queue);
                 answer[4..6].fill(0);
                 answer.to_vec()
@@ -309,18 +327,24 @@ impl Device<'_> {
                     return;
                 }
                 room -= 1;
-                let (_, queue, descriptors, index) = self.queues[at];
+                let (_, queue, descriptors, index, slots) = self.queues[at];
+                let slot = index % slots;
                 let tfd = device_read(
                     &self.native.domain,
                     descriptors,
-                    usize::from(index) * 256,
+                    usize::from(slot) * 256,
                     64,
                 );
                 // A finished slot holds one buffer, the invalid one.
                 if tfd[0] < 2 {
                     break;
                 }
-                let next = (index + 1) % 256;
+                // An AX210's pointers run on past the ring.
+                let next = if self.native.ax210 {
+                    index.wrapping_add(1)
+                } else {
+                    (index + 1) % 256
+                };
                 self.queues[at].3 = next;
                 let mut bytes = Vec::new();
                 for tb in 0..usize::from(tfd[0]) {
@@ -351,11 +375,12 @@ impl Device<'_> {
                         opcode: 0x1c,
                         version: 0,
                     };
-                    let sequence = (queue & 31) << 8 | index;
+                    let sequence = (queue & 31) << 8 | slot;
                     self.inject(rom, &command_packet(done, sequence, &response));
                 }
-                // The command header, then the 20-byte body's rest.
-                let mut frame = bytes[24..].to_vec();
+                // The command header, then the body's rest: 20 bytes, or the
+                // AX210's 28.
+                let mut frame = bytes[if self.native.ax210 { 32 } else { 24 }..].to_vec();
                 if frame[0] & 0x88 == 0x88 {
                     // The dword pad after the QoS header.
                     frame.drain(26..28);
@@ -566,6 +591,75 @@ fn shared_memory(size: u32) -> Vec<u8> {
     payload
 }
 
+/// The SKU an AX210's ALIVE names and its PNVM file's tables carry.
+const AX210_SKU: [u32; 3] = [0x610d0, 0x1234, 0x55667788];
+
+/// An AX200 fixture image as an AX210 one: its API 89 header, its image
+/// loader, and the command versions an AX210 radio takes.
+fn ax210_image(mut image: Vec<u8>) -> Vec<u8> {
+    image[72..76].copy_from_slice(&(89u32 << 8).to_le_bytes());
+    let mut at = 88;
+    while at < image.len() {
+        let word = |at: usize| u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
+        let (kind, length) = (word(at), word(at + 4) as usize);
+        if kind == 48 {
+            for entry in image[at + 8..at + 8 + length].as_chunks_mut::<4>().0 {
+                match entry[..2] {
+                    [0xc1, 0] => entry[3] = 5,
+                    [0x1c, 1] => entry[2] = 10,
+                    _ => {}
+                }
+            }
+        }
+        at += 8 + length.next_multiple_of(4);
+    }
+    // The capability an AX210 radio takes, then the image loader.
+    image.extend(29u32.to_le_bytes());
+    image.extend(8u32.to_le_bytes());
+    image.extend(2u32.to_le_bytes());
+    image.extend((1u32 << 4).to_le_bytes());
+    image.extend(52u32.to_le_bytes());
+    image.extend(64u32.to_le_bytes());
+    image.extend([0xa5; 64]);
+    image
+}
+
+/// An AX200 RX MPDU packet as an AX210 reports it: `iwl_rx_mpdu_desc`'s
+/// 64-byte form, its rate, energy, GP2 and TSF words moved past the PHY
+/// data that the AX210 adds.
+fn ax210_mpdu(packet: &[u8]) -> Vec<u8> {
+    let length = (u32::from_le_bytes(packet[..4].try_into().unwrap()) & 0x3fff) as usize - 4;
+    let payload = &packet[8..8 + length];
+    let (old, frame) = payload.split_at(48);
+    let mut descriptor = vec![0; 64];
+    descriptor[..20].copy_from_slice(&old[..20]);
+    descriptor[24..28].copy_from_slice(&old[20..24]);
+    descriptor[20..24].copy_from_slice(&old[24..28]);
+    descriptor[36..48].copy_from_slice(&old[28..40]);
+    descriptor[48..56].copy_from_slice(&old[40..48]);
+    descriptor.extend(frame);
+    let mpdu = Id {
+        group: 0,
+        opcode: 0xc1,
+        version: 0,
+    };
+    command_packet(
+        mpdu,
+        u16::from_le_bytes([packet[6], packet[7]]),
+        &descriptor,
+    )
+}
+
+/// Whether the PNVM doorbell (`UREG_DOORBELL_TO_ISR6_PNVM`) rang.
+fn pnvm_rang(state: &Mutex<ModelState>) -> bool {
+    state
+        .lock()
+        .unwrap()
+        .ops
+        .windows(2)
+        .any(|ops| ops == [Op::Write(0x444, 0x03d05c04), Op::Write(0x44c, 1 << 20)])
+}
+
 /// Bring the modeled function up for the network "test" until it is ready
 /// to authenticate or fails, with `flags` on the US 2.4 GHz rule and
 /// `channel` as the firmware's channel word.
@@ -668,21 +762,22 @@ fn raise_as<'n>(
     other: bool,
 ) -> (Station<Model, ClockBios>, Phase, Device<'n>) {
     let image = native.firmware.clone().unwrap_or_else(|| coex_image(2));
-    let catalog: &'static resources::Catalog = Box::leak(Box::new(catalog_for(
-        &profile(),
-        Family::Ax200.firmware_name(),
-        &feature(
-            feature(
-                feature(two_receive_chains(image, native.host_chains), 30, 63, true),
-                30,
-                21,
-                true,
-            ),
+    let image = feature(
+        feature(
+            feature(two_receive_chains(image, native.host_chains), 30, 63, true),
             30,
-            46,
+            21,
             true,
         ),
-    )));
+        30,
+        46,
+        true,
+    );
+    let catalog: &'static resources::Catalog = Box::leak(Box::new(if native.ax210 {
+        catalog_with_pnvm(&ax210_profile(), &ax210_image(image), AX210_SKU)
+    } else {
+        catalog_for(&profile(), Family::Ax200.firmware_name(), &image)
+    }));
     let source: &'static Source = Box::leak(Box::new(Source::default()));
     native
         .state
@@ -690,17 +785,36 @@ fn raise_as<'n>(
         .unwrap()
         .registers
         .extend([(0x388, 0x02123456), (0x38c, 0x789a)]);
-    let mut boot = start(
-        catalog,
-        source,
-        &native.domain,
-        &native.state,
-        &native.drops,
-    );
+    let mut boot = if native.ax210 {
+        native.state.lock().unwrap().registers.extend([
+            (0x28, 0x420),
+            (0x9c, 0x10d000),
+            (0, 0x45678900),
+        ]);
+        let (observation, step) = step_fixture();
+        let step: &'static resources::Catalog = Box::leak(Box::new(step));
+        start_ax210(
+            catalog,
+            crate::wifi::intel::platform::load_step(observation, step).unwrap(),
+            source,
+            &native.domain,
+            &native.state,
+            &native.drops,
+        )
+    } else {
+        start(
+            catalog,
+            source,
+            &native.domain,
+            &native.state,
+            &native.drops,
+        )
+    };
     event(&native.state, 1);
     boot.poll().unwrap();
     let mut alive = rx_packet(1, 0xcafe, 0);
-    set_sku(&mut alive, [0; 3]);
+    // A zero SKU asks for no PNVM; the AX210's names its file's tables.
+    set_sku(&mut alive, if native.ax210 { AX210_SKU } else { [0; 3] });
     let mut device = Device {
         native,
         entry: 0,
@@ -725,6 +839,7 @@ fn raise_as<'n>(
         confirm: None,
         other: other.then(|| (other_beacon([60, 70]), other_response())),
         holds_link_scan: false,
+        pnvm_loaded: false,
     };
     device.inject(&boot, &alive);
     let inputs = Inputs {
@@ -837,7 +952,13 @@ fn connect_in<'n>(
     quality: bool,
 ) -> (Station<Model, ClockBios>, Device<'n>) {
     let (mut wifi, phase, mut device) = raise(native, country, vec![b"test"], 0, OPEN, quality);
-    assert_eq!(phase, Phase::AuthenticationRequired);
+    assert_eq!(
+        phase,
+        Phase::AuthenticationRequired,
+        "{:?} after {:?}",
+        wifi.radio().error(),
+        device.commands
+    );
     let associated = run(&mut wifi, &mut device, |wifi, _, _| {
         wifi.radio().station().phase() == Peering::Associated
     });
@@ -1781,6 +1902,55 @@ fn fragment(index: u8, more: bool, number: u8, body: &[u8]) -> Vec<u8> {
 
 fn first_body() -> Vec<u8> {
     [&[0xaa, 0xaa, 3, 0, 0, 0, 8, 0][..], &[0x11; 40]].concat()
+}
+
+/// An AX210 goes from its ROM through its PNVM file, NVM, LARI and setup to
+/// an association, then carries data both ways, as `iwl_pcie_gen2` and
+/// iwlmvm drive it.
+#[test]
+fn an_ax210_boots_with_its_pnvm_joins_and_carries_data() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    let native = Native {
+        ax210: true,
+        ..Native::default()
+    };
+    let (mut wifi, mut device) = connect(&native, false);
+    assert_eq!(
+        wifi.radio().family,
+        crate::wifi::intel::firmware::Family::Ax210
+    );
+    assert!(device.pnvm_loaded, "the PNVM went to the firmware");
+    let receipts = wifi.radio().rom().unwrap().platform_receipts().unwrap();
+    assert!(
+        matches!(
+            receipts.pnvm,
+            crate::wifi::intel::calibration::Source::External { .. }
+        ),
+        "{:?}",
+        receipts.pnvm
+    );
+    device.inject(
+        wifi.radio().rom().unwrap(),
+        &data(LOCAL, false, [8, 0], &[0x45; 46], Some((0, 1))),
+    );
+    settle(&mut wifi, &mut device);
+    let ethernet = wifi.receive().unwrap().expect("the AP's frame");
+    assert_eq!(ethernet[..6], LOCAL);
+    assert_eq!(ethernet[14..], [0x45; 46]);
+    let sent = device.air.len();
+    let mut frame = AP.to_vec();
+    frame.extend(LOCAL);
+    frame.extend([8, 0]);
+    frame.extend([0x54; 46]);
+    wifi.transmit(&frame).unwrap();
+    settle(&mut wifi, &mut device);
+    let carried = &device.air[sent..];
+    assert!(
+        carried.iter().any(|mpdu| mpdu.ends_with(&[0x54; 46])),
+        "{carried:?}"
+    );
 }
 
 /// `ieee80211_rx_handlers`: a frame the receive path cannot take is dropped

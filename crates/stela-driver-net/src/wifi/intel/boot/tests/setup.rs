@@ -67,20 +67,15 @@ pub(super) fn catalog_for_target(
     .unwrap()
 }
 
-pub(super) fn phase_catalog(
-    profile: &Profile,
-    sku: [u32; 3],
-    bios: bool,
-    reduced: bool,
-) -> (Observations, resources::Catalog) {
-    use crate::wifi::intel::platform::{CapturedVariable, Observation, Stage, Variable};
-    use sha2::{Digest, Sha256};
-    fn tlv(bytes: &mut Vec<u8>, kind: u32, data: &[u8]) {
-        bytes.extend(kind.to_le_bytes());
-        bytes.extend((data.len() as u32).to_le_bytes());
-        bytes.extend(data);
-        bytes.resize(bytes.len().next_multiple_of(4), 0);
-    }
+fn tlv(bytes: &mut Vec<u8>, kind: u32, data: &[u8]) {
+    bytes.extend(kind.to_le_bytes());
+    bytes.extend((data.len() as u32).to_le_bytes());
+    bytes.extend(data);
+    bytes.resize(bytes.len().next_multiple_of(4), 0);
+}
+
+/// A PNVM file for `profile` whose tables are for `sku`.
+fn pnvm_file(profile: &Profile, sku: [u32; 3]) -> Vec<u8> {
     let mut pnvm = Vec::new();
     let sku_bytes: Vec<_> = sku.into_iter().flat_map(u32::to_le_bytes).collect();
     tlv(&mut pnvm, 64, &sku_bytes);
@@ -95,6 +90,53 @@ pub(super) fn phase_catalog(
         chunk.extend(vec![0x40 + n as u8; 16 + n as usize]);
         tlv(&mut pnvm, 19, &chunk);
     }
+    pnvm
+}
+
+/// One catalog of `profile`'s firmware `image` and the PNVM file beside it,
+/// its tables for `sku`.
+pub(super) fn catalog_with_pnvm(
+    profile: &Profile,
+    image: &[u8],
+    sku: [u32; 3],
+) -> resources::Catalog {
+    use sha2::{Digest, Sha256};
+    let resource = |name, target, bytes: Vec<u8>| resources::Resource {
+        name,
+        target,
+        provenance: resources::Provenance {
+            source: "test",
+            revision: "immutable",
+            member: name,
+            license: "LicenseRef-Local-Test-Fixture",
+        },
+        expected_length: bytes.len(),
+        expected_sha256: Sha256::digest(&bytes).into(),
+        bytes,
+    };
+    let firmware = profile.firmware_request();
+    let pnvm = profile.pnvm_request().expect("a PNVM file");
+    resources::Catalog::from_handoff(vec![
+        resource(firmware.name, firmware.requirement().target, image.to_vec()),
+        resource(
+            pnvm.name,
+            pnvm.requirement().target,
+            pnvm_file(profile, sku),
+        ),
+    ])
+    .unwrap()
+}
+
+pub(super) fn phase_catalog(
+    profile: &Profile,
+    sku: [u32; 3],
+    bios: bool,
+    reduced: bool,
+) -> (Observations, resources::Catalog) {
+    use crate::wifi::intel::platform::{CapturedVariable, Observation, Stage, Variable};
+    use sha2::{Digest, Sha256};
+    let pnvm = pnvm_file(profile, sku);
+    let sku_bytes: Vec<_> = sku.into_iter().flat_map(u32::to_le_bytes).collect();
     let mut power = Vec::new();
     tlv(&mut power, 64, &sku_bytes);
     for n in 0..2 {

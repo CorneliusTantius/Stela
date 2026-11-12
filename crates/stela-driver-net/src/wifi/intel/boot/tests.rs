@@ -26,7 +26,7 @@ use mpdu_fixture::exercise_mpdu_observations;
 use recycle_fixture::exercise_rx_recycling;
 use setup::{
     awake, awake_profile, ax210_profile, ax210_state, catalog_for, catalog_for_target,
-    phase_catalog, profile, start, start_ax210, step_fixture,
+    catalog_with_pnvm, phase_catalog, profile, start, start_ax210, step_fixture,
 };
 use std::sync::Mutex;
 use transport::{
