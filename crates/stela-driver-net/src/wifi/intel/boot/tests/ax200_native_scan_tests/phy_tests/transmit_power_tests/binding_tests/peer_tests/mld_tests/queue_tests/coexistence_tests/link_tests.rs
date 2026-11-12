@@ -3407,6 +3407,109 @@ fn an_open_port_sleeps_on_the_vector_which_each_pass_clears_and_rearms() {
     assert_eq!(state.registers.get(&AUTOMASK), Some(&1));
 }
 
+/// The probe's start budget, under which a restart may run as one step.
+fn starting() -> stela_driver_base::budget::Budget {
+    stela_driver_base::budget::Budget::start(
+        Clock {
+            ticks_per_microsecond: 1_000_000,
+        },
+        30_000_000,
+    )
+    .unwrap()
+}
+
+/// One keeper pass, a recovery step among it, which must not hold the
+/// model clock as long as `RECOVERY_STEP_US`; a millisecond passes before
+/// the next, as between two polls.
+fn bounded_pass(wifi: &mut Station<Model, ClockBios>) {
+    use crate::wifi::connection::keeper::RECOVERY_STEP_US;
+    let start = Clock::ticks();
+    wifi.carrier();
+    let took = (Clock::ticks() - start) / 1_000_000;
+    assert!(took < RECOVERY_STEP_US, "{took} us in one pass");
+    crate::test_clock::advance(
+        Clock {
+            ticks_per_microsecond: 1_000_000,
+        },
+        1_000,
+    );
+}
+
+/// Step a recovery the keeper runs through `Radio::recover` until the
+/// radio is idle again, the model answering the new ROM boot as it answered
+/// the first, each pass a [`bounded_pass`]. Whether the radio came back.
+fn recovered(
+    native: &Native,
+    wifi: &mut Station<Model, ClockBios>,
+    device: &mut Device<'_>,
+) -> bool {
+    native.state.lock().unwrap().timed = true;
+    let _clock = crate::test_clock::virtualize();
+    let pass = bounded_pass;
+    for _ in 0..1000 {
+        if wifi.radio().rom().is_some() {
+            break;
+        }
+        pass(wifi);
+    }
+    assert!(
+        wifi.radio().rom().is_some(),
+        "{:?} {:?}",
+        wifi.radio().phase(),
+        wifi.radio().error()
+    );
+    device.entry = 0;
+    device.answered = None;
+    device.queues.clear();
+    event(&native.state, 1);
+    pass(wifi);
+    let mut alive = rx_packet(1, 0xcafe, 0);
+    set_sku(&mut alive, [0; 3]);
+    device.inject(wifi.radio().rom().unwrap(), &alive);
+    for _ in 0..600 {
+        pass(wifi);
+        if wifi.radio().stage() == Standing::Idle {
+            return true;
+        }
+        let Some(rom) = wifi.radio().rom() else {
+            return false;
+        };
+        device.respond(rom);
+    }
+    false
+}
+
+/// Once the guest runs, a firmware error is recovered in the keeper's
+/// bounded steps: the stop, the wake and ROM start, then the bring-up, and
+/// the radio comes back with its address, without a function reset.
+#[test]
+fn a_firmware_error_after_the_start_recovers_in_bounded_steps() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    let native = Native::default();
+    let (mut wifi, mut device) = connect(&native, false);
+    native.state.lock().unwrap().registers.insert(8, 1 << 25);
+    let operations = native.state.lock().unwrap().ops.len();
+    assert!(!wifi.carrier());
+    assert_eq!(wifi.radio().stage(), Standing::Lost);
+    assert_eq!(wifi.lost(), None, "recovering, not lost");
+    assert!(
+        recovered(&native, &mut wifi, &mut device),
+        "{:?} {:?}",
+        wifi.radio().phase(),
+        wifi.radio().error()
+    );
+    assert_eq!(wifi.radio().address(), Mac(LOCAL));
+    assert_eq!(wifi.lost(), None);
+    let state = native.state.lock().unwrap();
+    assert!(
+        !state.ops[operations..]
+            .iter()
+            .any(|op| matches!(op, Op::Reset)),
+        "no function reset"
+    );
+}
 #[test]
 fn only_the_last_restarts_reset_the_function_and_one_without_a_reset_still_boots() {
     if crate::test_process::isolate_model() {
@@ -3418,6 +3521,7 @@ fn only_the_last_restarts_reset_the_function_and_one_without_a_reset_still_boots
         let (mut wifi, _device) = connect(&native, false);
         wifi.radio_mut().spend_restarts(spent);
         native.state.lock().unwrap().registers.insert(8, 1 << 25);
+        let _start = starting();
         wifi.carrier();
         assert_eq!(wifi.radio().phase(), Phase::Booting);
         let state = native.state.lock().unwrap();
@@ -3435,6 +3539,7 @@ fn only_the_last_restarts_reset_the_function_and_one_without_a_reset_still_boots
             .unwrap()
             .registers
             .insert(0x2808, 1 << 3);
+        let _start = starting();
         wifi.carrier();
         assert_eq!(wifi.radio().phase(), Phase::Booting);
         let state = native.state.lock().unwrap();
@@ -3459,7 +3564,9 @@ fn a_firmware_error_frees_the_function_and_boots_it_for_the_keeper_to_join_again
     let (mut wifi, mut device) = connect(&native, false);
     let live = native.domain.records.lock().unwrap().live.len();
     native.state.lock().unwrap().registers.insert(8, 1 << 25);
+    let start = starting();
     wifi.carrier();
+    drop(start);
     assert_eq!(wifi.radio().error(), None);
     assert_eq!(wifi.radio().phase(), Phase::Booting);
     assert_eq!(wifi.radio().station().phase(), Peering::Idle);
@@ -3529,9 +3636,12 @@ fn a_switched_off_radio_stops_the_function_and_boots_again_once_it_is_on() {
             &state.ops[operations..]
         );
     }
-    // The switch on, ROM answers the boot as it answered the first.
+    // The switch on under the probe's start, ROM answers the boot as it
+    // answered the first.
     *native.state.lock().unwrap().registers.get_mut(&GP).unwrap() |= 0x0800_0000;
+    let start = starting();
     wifi.carrier();
+    drop(start);
     assert!(wifi.radio().rom().is_some(), "booting again");
     device.entry = 0;
     device.answered = None;
@@ -3562,6 +3672,119 @@ fn a_switched_off_radio_stops_the_function_and_boots_again_once_it_is_on() {
     panic!("{:?} {:?}", wifi.radio().phase(), wifi.radio().error());
 }
 
+/// A function that does not take ownership back holds no recovery step
+/// past `RECOVERY_STEP_US`: its wake fails at the step's budget, the keeper
+/// says so and tries again a second later, and the radio comes back once
+/// the function answers.
+#[test]
+fn a_function_that_stops_answering_fails_its_recovery_step_in_time() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    const HW_IF: u32 = 0;
+    const OWN: u32 = 0x0040_0000;
+    let native = Native::default();
+    let (mut wifi, mut device) = connect(&native, false);
+    {
+        let mut state = native.state.lock().unwrap();
+        state.timed = true;
+        state.stuck = Some((HW_IF, OWN));
+        state.registers.insert(HW_IF, 0);
+        state.registers.insert(8, 1 << 25);
+    }
+    {
+        let _clock = crate::test_clock::virtualize();
+        // The wake keeps iwlwifi's bounds for ownership, ten rounds of 750
+        // polls, a poll or a wait check a step, before the attempt fails.
+        let mut failed = false;
+        for _ in 0..100_000 {
+            bounded_pass(&mut wifi);
+            failed |= core::iter::from_fn(|| wifi.take_diagnostic())
+                .any(|line| line.contains("chip reset 1 of 10 failed"));
+            if failed {
+                break;
+            }
+        }
+        assert!(failed, "the failed step is said");
+        assert_eq!(wifi.lost(), None, "another attempt follows");
+        assert!(wifi.radio().rom().is_none());
+        native.state.lock().unwrap().stuck = None;
+        crate::test_clock::advance(
+            Clock {
+                ticks_per_microsecond: 1_000_000,
+            },
+            1_000_000,
+        );
+    }
+    assert!(
+        recovered(&native, &mut wifi, &mut device),
+        "{:?} {:?}",
+        wifi.radio().phase(),
+        wifi.radio().error()
+    );
+}
+
+/// A firmware command its deadline passes unanswered restarts the
+/// firmware, as iwlwifi's sync command timeout does, in the keeper's
+/// bounded recovery steps.
+#[test]
+fn a_command_the_firmware_leaves_unanswered_recovers_the_radio() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    let native = Native::default();
+    let (mut wifi, mut device) = connect(&native, false);
+    {
+        let _clock = crate::test_clock::virtualize();
+        wifi.radio_mut().deauthenticate(3).unwrap();
+        assert!(!wifi.carrier());
+        assert_ne!(
+            wifi.radio().stage(),
+            Standing::Lost,
+            "the command has its time"
+        );
+        crate::test_clock::advance(
+            Clock {
+                ticks_per_microsecond: 1_000_000,
+            },
+            2_100_000,
+        );
+        assert!(!wifi.carrier());
+    }
+    assert_eq!(wifi.radio().stage(), Standing::Lost);
+    assert_eq!(wifi.lost(), None, "recovering, not lost");
+    assert!(
+        recovered(&native, &mut wifi, &mut device),
+        "{:?} {:?}",
+        wifi.radio().phase(),
+        wifi.radio().error()
+    );
+    assert_eq!(wifi.lost(), None);
+}
+
+/// A switch that comes on once the guest runs boots the stopped function
+/// in the keeper's bounded recovery steps, as at boot in one.
+#[test]
+fn a_switch_on_after_the_start_boots_the_radio_in_bounded_steps() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    const GP: u32 = 0x24;
+    let native = Native::default();
+    let (mut wifi, mut device) = connect(&native, false);
+    *native.state.lock().unwrap().registers.get_mut(&GP).unwrap() &= !0x0800_0000;
+    assert!(!wifi.carrier());
+    assert!(wifi.radio().rom().is_none(), "off");
+    *native.state.lock().unwrap().registers.get_mut(&GP).unwrap() |= 0x0800_0000;
+    assert!(
+        recovered(&native, &mut wifi, &mut device),
+        "{:?} {:?}",
+        wifi.radio().phase(),
+        wifi.radio().error()
+    );
+    assert_eq!(wifi.radio().address(), Mac(LOCAL));
+    assert_eq!(wifi.lost(), None);
+}
 #[test]
 fn reset_access_refusal_retains_stopped_owner_and_never_boots_or_retries() {
     if crate::test_process::isolate_model() {
@@ -3582,7 +3805,9 @@ fn reset_access_refusal_retains_stopped_owner_and_never_boots_or_retries() {
         state.reset_error = Some(error.clone());
         state.registers.insert(8, 1 << 25);
     }
+    let start = starting();
     wifi.carrier();
+    drop(start);
     assert_eq!(wifi.radio().phase(), Phase::Failed);
     assert_eq!(
         wifi.radio().error(),

@@ -53,7 +53,7 @@ use crate::{
 };
 use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
 use core::fmt;
-use stela_driver_base::entropy::Entropy;
+use stela_driver_base::{entropy::Entropy, stepped::Stepped};
 
 mod station;
 pub use station::{ManagementKey, channel_flags};
@@ -135,6 +135,22 @@ impl Error {
                 | Self::SwitchedOff
         )
     }
+}
+
+/// The boot [`attach::boot`] runs a step at a time.
+type Booting<Q> = Stepped<'static, Result<RomBoot<'static, Q>, attach::AttachError>>;
+
+/// Where a recovery the keeper steps through
+/// [`crate::wifi::connection::keeper::Radio::recover`] stands:
+/// `iwl_trans_restart_wk`'s stop and boot, a step a call, then the polled
+/// bring-up to the scan.
+pub(super) enum Recovering<Q: BootIo> {
+    /// The failed firmware's function is still to be stopped.
+    Stop,
+    /// The stopped function wakes and its ROM starts.
+    Boot(Booting<Q>),
+    /// The new firmware comes up, pass by pass.
+    Bringing,
 }
 
 impl fmt::Display for Error {
@@ -396,6 +412,8 @@ pub struct Wifi<Q: BootIo, B: BiosIo> {
     /// The function stopped for good, as iwlwifi gives up on a device it
     /// cannot stop, reset or boot again.
     gone: bool,
+    /// A recovery under way, once the guest runs.
+    pub(super) recovery: Option<Recovering<Q>>,
     /// Where this firmware keeps its error logs.
     tables: Tables,
     restart: Restart<Q, B>,
@@ -504,6 +522,7 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
             error: None,
             reported: false,
             gone: false,
+            recovery: None,
             tables: Tables::default(),
             restart,
             degraded: Vec::new(),
@@ -537,6 +556,14 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
         // end it for good; a list that ran out waits for its delay.
         if !self.error.as_ref().is_some_and(Error::restartable) {
             self.gone |= self.error.is_some();
+            return false;
+        }
+        // A restart in one step (stop, function reset, power wake, boot)
+        // runs only while the probe starts the function, under its start
+        // budget. Once the guest runs, the keeper steps the recovery in
+        // bounded slices instead.
+        if !stela_driver_base::budget::armed() {
+            self.recovery.get_or_insert(Recovering::Stop);
             return false;
         }
         if !self.restart.attempts.allow(self.clock.now_us()) {
@@ -592,6 +619,48 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
                 self.pages,
             )
         };
+        self.booted(boot, no_reset)
+    }
+
+    /// The stopped function's boot, run a step at a time.
+    fn booting(&self) -> Booting<Q> {
+        let restart = &self.restart;
+        let (io, profile, vector, domain, entries) = (
+            restart.io.clone(),
+            restart.profile.clone(),
+            self.vector,
+            restart.domain.clone(),
+            restart.entries,
+        );
+        let (firmware, observations, pages, clock) =
+            (self.firmware, self.observations, self.pages, self.clock);
+        Stepped::new(async move {
+            // SAFETY: as in `boot_again`: the owner that held `io`'s twin
+            // stopped, and `new`'s contract holds for what it kept.
+            unsafe {
+                attach::boot(
+                    io,
+                    profile,
+                    vector,
+                    domain,
+                    entries,
+                    firmware,
+                    observations,
+                    pages,
+                    Some(clock),
+                )
+                .await
+            }
+        })
+    }
+
+    /// Take the ROM boot `boot` started, or its failure, which ends the
+    /// function for good. Whether it is booting.
+    fn booted(
+        &mut self,
+        boot: Result<RomBoot<'static, Q>, attach::AttachError>,
+        no_reset: bool,
+    ) -> bool {
         let boot = match boot {
             Ok(boot) => boot,
             Err(error) => {
@@ -634,6 +703,49 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
                 .unsupported("a reset of this function: it boots again without one");
         }
         true
+    }
+
+    /// A recovery's stop: the failed firmware's function stops, freeing
+    /// what it held, as the first part of `iwl_trans_restart_wk`, and its
+    /// boot is ready to step. A function that does not stop is lost for
+    /// good; one already stopped, or switched off, has nothing to stop.
+    fn recovery_stop(&mut self) -> Result<(), String> {
+        if let Some(owner) = self.stage.owner()
+            && !owner.stop_function()
+        {
+            self.gone = true;
+            self.recovery = None;
+            return Err(String::from("the function did not stop"));
+        }
+        self.stage = Stage::Moving;
+        self.recovery = Some(Recovering::Boot(self.booting()));
+        Ok(())
+    }
+
+    /// One step of a recovery's wake and ROM start. Booting again needs no
+    /// function reset: one a TOP fatal error asked for is left out, said
+    /// once. A failed boot holds no firmware: the next attempt boots again.
+    fn recovery_boot(&mut self) -> Result<bool, String> {
+        let Some(Recovering::Boot(booting)) = &mut self.recovery else {
+            return Ok(false);
+        };
+        let core::task::Poll::Ready(boot) = booting.step() else {
+            return Ok(false);
+        };
+        let wanted = core::mem::take(&mut self.restart.top_failed);
+        let first = wanted && !core::mem::replace(&mut self.restart.no_reset, true);
+        if self.booted(boot, first) {
+            self.recovery = Some(Recovering::Bringing);
+            return Ok(true);
+        }
+        self.recovery = Some(Recovering::Boot(self.booting()));
+        self.gone = false;
+        self.reported = false;
+        let error = self.error.take();
+        Err(error.map_or_else(
+            || String::from("the boot failed"),
+            |error| format!("{error}"),
+        ))
     }
 
     /// Whether the radio's switch is on (CSR_GP_CNTRL's HW_RF_KILL_SW bit),
@@ -1127,7 +1239,14 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
                 })
             }
             failed @ Stage::Failed { .. } => Ok(failed),
-            Stage::SwitchedOff if self.switch() == Some(true) => {
+            Stage::SwitchedOff if self.recovery.is_none() && self.switch() == Some(true) => {
+                // Booting in one step (power wake, ROM) runs only under the
+                // probe's start budget; once the guest runs, the keeper boots
+                // the stopped function in bounded slices.
+                if !stela_driver_base::budget::armed() {
+                    self.recovery = Some(Recovering::Stop);
+                    return Ok(Stage::SwitchedOff);
+                }
                 self.boot_again(false);
                 Ok(core::mem::replace(&mut self.stage, Stage::Moving))
             }

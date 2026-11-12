@@ -2207,6 +2207,22 @@ impl<Q: BootIo, B: BiosIo> Link for Wifi<Q, B> {
     }
 }
 
+impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
+    /// Where the bring-up stands for the keeper, the radio not lost.
+    fn standing(&self) -> Standing {
+        match &self.stage {
+            Stage::Scan(_) if self.client.left => Standing::NeedsDrain,
+            Stage::Scan(scan) => match scan.phase() {
+                Ax200ScanPhase::NotStarted => Standing::Idle,
+                Ax200ScanPhase::DrainRequired => Standing::Scanned,
+                _ => Standing::Busy,
+            },
+            Stage::Ready(_) if self.client.admitted.is_some() => Standing::Admitted,
+            _ => Standing::Busy,
+        }
+    }
+}
+
 impl<Q: BootIo, B: BiosIo> Radio for Wifi<Q, B> {
     type Handle = usize;
     type Profile = ();
@@ -2222,6 +2238,13 @@ impl<Q: BootIo, B: BiosIo> Radio for Wifi<Q, B> {
     }
 
     fn service(&mut self) -> Result<(), Error> {
+        // A recovery's stop and boot run in its own steps.
+        if matches!(
+            self.recovery,
+            Some(super::Recovering::Stop | super::Recovering::Boot(_))
+        ) {
+            return Ok(());
+        }
         if self.error.is_none() && self.died() {
             let log = self.tables.read(&self.restart.io, self.family);
             self.error = Some(Error::FirmwareDied(log));
@@ -2256,24 +2279,46 @@ impl<Q: BootIo, B: BiosIo> Radio for Wifi<Q, B> {
         Err(self.error.clone().unwrap_or(error))
     }
 
+    fn recoverable(&self) -> bool {
+        self.recovery.is_some() && !self.gone
+    }
+
+    /// `iwl_trans_restart_wk` a step a call: the stop, then the wake and ROM
+    /// start as stepped work, then the polled bring-up until the scan may
+    /// start.
+    fn recover(&mut self) -> Result<keeper::Recovery, String> {
+        use super::Recovering;
+        match &self.recovery {
+            None => return Err(String::from("iwlwifi: no recovery under way")),
+            Some(Recovering::Stop) => self.recovery_stop()?,
+            Some(Recovering::Boot(_)) => {
+                self.recovery_boot()?;
+            }
+            Some(Recovering::Bringing) => {
+                if let Some(error) = self.error.take() {
+                    // The new firmware failed too: the next attempt stops it.
+                    self.recovery = Some(Recovering::Stop);
+                    self.reported = false;
+                    return Err(format!("{error}"));
+                }
+                if self.standing() == Standing::Idle {
+                    self.recovery = None;
+                    return Ok(keeper::Recovery::Done);
+                }
+            }
+        }
+        Ok(keeper::Recovery::Pending)
+    }
+
     fn take_event(&mut self) -> Option<keeper::Event> {
         self.client.events.pop_front()
     }
 
     fn stage(&self) -> Standing {
-        if self.gone {
+        if self.gone || self.recovery.is_some() {
             return Standing::Lost;
         }
-        match &self.stage {
-            Stage::Scan(_) if self.client.left => Standing::NeedsDrain,
-            Stage::Scan(scan) => match scan.phase() {
-                Ax200ScanPhase::NotStarted => Standing::Idle,
-                Ax200ScanPhase::DrainRequired => Standing::Scanned,
-                _ => Standing::Busy,
-            },
-            Stage::Ready(_) if self.client.admitted.is_some() => Standing::Admitted,
-            _ => Standing::Busy,
-        }
+        self.standing()
     }
 
     fn station(&self) -> &Station {

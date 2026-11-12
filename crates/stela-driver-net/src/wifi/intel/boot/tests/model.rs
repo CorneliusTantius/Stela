@@ -35,6 +35,13 @@ pub(super) struct ModelState {
     pub(super) sentinel: Option<(usize, u32)>,
     pub(super) no_reset: bool,
     pub(super) reset_error: Option<crate::block::BlockError>,
+    /// Each delay runs the thread's virtual clock on at a microsecond per
+    /// million ticks, and fails once an armed budget passed, as
+    /// `budget::Bounded` does.
+    pub(super) timed: bool,
+    /// Bits of a register that never take a write, as a function that
+    /// stopped answering leaves them.
+    pub(super) stuck: Option<(u32, u32)>,
 }
 impl Default for ModelState {
     fn default() -> Self {
@@ -48,6 +55,8 @@ impl Default for ModelState {
             sentinel: None,
             no_reset: false,
             reset_error: None,
+            timed: false,
+            stuck: None,
         }
     }
 }
@@ -95,12 +104,50 @@ impl Csr for Model {
             let prior = state.registers.entry(register).or_default();
             *prior &= !value;
         } else {
-            state.registers.insert(register, value);
+            let kept = match state.stuck {
+                Some((stuck, bits)) if stuck == register => value & !bits,
+                _ => value,
+            };
+            state.registers.insert(register, kept);
         }
         Ok(())
     }
+    fn begin_interval(
+        &mut self,
+        microseconds: u32,
+    ) -> Result<Option<alloc::boxed::Box<dyn crate::bus::pci::power::Interval>>, power::AccessError>
+    {
+        /// An interval on the thread's virtual clock.
+        struct Virtual(crate::Deadline);
+        impl crate::bus::pci::power::Interval for Virtual {
+            fn elapsed(&self) -> Result<bool, crate::bus::pci::power::Error> {
+                Ok(self.0.passed())
+            }
+        }
+        if !self.state.lock().unwrap().timed {
+            return Ok(None);
+        }
+        let clock = crate::Clock {
+            ticks_per_microsecond: 1_000_000,
+        };
+        Ok(Some(alloc::boxed::Box::new(Virtual(
+            clock.deadline(u64::from(microseconds)),
+        ))))
+    }
     fn delay_us(&mut self, microseconds: u32) -> Result<(), power::AccessError> {
-        drop(self.operation(Op::Delay(microseconds))?);
+        let state = self.operation(Op::Delay(microseconds))?;
+        if state.timed {
+            const CLOCK: crate::Clock = crate::Clock {
+                ticks_per_microsecond: 1_000_000,
+            };
+            crate::test_clock::advance(CLOCK, u64::from(microseconds));
+            // A deadline no wait reaches passes only with an armed budget.
+            if CLOCK.deadline(1_000_000_000).passed() {
+                return Err(power::AccessError::Minimum(
+                    crate::bus::pci::power::Error::StartBudget,
+                ));
+            }
+        }
         Ok(())
     }
 }
