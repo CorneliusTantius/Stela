@@ -52,6 +52,8 @@ pub struct Rtw88 {
     /// The radios `rf_tbl` loads: two on the RTL8822C, path A alone on the
     /// RTL8821C.
     pub rf_paths: u8,
+    /// The RFE options `rfe_defs` defines, the boards the chip's tables know.
+    pub rfe_options: &'static [u8],
 }
 
 /// Efuse sizes in bytes.
@@ -126,6 +128,7 @@ pub static RTL8822C: Spec = Spec {
         power_off: super::power::tables::OFF_8822C,
         pcie_aux_clock_cut: Some(3),
         rf_paths: 2,
+        rfe_options: &[0, 1, 2, 3, 4, 5, 6],
     }),
 };
 
@@ -162,6 +165,7 @@ pub static RTL8821C: Spec = Spec {
         power_off: super::power::tables::OFF_8821C,
         pcie_aux_clock_cut: None,
         rf_paths: 1,
+        rfe_options: &[0, 2, 4, 6],
     }),
 };
 

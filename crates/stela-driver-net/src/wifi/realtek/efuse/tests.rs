@@ -342,6 +342,68 @@ fn immutable_board_provenance_keeps_raw_values_without_fallback_or_policy() {
     }
 }
 #[test]
+fn an_rtl8821c_reads_its_own_map() {
+    let rtl8821c = crate::wifi::realtek::chip::rtl8821c::tests::profile(1);
+    // Its logical map ends at 512 bytes and 96 physical bytes are protected.
+    let mut p = [255; PHYSICAL];
+    p[..4].copy_from_slice(&[0x0f, 0x8e, 1, 2]);
+    let physical = Physical {
+        profile: rtl8821c,
+        bytes: p,
+    };
+    assert_eq!(
+        physical.logical().err(),
+        Some(Error::Logical { offset: 64 * 8 })
+    );
+    let mut p = [0x1f; PHYSICAL];
+    p[PHYSICAL - 96 - 1] = 0x0f;
+    let physical = Physical {
+        profile: rtl8821c,
+        bytes: p,
+    };
+    assert_eq!(
+        physical.logical().err(),
+        Some(Error::Header {
+            offset: PHYSICAL - 96 - 1
+        })
+    );
+    let mut log = Logical {
+        profile: rtl8821c,
+        bytes: core::array::from_fn(|i| i as u8),
+    };
+    log.bytes[0xd0..0xd6].copy_from_slice(&[2, 3, 4, 5, 6, 7]);
+    for (rfe, btg, known) in [
+        (0x00, false, true),
+        (0x22, true, true),
+        (0x04, true, true),
+        (0x06, false, true),
+        (0x01, false, false),
+        (0x0a, true, false),
+    ] {
+        log.bytes[0xca] = rfe;
+        let b = log.board();
+        assert_eq!(b.valid_mac().unwrap(), [2, 3, 4, 5, 6, 7]);
+        let raw = b.raw();
+        assert_eq!(raw.rfe_raw, rfe & 0x1f);
+        assert_eq!(raw.package, (rfe >> 5) & 1);
+        assert_eq!(raw.rfe_btg, btg);
+        assert_eq!(b.source_rfe().is_ok(), known);
+        assert_eq!(raw.thermal_raw, [0xba, 0xff]);
+        assert_eq!(raw.thermal_average, 0xba);
+        assert_eq!(raw.crystal_cap_raw, 0xb9);
+        assert_eq!(raw.tx_bb_swing, [0xc6, 0xc7]);
+        assert_eq!(raw.power_track_raw, 0);
+        // RFE 2 and 4 take path A's 2.4 GHz indices from path B's.
+        let a = &raw.power_tables[..18];
+        if matches!(rfe & 0x1f, 2 | 4) {
+            assert_eq!(a, &log.bytes[0x10 + 42..0x10 + 42 + 18]);
+        } else {
+            assert_eq!(a, &log.bytes[0x10..0x10 + 18]);
+        }
+        assert_eq!(raw.power_tables[18..], log.bytes[0x10 + 18..0xb8]);
+    }
+}
+#[test]
 #[ignore = "oracle: STELA_REALTEK_WIFI_EFUSE_ORACLE"]
 fn physical_transport_logical_maps_and_all_board_fields_match_unchanged_c() {
     let trace = std::fs::read(std::env::var("STELA_REALTEK_WIFI_EFUSE_ORACLE").unwrap()).unwrap();

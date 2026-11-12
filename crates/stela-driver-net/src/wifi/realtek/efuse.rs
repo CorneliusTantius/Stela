@@ -4,7 +4,7 @@
 //! Raw OTP/regulatory/calibration fields do not attest calibrated radio policy.
 use super::{
     chip::{EfuseSize, RTL8822C},
-    identity::Profile,
+    identity::{Chip, Profile},
     io::{self, Io, sleep},
     registers::*,
 };
@@ -84,29 +84,77 @@ impl Logical {
     pub fn bytes(&self) -> &[u8; LOGICAL] {
         &self.bytes
     }
+    /// The chip's `read_efuse`.
     pub fn board(&self) -> Board {
-        let b = &self.bytes;
+        let raw = match self.profile.chip() {
+            Chip::Rtl8821C => self.board_8821c(),
+            _ => self.board_8822c(),
+        };
         Board {
             profile: self.profile,
-            raw: BoardData {
-                usb_mode_switch_raw: b[6] & 0x80 != 0,
-                rtl_id: u16::from_le_bytes([b[0], b[1]]),
-                mac: b[0x120..0x126].try_into().unwrap(),
-                rfe_raw: b[0xca],
-                rf_board_raw: b[0xc1],
-                crystal_cap_raw: b[0xb9] & 0x7f,
-                channel_plan_raw: b[0xb8],
-                country_raw: [b[0xcb], b[0xcc]],
-                bt_raw: b[0xc3],
-                regulatory_raw: b[0xc1] & 7,
-                thermal_raw: [b[0xd0], b[0xd1]],
-                thermal_average: ((u16::from(b[0xd0]) + u16::from(b[0xd1])) >> 1) as u8,
-                power_track_raw: b[0xc8] >> 4,
-                power_tables: b[0x10..0xb8].try_into().unwrap(),
-            },
+            raw,
+        }
+    }
+    /// `rtw8822c_read_efuse`.
+    fn board_8822c(&self) -> BoardData {
+        let b = &self.bytes;
+        BoardData {
+            usb_mode_switch_raw: b[6] & 0x80 != 0,
+            rtl_id: u16::from_le_bytes([b[0], b[1]]),
+            mac: b[0x120..0x126].try_into().unwrap(),
+            rfe_raw: b[0xca],
+            rf_board_raw: b[0xc1],
+            crystal_cap_raw: b[0xb9] & 0x7f,
+            channel_plan_raw: b[0xb8],
+            country_raw: [b[0xcb], b[0xcc]],
+            bt_raw: b[0xc3],
+            regulatory_raw: b[0xc1] & 7,
+            thermal_raw: [b[0xd0], b[0xd1]],
+            thermal_average: ((u16::from(b[0xd0]) + u16::from(b[0xd1])) >> 1) as u8,
+            power_track_raw: b[0xc8] >> 4,
+            power_tables: b[0x10..0xb8].try_into().unwrap(),
+            package: 0,
+            tx_bb_swing: [0; 2],
+            rfe_btg: false,
+        }
+    }
+    /// `rtw8821c_read_efuse` and `rtw8821ce_efuse_parsing`: one thermal
+    /// meter, the PCIe MAC address at 0xd0, and on RFE 2 and 4 path A's
+    /// 2.4 GHz indices taken from path B's.
+    fn board_8821c(&self) -> BoardData {
+        let b = &self.bytes;
+        let mut power_tables: [u8; 168] = b[0x10..0xb8].try_into().unwrap();
+        let rfe = b[0xca] & 0x1f;
+        if rfe == 2 || rfe == 4 {
+            power_tables.copy_within(TXPWR_IDX..TXPWR_IDX + TXPWR_IDX_2G, 0);
+        }
+        BoardData {
+            usb_mode_switch_raw: false,
+            rtl_id: u16::from_le_bytes([b[0], b[1]]),
+            mac: b[0xd0..0xd6].try_into().unwrap(),
+            rfe_raw: rfe,
+            rf_board_raw: b[0xc1],
+            crystal_cap_raw: b[0xb9],
+            channel_plan_raw: b[0xb8],
+            country_raw: [b[0xcb], b[0xcc]],
+            bt_raw: b[0xc3],
+            regulatory_raw: b[0xc1] & 7,
+            // Path A alone.
+            thermal_raw: [b[0xba], 0xff],
+            thermal_average: b[0xba],
+            // rtw88 tracks the RTL8821C by its type 0 table always.
+            power_track_raw: 0,
+            power_tables,
+            package: (b[0xca] >> 5) & 1,
+            tx_bb_swing: [b[0xc6], b[0xc7]],
+            rfe_btg: matches!(rfe, 0x2 | 0x4 | 0x7 | 0xa | 0xc | 0xf),
         }
     }
 }
+/// `struct rtw_txpwr_idx` and its `rtw_2g_txpwr_idx` head: six CCK and
+/// five BW40 bases, the one-byte 1S difference and three two-byte NS ones.
+const TXPWR_IDX: usize = 42;
+const TXPWR_IDX_2G: usize = 6 + 5 + 1 + 3 * 2;
 /// Source-decoded raw board identity and all four 42-byte power tables. No
 /// country byte, power entry, CAM flag or RFE selector authorizes transmission.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -130,6 +178,12 @@ pub struct BoardData {
     pub thermal_average: u8,
     pub power_track_raw: u8,
     pub power_tables: [u8; 168],
+    /// `hal->pkg_type`, which the RTL8821C's tables match on.
+    pub package: u8,
+    /// `tx_bb_swing_setting_2g` and `_5g`.
+    pub tx_bb_swing: [u8; 2],
+    /// `hal->rfe_btg`: 2.4 GHz shares Bluetooth's antenna path.
+    pub rfe_btg: bool,
 }
 impl Board {
     pub fn profile(&self) -> Profile {
@@ -141,7 +195,11 @@ impl Board {
     /// Source's seven declared RFE tables, without inventing a fallback for
     /// unknown/unprogrammed boards. Source PHY tables remain separate.
     pub fn source_rfe(&self) -> Result<u8, Error> {
-        if self.raw.rfe_raw <= 6 {
+        let known = self
+            .profile
+            .rtw88()
+            .map_or(&[][..], |spec| spec.rfe_options);
+        if known.contains(&self.raw.rfe_raw) {
             Ok(self.raw.rfe_raw)
         } else {
             Err(Error::UnsupportedRfe(self.raw.rfe_raw))
