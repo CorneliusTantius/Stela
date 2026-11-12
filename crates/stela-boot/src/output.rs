@@ -912,6 +912,11 @@ pub(crate) fn early_fatal(message: &str) -> ! {
     halt(0x11)
 }
 
+/// Halt after a report already shown, as [`fatal`] does.
+pub(crate) fn halt_stopped() -> ! {
+    halt(0x11)
+}
+
 fn halt(code: u32) -> ! {
     debug_exit(code);
     loop {
@@ -973,6 +978,16 @@ pub fn stopped_text() -> &'static str {
 }
 
 pub fn fatal(message: impl core::fmt::Display) -> ! {
+    // The device-start watchdog stopped the boot and showed why; its
+    // processor holds the drivers, which a log store would wait for.
+    if crate::engine::start_watchdog::stopped() {
+        use core::fmt::Write;
+        let _ = writeln!(
+            crate::serial::Serial,
+            "STELA FATAL after the watchdog: {message}"
+        );
+        halt(0x11)
+    }
     let message = alloc::string::ToString::to_string(&message);
     arguments(format_args!("\nSTELA FATAL {message}\n"));
     // The reason reaches the port before any later step can stop for good.

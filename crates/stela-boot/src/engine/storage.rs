@@ -842,6 +842,7 @@ impl Observer {
 
     /// Once every function's start has ended.
     fn finished(&self) {
+        super::start_watchdog::finish();
         output::arguments(format_args!("{}\n", device_starts::STARTED));
         self.store();
     }
@@ -909,7 +910,12 @@ impl stela_drivers::probe::Observer for Observer {
         }
         output::arguments(format_args!("{}\n", function.line(device_starts::START)));
         self.store();
+        // Last: the store above is not the driver's start.
+        super::start_watchdog::arm(identity);
         stela_drivers::probe::Start::Run
+    }
+    fn ended(&mut self) {
+        super::start_watchdog::disarm();
     }
 }
 
@@ -1503,6 +1509,12 @@ pub unsafe fn open(
     let firmware =
         super::firmware_requests::Requests::new(stela_drivers::probe::handoff_provider(handoff));
     let mut observer = Observer::new(boot_disk, log, root, device_skips, device_needs);
+    super::start_watchdog::enable(
+        handoff
+            .clock
+            .ticks_per_microsecond
+            .saturating_mul(1_000_000),
+    );
     STARTING_GS.store(this_gs(), Ordering::Release);
     // SAFETY: the loader mapped these ranges uncached and identity-mapped;
     // the observer drives only the log partition its first device brought,

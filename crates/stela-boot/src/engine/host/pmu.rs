@@ -102,6 +102,16 @@ global_asm!(
     "rdpmc",
     "xor eax, eax",
     "ret",
+    ".global stela_pmu_rdmsr",
+    "stela_pmu_rdmsr:",
+    "mov ecx, edi",
+    ".global stela_pmu_rdmsr_instruction",
+    "stela_pmu_rdmsr_instruction:",
+    "rdmsr",
+    "mov [rsi], eax",
+    "mov [rsi + 4], edx",
+    "xor eax, eax",
+    "ret",
     ".global stela_pmu_refused",
     "stela_pmu_refused:",
     "mov eax, 1",
@@ -111,19 +121,22 @@ global_asm!(
 unsafe extern "sysv64" {
     fn stela_pmu_wrmsr(index: u32, value: u64) -> u32;
     fn stela_pmu_rdpmc(counter: u32) -> u32;
+    fn stela_pmu_rdmsr(index: u32, value: *mut u64) -> u32;
     static stela_pmu_wrmsr_instruction: u8;
     static stela_pmu_rdpmc_instruction: u8;
+    static stela_pmu_rdmsr_instruction: u8;
     static stela_pmu_refused: u8;
 }
 
-/// Resume a #GP of the probing WRMSR or RDPMC at its refusal: the event or
-/// counter is unsupported.
+/// Resume a #GP of the probing WRMSR, RDMSR or RDPMC at its refusal: the
+/// event, counter or MSR is unsupported.
 pub(crate) fn fixup(frame: &mut Frame) -> bool {
     let rip = frame.rip;
     if frame.vector != 13
         || frame.cs & 3 != 0
         || (rip != (&raw const stela_pmu_wrmsr_instruction).addr() as u64
-            && rip != (&raw const stela_pmu_rdpmc_instruction).addr() as u64)
+            && rip != (&raw const stela_pmu_rdpmc_instruction).addr() as u64
+            && rip != (&raw const stela_pmu_rdmsr_instruction).addr() as u64)
     {
         return false;
     }
@@ -132,9 +145,17 @@ pub(crate) fn fixup(frame: &mut Frame) -> bool {
 }
 
 /// WRMSR that answers a #GP with `false`.
-fn write(index: u32, value: u64) -> bool {
+pub(crate) fn write(index: u32, value: u64) -> bool {
     // SAFETY: ring 0; a refused write takes #GP, which `fixup` resumes.
     unsafe { stela_pmu_wrmsr(index, value) == 0 }
+}
+
+/// RDMSR that answers a #GP with `None`.
+pub(crate) fn read(index: u32) -> Option<u64> {
+    let mut value = 0;
+    // SAFETY: ring 0; a refused read takes #GP, which `fixup` resumes
+    // before the store to `value`.
+    (unsafe { stela_pmu_rdmsr(index, &mut value) } == 0).then_some(value)
 }
 
 #[inline]

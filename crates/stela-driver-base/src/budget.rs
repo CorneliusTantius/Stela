@@ -200,6 +200,12 @@ impl Drop for Budget {
     }
 }
 
+/// The wait that first saw the armed budget passed, without a [`Budget`]
+/// handle: what a report from an interrupt names, lock-free.
+pub fn passed_step() -> Option<&'static Location<'static>> {
+    state::armed().then(|| state::get().at).flatten()
+}
+
 /// Whether this processor's armed budget has passed at `counter`. The
 /// first wait to see it passed is kept as the step the device stopped at.
 #[inline]
@@ -289,9 +295,11 @@ mod tests {
         // A fresh deadline is passed at once; the first step stays named.
         assert!(CLOCK.deadline(5_000_000).passed());
         assert_eq!(budget.expired().unwrap().at, Some(first));
+        assert_eq!(passed_step(), Some(first));
         // A ready device is still seen ready.
         assert!(CLOCK.wait(60_000_000, || true));
         drop(budget);
+        assert_eq!(passed_step(), None);
         assert!(!CLOCK.deadline(5_000_000).passed());
     }
 

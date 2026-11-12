@@ -76,6 +76,7 @@ pub mod shutdown;
 pub mod source_health;
 pub mod staged_disk;
 pub mod staged_frame;
+pub mod start_watchdog;
 pub mod storage;
 pub mod topology;
 pub mod tsc;
