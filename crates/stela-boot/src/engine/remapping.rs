@@ -27,7 +27,7 @@ use crate::{
         firmware_state::Kind,
         requester::RequesterClaim,
         vtd::interrupt::DirectDelivery,
-        vtd::{BlockedRequester, BoundRequester, InitialBlock, MmioRegisters, Unit, VtdError},
+        vtd::{BlockedRequester, InitialBlock, MmioRegisters, Unit, VtdError},
     },
     native_mmio, output,
 };
@@ -124,7 +124,6 @@ pub(super) struct Remappers {
     taken: Vec<Taken>,
     initial_fabric: Option<BlockedFabric>,
     initial_lines: Option<native_mmio::InitialPciLines>,
-    requesters: core::cell::RefCell<Vec<BoundRequester<MmioRegisters>>>,
     amd: Vec<amd::Taken>,
     amd_fabric: Option<&'static native_mmio::Source>,
     roles: core::cell::RefCell<roles::Inventory>,
@@ -201,7 +200,6 @@ impl Remappers {
             taken: Vec::new(),
             initial_fabric: None,
             initial_lines: None,
-            requesters: core::cell::RefCell::new(Vec::new()),
             amd: Vec::new(),
             amd_fabric: None,
             roles: core::cell::RefCell::new(roles::Inventory::empty()),
@@ -949,72 +947,5 @@ impl Remappers {
         }
         self.vtd(address.segment, rid)?
             .map_or(Ok(()), |taken| taken.unit.admit_requester(rid))
-    }
-
-    /// The domain of its own for `binding`'s requester when a taken unit
-    /// covers it; the binding back when none does.
-    pub(super) fn domain(
-        &self,
-        source: &native_mmio::Source,
-        binding: RequesterBinding,
-    ) -> Result<Result<Arc<dyn DmaDomain>, VtdError>, RequesterBinding> {
-        let segment = binding.address().segment;
-        let rid = binding.requester();
-        let amd = match self.amd(segment, rid) {
-            Ok(taken) => taken,
-            Err(error) => return Ok(Err(error)),
-        };
-        if let Some(taken) = amd {
-            if !taken.covers(segment, rid) {
-                return Ok(Err(VtdError::Unsupported));
-            }
-            return Ok(taken.domain(binding).map_err(|error| {
-                output::arguments(format_args!(
-                    "HOST IOMMU AMD-Vi attach refused: {error:?}\n"
-                ));
-                VtdError::Busy
-            }));
-        }
-        let taken = match self.vtd(segment, rid) {
-            Ok(Some(taken)) if taken.unit.allows(rid) => taken,
-            Ok(Some(_)) | Err(_) => return Ok(Err(VtdError::Unsupported)),
-            Ok(None) => return Err(binding),
-        };
-        // SAFETY: the driver's binding of its stopped function, whose bus
-        // mastering it enables after mapping through this domain.
-        let claim = match unsafe { RequesterClaim::from_binding(binding) } {
-            Ok(claim) => claim,
-            Err((error, binding)) => {
-                // A failed epoch check returns the SAME retained binding.
-                // Refusal cannot authorize releasing its original graph.
-                let _kept = core::mem::ManuallyDrop::new(alloc::boxed::Box::new(
-                    core::mem::ManuallyDrop::new(binding),
-                ));
-                return Ok(Err(error));
-            }
-        };
-        let initial = self
-            .initial_requester(source, taken, rid)
-            .and_then(|blocked| blocked.map_or(Ok(()), |requester| requester.drain()));
-        if let Err(error) = initial {
-            output::arguments(format_args!(
-                "HOST IOMMU VT-d requester {rid:#06x} initial handoff refused: {error:?}\n"
-            ));
-            let _kept = core::mem::ManuallyDrop::new(claim);
-            return Ok(Err(match error {
-                DmaError::InvalidationFailed => VtdError::Invalidation,
-                _ => VtdError::Unsupported,
-            }));
-        }
-        // SAFETY: the same checked stopped claim and original unit remain held.
-        let owner = match unsafe { taken.unit.attach_requester(claim) } {
-            Ok(owner) => owner,
-            Err(failure) => return Ok(Err(failure.error)),
-        };
-        let domain = owner.domain();
-        // The serialized service keeps affine config custody. The returned
-        // DMA projection contains no command/configuration callback.
-        self.requesters.borrow_mut().push(owner);
-        Ok(Ok(domain as Arc<dyn DmaDomain>))
     }
 }

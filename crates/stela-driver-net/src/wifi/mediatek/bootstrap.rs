@@ -116,6 +116,39 @@ pub async unsafe fn identify(
     Identity::observed(pci, raw_chip, raw_revision, raw_bound).map_err(Error::Identity)
 }
 
+/// Stop the MT7925 `pci` names before Stela binds its DMA, as
+/// `mt7925_pci_probe` does before it maps anything; see
+/// [`Control::cold_stop`].
+///
+/// # Safety
+/// `base..base+bytes` is this function's uncached BAR0, mapped while `owner`
+/// lives, with bus mastering off and no other user; `clock` is calibrated on
+/// this CPU.
+pub unsafe fn stop(
+    pci: PciIdentity,
+    base: NonNull<u8>,
+    bytes: usize,
+    owner: Arc<dyn core::any::Any>,
+    clock: Clock,
+    aspm: bool,
+) -> Result<(), Error> {
+    let chip = pci
+        .chip()
+        .ok_or(Error::Identity(IdentityError::UnsupportedPci(pci)))?;
+    if chip != Chip::Mt7925 {
+        return Err(Error::UnsupportedChip(chip));
+    }
+    // SAFETY: the caller's mapped, unshared BAR0, kept by `owner`.
+    let io = unsafe { MmioBar::from_owned_window(base, bytes, owner) }.map_err(Error::Register)?;
+    // SAFETY: the chip comes from this function's own PCI IDs.
+    let registers = unsafe { Registers::new(chip, io) };
+    // SAFETY: `clock` is calibrated on this CPU and nothing else reaches the
+    // function's registers.
+    let mut control = unsafe { Control::new(registers, clock) }.map_err(Error::Control)?;
+    // SAFETY: bus mastering is off and this control is dropped right after.
+    unsafe { control.cold_stop(aspm) }.map_err(Error::Control)
+}
+
 pub(in crate::wifi::mediatek) struct NativeWindow {
     base: NonNull<u8>,
     bytes: usize,

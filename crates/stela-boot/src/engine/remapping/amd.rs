@@ -663,11 +663,6 @@ impl Taken {
         claimed.1 = true;
         Ok(root)
     }
-
-    /// A domain of its own for `binding`'s requester.
-    pub(super) fn domain(&self, binding: RequesterBinding) -> Result<Arc<dyn DmaDomain>, Error> {
-        attach_domain(&self.unit, binding).map(|domain| domain as Arc<dyn DmaDomain>)
-    }
 }
 
 fn attach_domain(

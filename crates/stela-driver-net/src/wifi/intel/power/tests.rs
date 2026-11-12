@@ -538,3 +538,81 @@ fn the_early_access_reads_what_the_csrs_do_not_say() {
     assert_eq!(model.peripheral[&0xd03030], 0x8000_000f);
     assert_eq!(model.registers[&GP] & BZ_MAC_ACCESS, 0);
 }
+
+#[test]
+fn a_cold_stop_masks_interrupts_stops_the_master_and_resets_the_device() {
+    for acknowledged in [true, false] {
+        let mut model = Model::new(Family::Ax210);
+        model.registers.insert(GP, 0x0800_000d);
+        if acknowledged {
+            model.registers.insert(RESET, MASTER_DISABLED);
+        }
+        stop(&mut model, Family::Ax210).unwrap();
+        let ops = &model.ops;
+        assert_eq!(
+            ops[..3],
+            [
+                Op::Write(INT_MASK, 0),
+                Op::Write(INT, u32::MAX),
+                Op::Write(FH_INT, u32::MAX)
+            ]
+        );
+        let stop_master = ops
+            .iter()
+            .position(|op| matches!(op, Op::Write(RESET, value) if value & STOP_MASTER != 0))
+            .unwrap();
+        let reset = ops
+            .iter()
+            .position(|op| matches!(op, Op::Write(RESET, value) if value & SW_RESET_LEGACY != 0))
+            .unwrap();
+        assert!(stop_master < reset);
+        // An unacknowledged master stop is polled for its 100 us, then reset;
+        // the reset's own read-modify-write reads the register once more.
+        let reads = ops[stop_master..reset]
+            .iter()
+            .filter(|op| **op == Op::Read(RESET))
+            .count();
+        assert_eq!(reads, if acknowledged { 2 } else { 11 });
+        assert_eq!(ops[reset + 1], Op::Delay(5000));
+        assert_eq!(model.registers[&GP] & (INIT_DONE | MAC_ACCESS), 0);
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op, Op::Write(GP, value) if value & SW_RESET != 0))
+        );
+    }
+}
+
+#[test]
+fn a_bz_cold_stop_uses_gp_control_and_a_vanished_device_fails() {
+    let mut model = Model::new(Family::Ax210);
+    model
+        .registers
+        .insert(GP, 0x0800_0000 | MAC_INIT | BZ_MAC_ACCESS);
+    stop(&mut model, Family::Bz).unwrap();
+    let ops = &model.ops;
+    assert!(!ops.iter().any(|op| matches!(op, Op::Write(RESET, _))));
+    let request = ops
+        .iter()
+        .position(
+            |op| matches!(op, Op::Write(GP, value) if value & BUS_MASTER_DISABLE_REQUEST != 0),
+        )
+        .unwrap();
+    let reset = ops
+        .iter()
+        .position(|op| matches!(op, Op::Write(GP, value) if value & SW_RESET != 0))
+        .unwrap();
+    assert!(request < reset);
+    assert_eq!(ops[reset + 1], Op::Delay(10000));
+    assert_eq!(model.registers[&GP] & (MAC_INIT | BZ_MAC_ACCESS), 0);
+
+    let mut model = Model::new(Family::Ax210);
+    model.registers.insert(RESET, u32::MAX);
+    assert!(matches!(
+        stop(&mut model, Family::Ax210),
+        Err(Error::FailedRead {
+            register: RESET,
+            ..
+        })
+    ));
+    assert!(!model.ops.iter().any(|op| matches!(op, Op::Write(RESET, _))));
+}

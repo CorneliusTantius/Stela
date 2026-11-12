@@ -1127,3 +1127,53 @@ fn a_bring_up_dropped_mid_download_leaves_the_device_to_the_next_reset() {
     assert_eq!(f.controller.phase(), Phase::Policy);
     f.retire();
 }
+
+#[test]
+fn a_cold_stop_resets_the_wlan_subsystem_masks_interrupts_and_stops_wfdma() {
+    if crate::test_process::isolate_model() {
+        return;
+    }
+    let bar = Bar(Arc::new(Mutex::new(DeviceBar {
+        values: BTreeMap::from([(0xf0140, 0xa5a50011), (0xd4208, !(1 << 1 | 1 << 3))]),
+        ..DeviceBar::default()
+    })));
+    // SAFETY: the model device belongs to this test alone.
+    let mut control =
+        unsafe { Control::new(Registers::new(Chip::Mt7925, bar.clone()), model_clock()) }.unwrap();
+    // SAFETY: as above; nothing else uses the model.
+    unsafe { control.cold_stop(false) }.unwrap();
+    let b = bar.0.lock().unwrap();
+    let wfsys: Vec<_> = b
+        .log
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.0 == 1 && v.1 == 0xf0140)
+        .collect();
+    assert_eq!(wfsys.len(), 2);
+    let stop = b
+        .log
+        .iter()
+        .rposition(|v| v.0 == 1 && v.1 == 0xd4208)
+        .unwrap();
+    assert!(wfsys[1].0 < stop);
+    assert_eq!(b.values[&0xd4208] & (1 | 1 << 2), 0);
+    assert!(!b.log.iter().any(|v| v.0 == 2));
+
+    let bar = Bar(Arc::new(Mutex::new(DeviceBar {
+        wfsys_no_ack: true,
+        ..DeviceBar::default()
+    })));
+    // SAFETY: as above.
+    let mut control =
+        unsafe { Control::new(Registers::new(Chip::Mt7925, bar.clone()), model_clock()) }.unwrap();
+    // SAFETY: as above.
+    assert!(unsafe { control.cold_stop(false) }.is_err());
+    assert!(
+        !bar.0
+            .lock()
+            .unwrap()
+            .log
+            .iter()
+            .any(|v| v.0 == 1 && v.1 == 0xd4208)
+    );
+}

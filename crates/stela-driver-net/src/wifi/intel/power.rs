@@ -44,6 +44,16 @@ const MAC_INIT: u32 = 1 << 6;
 const MAC_STATUS: u32 = 1 << 20;
 const BZ_MAC_ACCESS: u32 = 1 << 21;
 const SW_RESET: u32 = 1 << 31;
+/// CSR_RESET_REG_FLAG_SW_RESET, before the Bz family.
+const SW_RESET_LEGACY: u32 = 1 << 7;
+/// CSR_RESET_REG_FLAG_STOP_MASTER and CSR_RESET_REG_FLAG_MASTER_DISABLED.
+const STOP_MASTER: u32 = 1 << 9;
+const MASTER_DISABLED: u32 = 1 << 8;
+/// CSR_GP_CNTRL_REG_FLAG_BUS_MASTER_DISABLE_REQ and _STATUS, from Bz on.
+const BUS_MASTER_DISABLE_REQUEST: u32 = 1 << 29;
+const BUS_MASTER_DISABLED: u32 = 1 << 28;
+/// CSR_GP_CNTRL_REG_FLAG_INIT_DONE.
+const INIT_DONE: u32 = 1 << 2;
 const WFPM_CTRL: u32 = 0xa03030;
 const WFPM_AUX_MAC_OWNER: u32 = 0x80000000;
 const WFPM_OTP_CFG1: u32 = 0xa03098;
@@ -94,6 +104,27 @@ impl NativeCsr {
         let registers =
             crate::registers(handoff, bar, 0, 4096).map_err(|_| AccessError::Mapping)?;
         Ok(Self { registers, minimum })
+    }
+
+    /// The CSRs at the start of an already mapped BAR0 window.
+    ///
+    /// # Safety
+    /// As for [`Self::new`], with `window` the start of this function's
+    /// uncached BAR0 mapping, which covers at least 4 KiB and stays mapped
+    /// for this object's life.
+    pub unsafe fn from_window(
+        window: core::ptr::NonNull<u8>,
+        minimum: alloc::rc::Rc<dyn crate::bus::pci::power::Timer>,
+    ) -> Result<Self, AccessError> {
+        minimum.check().map_err(AccessError::Minimum)?;
+        if !(window.as_ptr() as usize).is_multiple_of(4096) {
+            return Err(AccessError::Mapping);
+        }
+        Ok(Self {
+            // SAFETY: covered by this function's own safety contract.
+            registers: unsafe { Mmio::new(window.as_ptr() as u64, 4096) },
+            minimum,
+        })
     }
 }
 impl Csr for NativeCsr {
@@ -413,6 +444,52 @@ impl<C: Csr> Csr for &mut C {
     fn delay_us(&mut self, microseconds: u32) -> Result<(), AccessError> {
         (**self).delay_us(microseconds)
     }
+}
+
+/// Stop a function whatever its last owner left running, as
+/// `_iwl_trans_pcie_gen2_stop_device` does: mask and acknowledge its
+/// interrupts (`iwl_disable_interrupts`), ask its DMA master to stop
+/// (`iwl_pcie_apm_stop_master`), reset the whole device
+/// (`iwl_trans_pcie_sw_reset`) and clear INIT_DONE, or MAC_INIT from the Bz
+/// family on, with the NIC access request. As in Linux, a master that does
+/// not report stopped within 100 us is no failure: the reset follows and
+/// stops it. Bus mastering stays off at the PCI level throughout.
+pub fn stop<C: Csr>(io: &mut C, family: Family) -> Result<(), Error> {
+    let mut nic = Nic {
+        io,
+        family,
+        bisr: false,
+    };
+    nic.write(INT_MASK, 0)?;
+    nic.write(INT, u32::MAX)?;
+    nic.write(FH_INT, u32::MAX)?;
+    let master = if family >= Family::Bz {
+        nic.set(GP, BUS_MASTER_DISABLE_REQUEST)?;
+        let stopped = nic.poll(GP, BUS_MASTER_DISABLED, 100);
+        nic.io.delay_us(10000)?;
+        stopped
+    } else {
+        nic.set(RESET, STOP_MASTER)?;
+        nic.poll(RESET, MASTER_DISABLED, 100)
+    };
+    match master {
+        Ok(()) | Err(Error::Timeout { .. }) => {}
+        Err(error) => return Err(error),
+    }
+    if family >= Family::Bz {
+        nic.set(GP, SW_RESET)?;
+        nic.io.delay_us(10000)?;
+    } else {
+        nic.set(RESET, SW_RESET_LEGACY)?;
+        nic.io.delay_us(5000)?;
+    }
+    let initialized = if family >= Family::Bz {
+        MAC_INIT
+    } else {
+        INIT_DONE
+    };
+    let gp = nic.read(GP)?;
+    nic.write(GP, gp & !(initialized | NicAccess::of(family).request))
 }
 
 /// `iwl_pci_probe`'s early NIC access: wake the function just far enough to

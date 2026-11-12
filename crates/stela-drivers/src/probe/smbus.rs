@@ -45,6 +45,34 @@ struct State {
     host_notify: bool,
     /// Host Notify senders not yet consumed, a bit per seven-bit address.
     notified: u128,
+    /// The function's own DMA domain from its hand-over.
+    _attachment: crate::bus::pci::requester::preparation::Attachment,
+}
+
+/// The i801's vendor stop. The host has no DMA engine: Linux `i801_probe`
+/// never enables its bus mastering, so with the preparation's seal on it
+/// has nothing to stop.
+struct Stop;
+
+impl native::hand_over::ColdStop for Stop {
+    type Error = PlatformError;
+    /// The host is reached through its I/O window, BAR 4.
+    const BAR: Option<usize> = None;
+    fn admit(
+        &mut self,
+        function: &mut crate::bus::pci::Function<crate::bus::pci::owned::OwnedConfig>,
+    ) -> Result<(), PlatformError> {
+        ControllerInfo::from_pci_id(function.vendor, function.device)
+            .map(|_| ())
+            .ok_or(PlatformError::Refused("not an i801 SMBus host"))
+    }
+    unsafe fn stop(
+        &mut self,
+        _: &mut crate::bus::pci::Function<crate::bus::pci::owned::OwnedConfig>,
+        _: Option<native::hand_over::Window>,
+    ) -> Result<(), PlatformError> {
+        Ok(())
+    }
 }
 
 impl State {
@@ -137,14 +165,14 @@ pub(super) unsafe fn attach(
     bridges: &[native::Bridge],
     clock: Clock,
 ) -> Result<Host, PlatformError> {
-    let requester = services
-        .claim_stopped(address)
-        .map_err(PlatformError::Native)?;
-    let mut function = requester.into_function();
+    // SAFETY: forwarded from the caller.
+    let handed = unsafe { native::hand_over::hand_over(services, address, &mut Stop) }
+        .map_err(|(error, _)| error)?;
+    let attachment = handed.attachment;
+    let mut function = handed.requester.into_function();
     let info = ControllerInfo::from_pci_id(function.vendor, function.device)
         .ok_or(PlatformError::Refused("not an i801 SMBus host"))?;
-    let Some(Bar::Io { port, size }) = function.bars().map_err(PlatformError::Config)?[SMBUS_BAR]
-    else {
+    let Some(Bar::Io { port, size }) = handed.bars[SMBUS_BAR] else {
         return Err(PlatformError::Refused(
             "SMBus base address uninitialized, as Linux i801_probe reports it",
         ));
@@ -222,5 +250,6 @@ pub(super) unsafe fn attach(
         firmware,
         host_notify,
         notified: 0,
+        _attachment: attachment,
     }))))
 }

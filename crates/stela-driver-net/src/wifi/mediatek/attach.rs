@@ -78,6 +78,8 @@ pub enum AttachError {
     Client(client::Error),
     Policy(PolicyError),
     Link(LinkControlError),
+    /// Stopping what the function's last owner left running failed.
+    Stop(bootstrap::Error),
 }
 
 impl From<bootstrap::Error> for AttachError {
@@ -93,6 +95,8 @@ impl fmt::Display for AttachError {
             Self::Bootstrap(error) => write!(f, "{error}"),
             Self::Link(error) => write!(f, "{error}"),
             Self::NoRegulatoryDatabase => f.write_str("MT7925: no regulatory database"),
+            Self::UnsupportedChip(_) => f.write_str("this MediaTek Wi-Fi adapter is not supported"),
+            Self::Stop(error) => write!(f, "it did not stop for Stela to take over ({error:?})"),
             Self::Country(alpha2, error) => write!(
                 f,
                 "MT7925: regulatory.db country {}: {error:?}",

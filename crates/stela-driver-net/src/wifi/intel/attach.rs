@@ -68,15 +68,37 @@ pub enum AttachError {
     },
     Step(String),
     Boot(boot::Error),
+    /// Stopping what the function's last owner left running failed.
+    Stop(power::Error),
 }
 
 impl fmt::Display for AttachError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NoPinnedFirmware { family, name } => {
-                write!(f, "no pinned firmware for {family:?} ({name})")
+            Self::NoRegulatoryDatabase => {
+                f.write_str("the Wi-Fi regulatory database is missing, so nothing may scan")
             }
-            error => write!(f, "{error:?}"),
+            Self::NoNamespace => f.write_str("this build reads no ACPI namespace"),
+            Self::Register(error) => write!(f, "its registers did not answer ({error:?})"),
+            Self::Identity(IdentityError::UnsupportedPci) => {
+                f.write_str("this Intel Wi-Fi adapter is not supported")
+            }
+            Self::Identity(error) => {
+                write!(f, "this Intel Wi-Fi adapter is not supported ({error:?})")
+            }
+            Self::Power(error) => write!(f, "it did not wake up ({error:?})"),
+            Self::NoPinnedFirmware { name, .. } => {
+                write!(f, "its firmware {name} is not on the USB")
+            }
+            Self::Resource { name, kind } => {
+                write!(f, "its firmware {name} is unreadable ({kind})")
+            }
+            Self::Firmware { name, error } => {
+                write!(f, "its firmware {name} is invalid ({error:?})")
+            }
+            Self::Step(error) => write!(f, "its radio step is unknown ({error})"),
+            Self::Boot(error) => write!(f, "its firmware did not start ({error:?})"),
+            Self::Stop(error) => write!(f, "it did not stop for Stela to take over ({error:?})"),
         }
     }
 }
