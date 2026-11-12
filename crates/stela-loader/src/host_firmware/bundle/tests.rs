@@ -21,8 +21,8 @@ fn the_complete_bundle_holds_every_recipe_once_by_content() {
     assert_eq!(count, objects.len());
     // The RTL8168H and RTL8168M share a file, as the RTL9151A and RTL9151AS do.
     assert_eq!(count + 2, recipes().count());
-    // The recipes' recorded lengths: 84 files, 118.1 MiB.
-    assert_eq!((count, bytes), (84, 123_870_497), "{count} {bytes}");
+    // The recipes' recorded lengths: 89 files, 118.3 MiB.
+    assert_eq!((count, bytes), (89, 124_095_910), "{count} {bytes}");
     // The GPU's large images come last, for a volume short of room.
     assert_eq!(objects.last().unwrap().length, 63_571_696);
     let manifest = manifest(&complete()).unwrap();
@@ -78,7 +78,7 @@ fn members(selection: &Selection) -> Vec<&'static str> {
     members
 }
 
-const BLUETOOTH: [&str; 10] = [
+const BLUETOOTH: [&str; 15] = [
     "intel/ibt-0040-0041.ddc",
     "intel/ibt-0040-0041.sfi",
     "intel/ibt-0041-0041.sfi",
@@ -89,6 +89,11 @@ const BLUETOOTH: [&str; 10] = [
     "mediatek/BT_RAM_CODE_MT7922_1_1_hdr.bin",
     "mediatek/BT_RAM_CODE_MT7961_1_2_hdr.bin",
     "mediatek/mt7925/BT_RAM_CODE_MT7925_1_1_hdr.bin",
+    "rtl_bt/rtl8761bu_config.bin",
+    "rtl_bt/rtl8761bu_fw.bin",
+    "rtl_bt/rtl8822b_config.bin",
+    "rtl_bt/rtl8822b_fw.bin",
+    "rtl_bt/rtl8852bu_fw.bin",
 ];
 
 fn pci(vendor: u16, device: u16, class: u8) -> Pci {

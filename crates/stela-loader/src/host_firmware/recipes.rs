@@ -131,6 +131,8 @@ enum Consumer {
     /// Intel's TLV boot loader (`btintel_bootloader_setup_tlv`), over USB
     /// or PCIe.
     IntelTlv,
+    /// Realtek's USB Bluetooth epatch loader (`btrtl`).
+    RealtekBluetooth,
     Wifi,
     Nouveau,
 }
@@ -440,6 +442,58 @@ const INTEL_TLV_LINKS: &[(&str, &str)] = &[
     ("intel/ibt-0041-0041.ddc", "intel/ibt-0040-0041.ddc"),
     ("intel/ibt-0291-0291.sfi", "intel/ibt-0093-0291.sfi"),
     ("intel/ibt-0291-0291.ddc", "intel/ibt-0093-0041.ddc"),
+];
+
+/// The Realtek Bluetooth licence WHENCE names for `rtl_bt`, at the revision
+/// of its images.
+const REALTEK_BLUETOOTH_LICENSE: Artifact = Artifact {
+    source: LINUX_FIRMWARE,
+    revision: REALTEK_REVISION,
+    member: "LICENSES/LICENCE.rtlwifi_firmware.txt",
+    length: 2115,
+    sha256: "a61351665b4f264f6c631364f85b907d8f8f41f8b369533ef4021765f9f3b62e",
+};
+const fn realtek_bluetooth(member: &'static str, length: usize, sha256: &'static str) -> Recipe {
+    Recipe {
+        image: Artifact {
+            source: LINUX_FIRMWARE,
+            revision: REALTEK_REVISION,
+            member,
+            length,
+            sha256,
+        },
+        license: &REALTEK_BLUETOOTH_LICENSE,
+        consumer: Consumer::RealtekBluetooth,
+    }
+}
+/// The patch and configuration images the Realtek USB Bluetooth loader
+/// names for the RTL8761BU, RTL8822B and RTL8852BU.
+pub const REALTEK_BLUETOOTH: &[Recipe] = &[
+    realtek_bluetooth(
+        "rtl_bt/rtl8761bu_fw.bin",
+        44484,
+        "1d7a9597349ad89344fa16c1913d3e39e9a12e966e417ca16871bc79bbe59edb",
+    ),
+    realtek_bluetooth(
+        "rtl_bt/rtl8761bu_config.bin",
+        6,
+        "6c28a3f07c6a30ed208c4b64862a23f02b7d93543ea980edd24df16bab45095f",
+    ),
+    realtek_bluetooth(
+        "rtl_bt/rtl8822b_fw.bin",
+        51176,
+        "eecef2c3b2ff03c3a41292a93a25eca6f4ec38eb4a7491a3651b530be89a04fc",
+    ),
+    realtek_bluetooth(
+        "rtl_bt/rtl8822b_config.bin",
+        14,
+        "ea082136d5285655372e3805cd50d961bd7d42085c6fc1058a115a7e844df9c1",
+    ),
+    realtek_bluetooth(
+        "rtl_bt/rtl8852bu_fw.bin",
+        129733,
+        "c2b0d34a4ff8a8ea136993f0dc4ba657522d84231b4094c2a53cda39afc91c57",
+    ),
 ];
 
 const WIFI_FIRMWARE_LICENSE: Artifact = Artifact {
@@ -1291,6 +1345,43 @@ fn select_intel_tlv(request: &Request, pcie: bool) -> Option<&'static Recipe> {
         .find(|recipe| recipe.image.member == member)
 }
 
+/// The Realtek USB Bluetooth loader's request: one of the USB IDs its
+/// project table lists (`usb::bluetooth::realtek::identity`), the epatch
+/// format that project's loader reads, and one of the project's two images.
+/// `rtl8852bu_config.bin` is a link in linux-firmware, served from its target.
+fn select_realtek_bluetooth(request: &Request, v2: bool) -> Option<&'static Recipe> {
+    let usb: Vec<_> = request.target.hardware.split(':').collect();
+    if usb.len() != 4 || usb[0] != "usb" || !usb[1..].iter().all(|f| hex_field(f, 4)) {
+        return None;
+    }
+    let project = match (usb[1], usb[2]) {
+        ("0bda", "a728" | "8771") | ("0b05", "190e") => "rtl8761bu",
+        ("13d3", "3526") | ("0b05", "185c") => "rtl8822b",
+        ("0cb8", "c559")
+        | ("0bda", "4853" | "887b" | "b85b")
+        | ("13d3", "3570" | "3571" | "3572" | "3591")
+        | ("0489", "e123" | "e125") => "rtl8852bu",
+        _ => return None,
+    };
+    let format = if v2 { "epatch-v2:" } else { "epatch-v1:" };
+    if (project == "rtl8852bu") != v2 || !request.target.revision.starts_with(format) {
+        return None;
+    }
+    let member = match request
+        .name
+        .strip_prefix("rtl_bt/")?
+        .strip_prefix(project)?
+    {
+        "_fw.bin" => request.name.as_str(),
+        "_config.bin" if project == "rtl8852bu" => "rtl_bt/rtl8761bu_config.bin",
+        "_config.bin" => request.name.as_str(),
+        _ => return None,
+    };
+    REALTEK_BLUETOOTH
+        .iter()
+        .find(|recipe| recipe.image.member == member)
+}
+
 /// The pinned recipe for `request`'s exact name and target, if any.
 /// Board-specific requests and resources boot reads itself have none.
 pub fn recipe(request: &Request) -> Option<&'static Recipe> {
@@ -1302,6 +1393,8 @@ pub fn recipe(request: &Request) -> Option<&'static Recipe> {
         "intel-bluetooth-usb-rsa" => select_intel_rsa(request),
         "intel-bluetooth-usb-tlv" => select_intel_tlv(request, false),
         "intel-bluetooth-pcie-tlv" => select_intel_tlv(request, true),
+        "realtek-bluetooth-usb-epatch-v1" => select_realtek_bluetooth(request, false),
+        "realtek-bluetooth-usb-epatch-v2" => select_realtek_bluetooth(request, true),
         "wifi-regulatory" => select_regulatory(request),
         "wifi-intel" => select_intel_wifi(request),
         "wifi-mt792x" => select_mediatek_wifi(request),
@@ -1887,6 +1980,123 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    /// Each Realtek USB Bluetooth project's patch and configuration are
+    /// pinned for the USB IDs its loader takes, the RTL8852BU's configuration
+    /// served from the RTL8761BU file it links to, and the licence read at
+    /// the images' revision.
+    #[test]
+    fn realtek_bluetooth_recipes_follow_the_project_table() {
+        let v1 = "epatch-v1:hci-0a-000b:lmp-0a-8761:manufacturer-005d:register-8761-none:rom-01:security-00-00";
+        let v2 = "epatch-v2:hci-0b-000b:lmp-0b-8852:manufacturer-005d:register-8852-000b:rom-01:security-00-00";
+        for (driver, hardware, revision, name, member) in [
+            (
+                "realtek-bluetooth-usb-epatch-v1",
+                "usb:0bda:8771:0200",
+                v1,
+                "rtl_bt/rtl8761bu_fw.bin",
+                "rtl_bt/rtl8761bu_fw.bin",
+            ),
+            (
+                "realtek-bluetooth-usb-epatch-v1",
+                "usb:0bda:a728:0200",
+                v1,
+                "rtl_bt/rtl8761bu_config.bin",
+                "rtl_bt/rtl8761bu_config.bin",
+            ),
+            (
+                "realtek-bluetooth-usb-epatch-v1",
+                "usb:13d3:3526:0001",
+                v1,
+                "rtl_bt/rtl8822b_fw.bin",
+                "rtl_bt/rtl8822b_fw.bin",
+            ),
+            (
+                "realtek-bluetooth-usb-epatch-v1",
+                "usb:0b05:185c:0001",
+                v1,
+                "rtl_bt/rtl8822b_config.bin",
+                "rtl_bt/rtl8822b_config.bin",
+            ),
+            (
+                "realtek-bluetooth-usb-epatch-v2",
+                "usb:0bda:4853:0000",
+                v2,
+                "rtl_bt/rtl8852bu_fw.bin",
+                "rtl_bt/rtl8852bu_fw.bin",
+            ),
+            (
+                "realtek-bluetooth-usb-epatch-v2",
+                "usb:0489:e125:0000",
+                v2,
+                "rtl_bt/rtl8852bu_config.bin",
+                "rtl_bt/rtl8761bu_config.bin",
+            ),
+        ] {
+            let plan = Plan::select(&bluetooth(driver, name, hardware, revision)).unwrap();
+            let selection = &plan.selections[0];
+            assert_eq!(selection.request.name, name);
+            assert_eq!(selection.recipe.image.member, member);
+            assert_eq!(
+                (
+                    selection.recipe.image.revision,
+                    selection.recipe.license.revision
+                ),
+                (REALTEK_REVISION, REALTEK_REVISION)
+            );
+        }
+        for (driver, hardware, revision, name) in [
+            // Another project's file, an unlisted ID, the other epatch
+            // format, a truncated USB identity and an unknown file.
+            (
+                "realtek-bluetooth-usb-epatch-v1",
+                "usb:0bda:8771:0200",
+                v1,
+                "rtl_bt/rtl8822b_fw.bin",
+            ),
+            (
+                "realtek-bluetooth-usb-epatch-v1",
+                "usb:0bda:b00b:0200",
+                v1,
+                "rtl_bt/rtl8761bu_fw.bin",
+            ),
+            (
+                "realtek-bluetooth-usb-epatch-v2",
+                "usb:0bda:8771:0200",
+                v2,
+                "rtl_bt/rtl8761bu_fw.bin",
+            ),
+            (
+                "realtek-bluetooth-usb-epatch-v1",
+                "usb:0bda:4853:0000",
+                v1,
+                "rtl_bt/rtl8852bu_fw.bin",
+            ),
+            (
+                "realtek-bluetooth-usb-epatch-v2",
+                "usb:0bda:4853:0000",
+                v1,
+                "rtl_bt/rtl8852bu_fw.bin",
+            ),
+            (
+                "realtek-bluetooth-usb-epatch-v1",
+                "usb:0bda:8771",
+                v1,
+                "rtl_bt/rtl8761bu_fw.bin",
+            ),
+            (
+                "realtek-bluetooth-usb-epatch-v1",
+                "usb:0bda:8771:0200",
+                v1,
+                "rtl_bt/rtl8761bu_extra.bin",
+            ),
+        ] {
+            assert!(
+                Plan::select(&bluetooth(driver, name, hardware, revision)).is_err(),
+                "{driver} {hardware} {name}"
+            );
+        }
     }
 
     #[test]

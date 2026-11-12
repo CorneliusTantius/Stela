@@ -34,7 +34,7 @@ pub const TARGET: driver::Target<'static> = driver::Target {
 
 /// Every recipe family, in the order a volume short of room keeps them: the
 /// small network and Bluetooth files first, the GPU's large images last.
-pub const FAMILIES: [(&str, &[Recipe]); 9] = [
+pub const FAMILIES: [(&str, &[Recipe]); 10] = [
     ("Wi-Fi regulatory database", recipes::REGULATORY),
     ("Realtek Ethernet", recipes::REALTEK),
     ("Realtek Wi-Fi", recipes::REALTEK_WIFI),
@@ -43,6 +43,7 @@ pub const FAMILIES: [(&str, &[Recipe]); 9] = [
     ("MediaTek Bluetooth", recipes::MEDIATEK_BLUETOOTH),
     ("Intel Bluetooth", recipes::INTEL_RSA),
     ("Intel AX and BE Bluetooth", recipes::INTEL_TLV),
+    ("Realtek Bluetooth", recipes::REALTEK_BLUETOOTH),
     ("NVIDIA GSP-RM", recipes::GSP),
 ];
 
@@ -344,12 +345,13 @@ impl Selection {
 
 /// The files a PC with these PCI functions needs. USB Bluetooth controllers
 /// are not on PCI before the boot's own USB stack runs, so their files,
-/// about 4.6 MB in all, are always selected.
+/// about 4.8 MB in all, are always selected.
 pub fn select(functions: &[Pci]) -> Selection {
     let mut selection = Selection::default();
     selection.members(recipes::MEDIATEK_BLUETOOTH, &[], "usb bluetooth");
     selection.members(recipes::INTEL_RSA, &[], "usb bluetooth");
     selection.members(recipes::INTEL_TLV, &[], "usb bluetooth");
+    selection.members(recipes::REALTEK_BLUETOOTH, &[], "usb bluetooth");
     for function in functions {
         let why = format!("pci {:04x}:{:04x}", function.vendor, function.device);
         let mut inventory = Inventory::default();
