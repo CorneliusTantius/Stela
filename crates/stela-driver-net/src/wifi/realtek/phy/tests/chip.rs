@@ -437,6 +437,10 @@ const HOST_CLOCK: Clock = Clock {
 };
 
 fn attach_8821c(rfe: u8) -> Attached {
+    attach_8821c_on(rfe, HOST_CLOCK)
+}
+
+fn attach_8821c_on(rfe: u8, clock: Clock) -> Attached {
     use crate::wifi::realtek::{
         beacon::tests::{Domain, Model as Memory, Source},
         bootstrap::Claim,
@@ -455,7 +459,7 @@ fn attach_8821c(rfe: u8) -> Attached {
             model: chip.clone(),
             panic_delay: false,
             panic_register: None,
-            clock: Some(HOST_CLOCK),
+            clock: Some(clock),
         }))),
     );
     let memory = Arc::new(Mutex::new(Memory::default()));
@@ -463,7 +467,7 @@ fn attach_8821c(rfe: u8) -> Attached {
         window,
         bytes: 0x10000,
         owner: Arc::new(()),
-        clock: HOST_CLOCK,
+        clock,
         pages: &Source,
         domain: Arc::new(Domain(memory.clone())),
         firmware: Box::leak(Box::new(catalog_for(profile, legacy_fixture()))),
@@ -555,4 +559,219 @@ fn an_rtl8821c_station_runtime_tunes_tracks_and_calibrates_on_its_own_registers(
     assert_eq!(rf(&a, 0x42) >> 16 & 3, 3);
     assert!(!a.hardware.lost());
     assert!(a.memory.lock().unwrap().mappings.len() > 1);
+}
+
+/// The device side of an RTL8821C on the model: its BAR answered by the
+/// register model, its rings read and filled in the DMA memory model, and
+/// the station runtime on top, each call to which is timed on the clock.
+pub(in crate::wifi::realtek) struct OnChip {
+    attached: Attached,
+    clock: Clock,
+    /// Each queue's device index, by index register.
+    consumed: alloc::collections::BTreeMap<u32, u16>,
+    /// The receive ring's producer and next tag.
+    produced: u16,
+    tag: u16,
+    longest: u64,
+}
+
+/// The transmit queues' descriptor bases, counts and index registers.
+const TRANSMIT_QUEUES: [(u32, u32); 6] = [
+    (0x310, 0x3b0),
+    (0x318, 0x3a0),
+    (0x320, 0x3a4),
+    (0x328, 0x3a8),
+    (0x330, 0x3ac),
+    (0x340, 0x3b8),
+];
+
+impl OnChip {
+    /// An RTL8821CE on board option 0 on `clock`, whose firmware ends each
+    /// IQK at its first look.
+    pub(in crate::wifi::realtek) fn rtl8821c(clock: Clock) -> Self {
+        let attached = attach_8821c_on(0, clock);
+        attached
+            .chip
+            .lock()
+            .unwrap()
+            .set(0x2800 + 0x08 * 4, 4, 0xabcde);
+        Self {
+            attached,
+            clock,
+            consumed: alloc::collections::BTreeMap::new(),
+            produced: 0,
+            tag: 0,
+            longest: 0,
+        }
+    }
+
+    /// `work` on the runtime, timed: a station step's own part.
+    pub(in crate::wifi::realtek) fn step<T>(
+        &mut self,
+        work: impl FnOnce(&mut crate::wifi::realtek::hardware::Hardware) -> T,
+    ) -> T {
+        let start = self.clock.now_us();
+        let output = work(&mut self.attached.hardware);
+        let took = self.clock.now_us() - start;
+        assert!(took <= RECOVERY_STEP_US, "a runtime step took {took} us");
+        self.longest = self.longest.max(took);
+        // Firmware's IQK done marker stands for the next run too.
+        let mut chip = self.attached.chip.lock().unwrap();
+        if chip.get(0x2800 + 0x08 * 4, 4) & 0xfffff == 0 {
+            chip.set(0x2800 + 0x08 * 4, 4, 0xabcde);
+        }
+        output
+    }
+
+    pub(in crate::wifi::realtek) fn lost(&self) -> bool {
+        use crate::wifi::realtek::station::Device;
+        self.attached.hardware.lost()
+    }
+
+    pub(in crate::wifi::realtek) fn ready(&self) -> bool {
+        use crate::wifi::realtek::station::Device;
+        self.attached.hardware.ready()
+    }
+
+    /// The longest runtime step so far.
+    pub(in crate::wifi::realtek) fn longest(&self) -> u64 {
+        self.longest
+    }
+
+    /// A chip reset installed new rings, whose indices start at zero.
+    pub(in crate::wifi::realtek) fn rings_reset(&mut self) {
+        self.consumed.clear();
+        self.produced = 0;
+        self.tag = 0;
+    }
+
+    /// Firmware crashes: its ready bits go.
+    pub(in crate::wifi::realtek) fn crash_firmware(&mut self) {
+        let mut chip = self.attached.chip.lock().unwrap();
+        let crashed = chip.get(0x80, 2) & !0xc078;
+        chip.set(0x80, 2, crashed);
+    }
+
+    /// The bytes at `address` in the DMA memory model.
+    fn memory(&self, address: u32, length: usize) -> Vec<u8> {
+        let memory = self.attached.memory.lock().unwrap();
+        let (&base, (_, pointer)) = memory
+            .mappings
+            .range(..=u64::from(address))
+            .next_back()
+            .expect("an address no mapping holds");
+        let at = (u64::from(address) - base) as usize;
+        // SAFETY: the mapping's live allocation, which this test alone
+        // reaches while the runtime waits for the device.
+        unsafe { core::slice::from_raw_parts((*pointer + at) as *const u8, length) }.to_vec()
+    }
+
+    fn write_memory(&self, address: u32, bytes: &[u8]) {
+        let memory = self.attached.memory.lock().unwrap();
+        let (&base, (_, pointer)) = memory
+            .mappings
+            .range(..=u64::from(address))
+            .next_back()
+            .expect("an address no mapping holds");
+        let at = (u64::from(address) - base) as usize;
+        // SAFETY: as above, a buffer the device owns until it publishes.
+        unsafe {
+            ((*pointer + at) as *mut u8).copy_from_nonoverlapping(bytes.as_ptr(), bytes.len());
+        }
+    }
+
+    /// What the device took from every transmit queue since the last look,
+    /// as each frame's packet descriptor and MPDU; each queue's read index
+    /// then catches up, as the DMA engine's does.
+    pub(in crate::wifi::realtek) fn sent(&mut self) -> Vec<([u8; 48], Vec<u8>)> {
+        let mut frames = Vec::new();
+        for (base_register, index_register) in TRANSMIT_QUEUES {
+            let (base, host) = {
+                let chip = self.attached.chip.lock().unwrap();
+                (
+                    chip.get(base_register, 4),
+                    chip.get(index_register, 2) as u16 & 0xfff,
+                )
+            };
+            let ring_count = if index_register == 0x3a8 { 256 } else { 128 };
+            let mut read = self.consumed.get(&index_register).copied().unwrap_or(0);
+            while read != host {
+                let bd = self.memory(base + u32::from(read) * 16, 16);
+                let address = u32::from_le_bytes(bd[4..8].try_into().unwrap());
+                let length = u16::from_le_bytes(bd[8..10].try_into().unwrap());
+                let packet: [u8; 48] = self.memory(address, 48).try_into().unwrap();
+                frames.push((packet, self.memory(address + 48, usize::from(length))));
+                read = (read + 1) % ring_count;
+            }
+            self.consumed.insert(index_register, read);
+            let mut chip = self.attached.chip.lock().unwrap();
+            chip.set(index_register + 2, 2, u32::from(read));
+        }
+        frames
+    }
+
+    /// One received buffer: `descriptor` words, then `info` and `payload`.
+    fn produce(&mut self, words: [u32; 6], info: &[u8], payload: &[u8]) {
+        let (base, consumer) = {
+            let chip = self.attached.chip.lock().unwrap();
+            (chip.get(0x338, 4), chip.get(0x3b4, 2) as u16 & 0xfff)
+        };
+        assert_ne!(
+            (self.produced + 1) % 512,
+            consumer,
+            "the receive ring is full"
+        );
+        let bd = self.memory(base + u32::from(self.produced) * 8, 8);
+        let address = u32::from_le_bytes(bd[4..8].try_into().unwrap());
+        let mut buffer = Vec::new();
+        for word in words {
+            buffer.extend_from_slice(&word.to_le_bytes());
+        }
+        buffer.extend_from_slice(info);
+        buffer.extend_from_slice(payload);
+        self.write_memory(address, &buffer);
+        self.write_memory(
+            base + u32::from(self.produced) * 8 + 2,
+            &self.tag.to_le_bytes(),
+        );
+        self.tag = (self.tag + 1) % 8192;
+        self.produced = (self.produced + 1) % 512;
+        let mut chip = self.attached.chip.lock().unwrap();
+        chip.set(0x3b6, 2, u32::from(self.produced));
+    }
+
+    /// The air's frames and reports, as the chip hands them up: a frame
+    /// with its FCS and the RTL8821C's page 1 PHY status at OFDM 6 Mb/s, a
+    /// report as firmware's C2H packet.
+    pub(in crate::wifi::realtek) fn deliver(
+        &mut self,
+        items: impl IntoIterator<Item = crate::wifi::realtek::station::Incoming>,
+    ) {
+        use crate::wifi::realtek::{commands::Report, station::Incoming};
+        for item in items {
+            match item {
+                Incoming::Frame(frame) => {
+                    let mut payload = frame.bytes.clone();
+                    payload.extend_from_slice(&[0; 4]);
+                    let encryption = if frame.decrypted { 4 << 20 } else { 0 };
+                    let icv = u32::from(frame.icv_error) << 15;
+                    let w0 = payload.len() as u32 | icv | 4 << 16 | encryption | 1 << 26;
+                    let power = frame.signal_dbm.unwrap_or(-60);
+                    let mut info = [0u8; 32];
+                    info[0] = 1;
+                    info[1] = (power + 110) as u8;
+                    self.produce([w0, 0, 0, 4, 0, frame.tsf], &info, &payload);
+                }
+                Incoming::Report(Report::Transmitted {
+                    number,
+                    acknowledged,
+                }) => {
+                    let status = if acknowledged { 0 } else { 0xc0 };
+                    let packet = [3, 0, status, 0, 0, 0, 0, 0, number];
+                    self.produce([packet.len() as u32, 0, 1 << 28, 0, 0, 0], &[], &packet);
+                }
+                Incoming::Report(other) => panic!("no C2H encoding of {other:?}"),
+            }
+        }
+    }
 }

@@ -697,4 +697,4 @@ pub(super) fn control_fixture() -> (PhyInitialized, Report) {
     tests::control_fixture()
 }
 #[cfg(test)]
-mod tests;
+pub(in crate::wifi::realtek) mod tests;

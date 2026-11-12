@@ -703,7 +703,7 @@ fn power_setup() -> (Bus, PhyInitialized, Report, channel_power::Plan) {
     (bus, phy, report, plan)
 }
 
-mod chip;
+pub(in crate::wifi::realtek) mod chip;
 
 mod mac;
 
