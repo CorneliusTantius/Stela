@@ -3423,10 +3423,14 @@ fn starting() -> stela_driver_base::budget::Budget {
 /// the next, as between two polls.
 fn bounded_pass(wifi: &mut Station<Model, ClockBios>) {
     use crate::wifi::connection::keeper::RECOVERY_STEP_US;
+    // With minimum intervals, no wait of the wake or the ROM start blocks a
+    // pass; the stop's 5 ms settle is the longest left.
+    const LONGEST_WAIT_US: u64 = 6_000;
+    const { assert!(LONGEST_WAIT_US < RECOVERY_STEP_US) };
     let start = Clock::ticks();
     wifi.carrier();
     let took = (Clock::ticks() - start) / 1_000_000;
-    assert!(took < RECOVERY_STEP_US, "{took} us in one pass");
+    assert!(took < LONGEST_WAIT_US, "{took} us in one pass");
     crate::test_clock::advance(
         Clock {
             ticks_per_microsecond: 1_000_000,

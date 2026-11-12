@@ -632,8 +632,7 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
             restart.domain.clone(),
             restart.entries,
         );
-        let (firmware, observations, pages, clock) =
-            (self.firmware, self.observations, self.pages, self.clock);
+        let (firmware, observations, pages) = (self.firmware, self.observations, self.pages);
         Stepped::new(async move {
             // SAFETY: as in `boot_again`: the owner that held `io`'s twin
             // stopped, and `new`'s contract holds for what it kept.
@@ -647,7 +646,7 @@ impl<Q: BootIo, B: BiosIo> Wifi<Q, B> {
                     firmware,
                     observations,
                     pages,
-                    Some(clock),
+                    true,
                 )
                 .await
             }

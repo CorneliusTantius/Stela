@@ -175,11 +175,6 @@ pub unsafe fn attach<Q: BootIo, B: BiosIo>(
     Ok(unsafe { Wifi::new(boot, inputs) })
 }
 
-/// How long a stepped boot's ROM start may run before its waits fail:
-/// within [`crate::wifi::connection::keeper::RECOVERY_STEP_US`] with the
-/// 5 ms its longest single wait takes.
-const ROM_START_STEP_US: u64 = 40_000;
-
 /// Stage `profile`'s firmware, wake the function and ROM-boot it.
 ///
 /// # Safety
@@ -207,15 +202,15 @@ pub(super) unsafe fn start<Q: BootIo>(
                 firmware,
                 observations,
                 pages,
-                None,
+                false,
             )
         },
     )
 }
 
-/// [`start`] as stepped work: with `stepped`, the wake polls its waits a step
-/// at a time and the ROM start runs in one step whose waits fail once
-/// [`ROM_START_STEP_US`] passed on that clock.
+/// [`start`] as stepped work: with `stepped`, the wake and the ROM start poll
+/// their waits a step at a time, each a minimum interval when the delay
+/// source gives one.
 ///
 /// # Safety
 /// [`start`]'s.
@@ -229,7 +224,7 @@ pub(super) async unsafe fn boot<Q: BootIo>(
     firmware: &'static dyn Provider,
     observations: Observations,
     pages: &'static dyn PageSource,
-    stepped: Option<crate::Clock>,
+    stepped: bool,
 ) -> Result<RomBoot<'static, Q>, AttachError> {
     let family = profile.family();
     let staged = identity::stage(&profile, firmware).map_err(|error| match error {
@@ -252,32 +247,43 @@ pub(super) async unsafe fn boot<Q: BootIo>(
     if vector {
         power = power.with_vector();
     }
-    match stepped {
-        Some(_) => power.wake_in_steps(ManagementSession::NotConnected).await,
-        None => power.wake(ManagementSession::NotConnected),
+    if stepped {
+        power.wake_in_steps(ManagementSession::NotConnected).await
+    } else {
+        power.wake(ManagementSession::NotConnected)
     }
     .map_err(AttachError::Power)?;
-    if stepped.is_some() {
-        stela_driver_base::stepped::yield_now().await;
-    }
-    let _step = stepped
-        .and_then(|clock| stela_driver_base::budget::Budget::start(clock, ROM_START_STEP_US).ok());
-    match family {
+    match (family, stepped) {
         // SAFETY: the caller's contract is RomBoot's.
-        Family::Ax200 => unsafe { RomBoot::start(power, staged, pages, Some(domain), entries) },
+        (Family::Ax200, false) => unsafe {
+            RomBoot::start(power, staged, pages, Some(domain), entries)
+        },
+        // SAFETY: as above.
+        (Family::Ax200, true) => unsafe {
+            RomBoot::start_in_steps(power, staged, pages, Some(domain), entries).await
+        },
         _ => {
             let step = platform::load_step_or_ignore(observations.step, firmware);
-            // SAFETY: as above; no CSME session is attached to the function.
-            unsafe {
-                RomBoot::start_ax210(
-                    power,
-                    staged,
-                    step,
-                    pages,
-                    Some(domain),
-                    entries,
-                    ProductResetPolicy::NoIwlmei,
-                )
+            let policy = ProductResetPolicy::NoIwlmei;
+            if stepped {
+                // SAFETY: as above; no CSME session is attached to the function.
+                unsafe {
+                    RomBoot::start_ax210_in_steps(
+                        power,
+                        staged,
+                        step,
+                        pages,
+                        Some(domain),
+                        entries,
+                        policy,
+                    )
+                    .await
+                }
+            } else {
+                // SAFETY: as above.
+                unsafe {
+                    RomBoot::start_ax210(power, staged, step, pages, Some(domain), entries, policy)
+                }
             }
         }
     }

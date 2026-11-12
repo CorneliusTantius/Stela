@@ -32,6 +32,7 @@ use core::{
     ptr::NonNull,
     sync::atomic::{Ordering, fence},
 };
+use stela_driver_base::stepped::{block_on, yield_now};
 mod ax200;
 mod coexistence;
 pub use coexistence::CoexistenceError;
@@ -373,6 +374,9 @@ pub struct RomBoot<'a, Q: BootIo> {
     empty_quotas_applied: bool,
     coexistence: coexistence::Coexistence,
     state: State,
+    /// Each wait of the ROM start is a minimum interval polled a step at a
+    /// time, when the delay source gives one.
+    stepped: bool,
 }
 struct Ax210Memory<'a> {
     scratch: Chunk,
@@ -421,7 +425,23 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
         entries: u16,
     ) -> Result<Self, Error> {
         // SAFETY: the caller supplies the complete documented validation.
-        unsafe { Self::start_inner(power, staged, None, source, domain, entries, None) }
+        block_on(unsafe {
+            Self::start_inner(power, staged, None, source, domain, entries, None, false)
+        })
+    }
+    /// [`Self::start`] a step at a time: each wait is a minimum interval the
+    /// steps poll, when the delay source gives one.
+    /// # Safety
+    /// [`Self::start`]'s, through every step.
+    pub async unsafe fn start_in_steps(
+        power: Power<Q>,
+        staged: Staged<'a>,
+        source: &dyn PageSource,
+        domain: Option<Arc<dyn DmaDomain>>,
+        entries: u16,
+    ) -> Result<Self, Error> {
+        // SAFETY: the caller supplies the complete documented validation.
+        unsafe { Self::start_inner(power, staged, None, source, domain, entries, None, true) }.await
     }
     /// Start the distinct AX210 IML/context-v2 protocol, preserving the
     /// checked STEP resource receipt through this epoch. No absent default is
@@ -443,6 +463,32 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
         product_reset_policy: ProductResetPolicy,
     ) -> Result<Self, Error> {
         // SAFETY: covered by this function's own safety contract.
+        block_on(unsafe {
+            Self::start_inner(
+                power,
+                staged,
+                Some(step),
+                source,
+                domain,
+                entries,
+                Some(product_reset_policy),
+                false,
+            )
+        })
+    }
+    /// [`Self::start_ax210`] a step at a time, as [`Self::start_in_steps`].
+    /// # Safety
+    /// [`Self::start_ax210`]'s, through every step.
+    pub async unsafe fn start_ax210_in_steps(
+        power: Power<Q>,
+        staged: Staged<'a>,
+        step: StepConfiguration<'a>,
+        source: &dyn PageSource,
+        domain: Option<Arc<dyn DmaDomain>>,
+        entries: u16,
+        product_reset_policy: ProductResetPolicy,
+    ) -> Result<Self, Error> {
+        // SAFETY: covered by this function's own safety contract.
         unsafe {
             Self::start_inner(
                 power,
@@ -452,10 +498,13 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
                 domain,
                 entries,
                 Some(product_reset_policy),
+                true,
             )
         }
+        .await
     }
-    unsafe fn start_inner(
+    #[expect(clippy::too_many_arguments, reason = "each is one input of the start")]
+    async unsafe fn start_inner(
         power: Power<Q>,
         staged: Staged<'a>,
         step: Option<StepConfiguration<'a>>,
@@ -463,6 +512,7 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
         domain: Option<Arc<dyn DmaDomain>>,
         entries: u16,
         product_reset_policy: Option<ProductResetPolicy>,
+        stepped: bool,
     ) -> Result<Self, Error> {
         let vector = power.vector();
         let (io, profile, _) = power.into_awake()?;
@@ -513,6 +563,10 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
         let plan = firmware.self_load_plan()?;
         // SAFETY: covered by this function's own safety contract.
         let images = unsafe { MappedFirmware::prepare(&plan, source, Some(domain.clone()))? };
+        // Copying the image is the longest work before the rings: a step.
+        if stepped {
+            yield_now().await;
+        }
         let allocate = |bytes: usize, direction| {
             Chunk::allocate(source, domain.clone(), &alloc::vec![0;bytes], direction)
         };
@@ -532,6 +586,9 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
                 allocation: allocate(RECEIVE_BUFFER_BYTES, Direction::FromDevice)?,
                 device_owned: false,
             });
+        }
+        if stepped {
+            yield_now().await;
         }
         let (context, ax210) = if let Some(step) = step {
             let context = allocate(context_v2::CONTEXT_BYTES, Direction::Bidirectional)?;
@@ -632,8 +689,10 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
             empty_quotas_applied: false,
             coexistence: coexistence::Coexistence::new(),
             state: State::Prepared,
+            stepped,
         };
-        boot.publish()?;
+        boot.publish().await?;
+        boot.stepped = false;
         Ok(boot)
     }
     /// Exact canonical image identity, integrity and provenance kept across
@@ -671,7 +730,40 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
         let old = self.read_register(register)?;
         self.write(register, old | value)
     }
+    /// Wait `microseconds` at least. Stepped, each step polls the interval
+    /// once; a source without intervals waits in the step, which then ends.
+    /// Otherwise the wait is in the step.
+    async fn wait(&mut self, microseconds: u32) -> Result<(), Error> {
+        if !self.stepped {
+            self.io().delay_us(microseconds)?;
+            return Ok(());
+        }
+        match self.io().begin_interval(microseconds)? {
+            Some(interval) => {
+                while !interval
+                    .elapsed()
+                    .map_err(|error| Error::Access(power::AccessError::Minimum(error)))?
+                {
+                    yield_now().await;
+                }
+            }
+            None => {
+                self.io().delay_us(microseconds)?;
+                yield_now().await;
+            }
+        }
+        Ok(())
+    }
     fn poll_register(
+        &mut self,
+        register: u32,
+        mask: u32,
+        value: u32,
+        microseconds: u32,
+    ) -> Result<(), Error> {
+        block_on(self.poll_register_in_steps(register, mask, value, microseconds))
+    }
+    async fn poll_register_in_steps(
         &mut self,
         register: u32,
         mask: u32,
@@ -682,23 +774,27 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
             if self.read_register(register)? & mask == value {
                 return Ok(());
             }
-            self.io().delay_us(10)?;
+            self.wait(10).await?;
         }
         Err(Error::Timeout { register })
     }
     fn prph_write(&mut self, address: u32, value: u32) -> Result<(), Error> {
-        let mask = self.grab()?;
+        block_on(self.prph_write_in_steps(address, value))
+    }
+    async fn prph_write_in_steps(&mut self, address: u32, value: u32) -> Result<(), Error> {
+        let mask = self.grab().await?;
         self.write(0x444, (address & mask) | (3 << 24))?;
         self.write(0x44c, value)?;
         self.release()
     }
     /// `__iwl_trans_pcie_grab_nic_access`, giving the peripheral address mask.
-    fn grab(&mut self) -> Result<u32, Error> {
+    async fn grab(&mut self) -> Result<u32, Error> {
         let family = self.profile.family();
         let access = power::NicAccess::of(family);
         self.set(0x24, access.request)?;
-        self.io().delay_us(2)?;
-        self.poll_register(0x24, access.mask, access.ready, 15000)?;
+        self.wait(2).await?;
+        self.poll_register_in_steps(0x24, access.mask, access.ready, 15000)
+            .await?;
         Ok(if family >= Family::Ax210 {
             0xffffff
         } else {
@@ -711,13 +807,16 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
         self.write(0x24, gp & !access.request)
     }
     fn prph_read(&mut self, address: u32) -> Result<u32, Error> {
-        let mask = self.grab()?;
+        block_on(self.prph_read_in_steps(address))
+    }
+    async fn prph_read_in_steps(&mut self, address: u32) -> Result<u32, Error> {
+        let mask = self.grab().await?;
         self.write(0x448, (address & mask) | (3 << 24))?;
         let value = self.read_register(0x450)?;
         self.release()?;
         Ok(value)
     }
-    fn publish(&mut self) -> Result<(), Error> {
+    async fn publish(&mut self) -> Result<(), Error> {
         let observed = self.profile.observed();
         if self.read_register(0x28)? != observed.hardware_revision
             || self.read_register(0x9c)? != observed.radio_id
@@ -731,7 +830,7 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
             if self.product_reset_policy != Some(ProductResetPolicy::NoIwlmei) {
                 return Err(Error::ManagedSapUnsupported);
             }
-            self.sb_configuration = Some(self.prph_read(0xa03088 + 0x300000)?);
+            self.sb_configuration = Some(self.prph_read_in_steps(0xa03088 + 0x300000).await?);
         }
         self.write(12, 0)?;
         if self.read_register(12)? != 0 {
@@ -741,7 +840,7 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
         self.write(0x5c, 4)?;
         self.write(8, u32::MAX)?;
         if self.vector {
-            self.route_interrupts()?;
+            self.route_interrupts().await?;
         }
         // iwl_mvm_nic_config returns immediately on AX210: CSR0 becomes the
         // context-v2 boot control, never the old PHY configuration fields.
@@ -799,8 +898,8 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
                 false
             }
             (true, Family::Ax200) => {
-                self.prph_write(0xa0348c, 0xf)?;
-                self.prph_write(0xa03480, LTR_BOOT_VALUE)?;
+                self.prph_write_in_steps(0xa0348c, 0xf).await?;
+                self.prph_write_in_steps(0xa03480, LTR_BOOT_VALUE).await?;
                 false
             }
             (true, Family::Ax210) => {
@@ -814,20 +913,21 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
             self.set(0x24, ROM_START)?;
         } else {
             let offset = if family >= Family::Ax210 { 0x300000 } else { 0 };
-            self.prph_write(0xa05c44 + offset, 1)?;
+            self.prph_write_in_steps(0xa05c44 + offset, 1).await?;
         }
         if keep_busy {
-            self.spin_for_iml()?;
+            self.spin_for_iml().await?;
         }
         Ok(())
     }
     /// `iwl_pcie_conf_msix_hw` and `_iwl_enable_interrupts`. A cause only
     /// wakes the core that looks for frames, which finds what it asks for in
     /// the rings, so nothing here waits for firmware's own state.
-    fn route_interrupts(&mut self) -> Result<(), Error> {
+    async fn route_interrupts(&mut self) -> Result<(), Error> {
         let family = self.profile.family();
         let offset = if family >= Family::Ax210 { 0x300000 } else { 0 };
-        self.prph_write(interrupts::UREG_CHICK + offset, interrupts::MSIX_ENABLE)?;
+        self.prph_write_in_steps(interrupts::UREG_CHICK + offset, interrupts::MSIX_ENABLE)
+            .await?;
         let routes = interrupts::routes(family);
         for ivar in routes.ivars {
             self.io().write8(ivar, interrupts::SHARED)?;
@@ -859,13 +959,34 @@ impl<'a, Q: BootIo> RomBoot<'a, Q> {
     /// `iwl_pcie_spin_for_iml`: keep the CPU and device busy for at least
     /// 100 ms or until the image loader finishes. Running out is no failure;
     /// ALIVE decides whether the boot worked.
-    fn spin_for_iml(&mut self) -> Result<(), Error> {
-        for _ in 0..100_000 {
-            if self.read_register(MSIX_HW_CAUSES)? & IML_CAUSE != 0 {
+    /// Stepped, the 100 ms are one interval each step reads the cause and
+    /// the last LTR message against, as the device sees no spinning CPU
+    /// between the steps.
+    async fn spin_for_iml(&mut self) -> Result<(), Error> {
+        let interval = if self.stepped {
+            self.io().begin_interval(100_000)?
+        } else {
+            None
+        };
+        let Some(interval) = interval else {
+            for _ in 0..100_000 {
+                if self.read_register(MSIX_HW_CAUSES)? & IML_CAUSE != 0 {
+                    break;
+                }
+                self.read_register(LTR_LAST_MESSAGE)?;
+                self.wait(1).await?;
+            }
+            return Ok(());
+        };
+        while self.read_register(MSIX_HW_CAUSES)? & IML_CAUSE == 0 {
+            self.read_register(LTR_LAST_MESSAGE)?;
+            if interval
+                .elapsed()
+                .map_err(|error| Error::Access(power::AccessError::Minimum(error)))?
+            {
                 break;
             }
-            self.read_register(LTR_LAST_MESSAGE)?;
-            self.io().delay_us(1)?;
+            yield_now().await;
         }
         Ok(())
     }
