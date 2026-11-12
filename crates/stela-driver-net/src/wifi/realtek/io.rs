@@ -130,7 +130,7 @@ unsafe impl<I: Io> Io for &mut I {
 /// with the queue on any uncertain download; dropping this adapter cannot
 /// unmap memory still accessible to a quarantined device.
 pub struct NativeIo<Q: BeaconQueue> {
-    registers: Mmio,
+    registers: Window,
     clock: Clock,
     profile: Profile,
     bytes: usize,
@@ -214,7 +214,7 @@ impl<Q: BeaconQueue> NativeIo<Q> {
         }
         Ok(Self {
             // SAFETY: the constructor's UC BAR/ownership contract.
-            registers: unsafe { Mmio::new(window.as_ptr() as u64, bytes) },
+            registers: unsafe { Window::new(window, bytes) },
             clock,
             profile,
             bytes,
@@ -295,10 +295,118 @@ unsafe impl<Q: BeaconQueue> Io for NativeIo<Q> {
     }
 }
 
+/// The registers a [`NativeIo`] or [`Bar`] reaches: the BAR, or in tests a
+/// modeled chip attached at the BAR's address ([`model::attach`]).
+#[derive(Clone)]
+struct Window {
+    mmio: Mmio,
+    #[cfg(test)]
+    model: Option<alloc::rc::Rc<dyn model::Chip>>,
+}
+impl Window {
+    /// # Safety
+    /// [`Mmio::new`]'s contract for `window` and `bytes`.
+    unsafe fn new(window: NonNull<u8>, bytes: usize) -> Self {
+        Self {
+            // SAFETY: forwarded from the caller.
+            mmio: unsafe { Mmio::new(window.as_ptr() as u64, bytes) },
+            #[cfg(test)]
+            model: model::find(window),
+        }
+    }
+    fn read8(&self, offset: usize) -> u8 {
+        #[cfg(test)]
+        if let Some(chip) = &self.model {
+            return chip.read(offset as u32, 1) as u8;
+        }
+        self.mmio.read8(offset)
+    }
+    fn read16(&self, offset: usize) -> u16 {
+        #[cfg(test)]
+        if let Some(chip) = &self.model {
+            return chip.read(offset as u32, 2) as u16;
+        }
+        self.mmio.read16(offset)
+    }
+    fn read32(&self, offset: usize) -> u32 {
+        #[cfg(test)]
+        if let Some(chip) = &self.model {
+            return chip.read(offset as u32, 4);
+        }
+        self.mmio.read32(offset)
+    }
+    fn write8(&self, offset: usize, value: u8) {
+        #[cfg(test)]
+        if let Some(chip) = &self.model {
+            return chip.write(offset as u32, 1, value.into());
+        }
+        self.mmio.write8(offset, value);
+    }
+    fn write16(&self, offset: usize, value: u16) {
+        #[cfg(test)]
+        if let Some(chip) = &self.model {
+            return chip.write(offset as u32, 2, value.into());
+        }
+        self.mmio.write16(offset, value);
+    }
+    fn write32(&self, offset: usize, value: u32) {
+        #[cfg(test)]
+        if let Some(chip) = &self.model {
+            return chip.write(offset as u32, 4, value);
+        }
+        self.mmio.write32(offset, value);
+    }
+}
+
+/// Modeled chips that answer a test's BAR in place of memory, so the native
+/// register path, rings and [`super::hardware::Hardware`] run on them.
+#[cfg(test)]
+pub(super) mod model {
+    extern crate std;
+    use alloc::{rc::Rc, vec::Vec};
+    use core::{cell::RefCell, ptr::NonNull};
+
+    /// A chip's registers, by offset and access width in bytes.
+    pub(in crate::wifi::realtek) trait Chip {
+        fn read(&self, register: u32, width: usize) -> u32;
+        fn write(&self, register: u32, width: usize, value: u32);
+    }
+
+    type Attached = Vec<(usize, Rc<dyn Chip>)>;
+
+    std::thread_local! {
+        static CHIPS: RefCell<Attached> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Answer each BAR this thread maps at `window` from `chip`.
+    pub(in crate::wifi::realtek) fn attach(window: NonNull<u8>, chip: Rc<dyn Chip>) {
+        CHIPS.with(|chips| chips.borrow_mut().push((window.as_ptr().addr(), chip)));
+    }
+
+    /// Stop answering `window` from a chip; BARs mapped before keep theirs.
+    pub(in crate::wifi::realtek) fn detach(window: NonNull<u8>) {
+        CHIPS.with(|chips| {
+            chips
+                .borrow_mut()
+                .retain(|(at, _)| *at != window.as_ptr().addr())
+        });
+    }
+
+    pub(super) fn find(window: NonNull<u8>) -> Option<Rc<dyn Chip>> {
+        CHIPS.with(|chips| {
+            chips
+                .borrow()
+                .iter()
+                .find(|(at, _)| *at == window.as_ptr().addr())
+                .map(|(_, chip)| chip.clone())
+        })
+    }
+}
+
 /// The exclusive BAR of one RTL8822C requester, shared by its beacon, RX and
 /// TX register blocks. The owner keeps the PCI claim and mapping alive.
 pub struct Bar {
-    mmio: Mmio,
+    mmio: Window,
     profile: Profile,
     _owner: Arc<dyn core::any::Any>,
 }
@@ -322,7 +430,7 @@ impl Bar {
         }
         Ok(Self {
             // SAFETY: the constructor's exclusive mapped-BAR contract.
-            mmio: unsafe { Mmio::new(window.as_ptr() as u64, bytes) },
+            mmio: unsafe { Window::new(window, bytes) },
             profile,
             _owner: owner,
         })
@@ -361,6 +469,38 @@ mod tests {
     use alloc::vec::Vec;
 
     #[test]
+    fn a_chip_attached_at_the_window_answers_the_bars_mapped_there() {
+        use alloc::rc::Rc;
+        use core::cell::RefCell;
+        type Stores = RefCell<Vec<(u32, usize, u32)>>;
+        struct Echo(Stores);
+        impl model::Chip for Echo {
+            fn read(&self, register: u32, width: usize) -> u32 {
+                register ^ width as u32
+            }
+            fn write(&self, register: u32, width: usize, value: u32) {
+                self.0.borrow_mut().push((register, width, value));
+            }
+        }
+        let memory: Arc<Vec<u32>> = Arc::new(alloc::vec![0; BAR_BYTES / 4]);
+        let window = NonNull::new(memory.as_ptr().cast_mut().cast::<u8>()).unwrap();
+        let chip = Rc::new(Echo(RefCell::new(Vec::new())));
+        model::attach(window, chip.clone());
+        // SAFETY: the window is this test's own memory, which the chip
+        // answers in its place; nothing else maps it.
+        let bar = unsafe { Bar::new(window, BAR_BYTES, profile(), memory.clone()) }.unwrap();
+        model::detach(window);
+        assert_eq!(bar.read32(0x80), 0x84);
+        assert_eq!(bar.read8(0x10), 0x11);
+        bar.write16(0x100, 7);
+        assert_eq!(*chip.0.borrow(), [(0x100, 2, 7)]);
+        assert!(memory.iter().all(|word| *word == 0));
+        // SAFETY: as above, read only.
+        let plain = unsafe { Bar::new(window, BAR_BYTES, profile(), memory.clone()) }.unwrap();
+        assert_eq!(plain.read32(0x80), 0);
+    }
+
+    #[test]
     fn native_register_adapter_bounds_alignment_and_quarantine_prevent_invalid_access() {
         use core::sync::atomic::AtomicU32;
         struct NoDma;
@@ -385,7 +525,7 @@ mod tests {
         let mut io = NativeIo {
             // SAFETY: the model device, its pages and its domain belong to this test alone; no
             // other driver, worker or DMA touches them.
-            registers: unsafe { Mmio::new(address, BAR_BYTES) },
+            registers: unsafe { Window::new(NonNull::new(address as *mut u8).unwrap(), BAR_BYTES) },
             clock: Clock {
                 ticks_per_microsecond: 1,
             },
