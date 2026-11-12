@@ -349,7 +349,7 @@ impl<H: Host, D: Devices> Machine<H, D> {
             self.cpu.pstate.pan = !self.cpu.pstate.pan;
             self.sync_host_regime(step_timing::SyncSource::NativePan);
         }
-        let remaining = self.chain.budget().load(Ordering::Relaxed);
+        let remaining = self.chain.remaining();
         let (block, retired, hits, _) = self.chain.completed();
         self.promotion_runs = self.promotion_runs.wrapping_add(1);
         if self.promotion_runs.is_multiple_of(PROMOTION_RUNS) {

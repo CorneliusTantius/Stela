@@ -123,7 +123,7 @@ impl World {
         let itlb = LookupTable::itlb();
         let stamps = table.new_stamps();
         let control = Box::new(ChainControl {
-            budget: 1 << 20,
+            count: ChainControl::counting(1 << 20, 0),
             table: table.address(),
             itlb: itlb.address(),
             contexts: CONTEXTS,
@@ -189,7 +189,7 @@ fn a_filled_entry_holds_until_the_serial_moves() {
     assert_eq!(
         (
             world.control.hits,
-            world.control.retired,
+            world.control.retired(),
             world.control.block
         ),
         (1, u64::from(RAN), 3)
@@ -267,9 +267,9 @@ fn a_hit_keeps_the_probes_btype_budget_and_interruption_rules() {
     let branch = (REFUSING, ExitKind::Indirect as u64 | (RAN as u64) << 20);
     assert_eq!(world.run(32, REFUSING), branch);
     // A spent budget returns with the word and the instructions run.
-    world.control.budget = 0;
+    world.control.set_budget(0);
     assert_eq!(world.run(0, PC), exit(PC, ExitKind::Return));
-    world.control.budget = 100;
+    world.control.set_budget(100);
     // An interruption posted: the probe's gate exits.
     world.control.interrupt_epoch = 1;
     assert_eq!(world.run(0, PC), exit(PC, ExitKind::Return));
@@ -334,10 +334,10 @@ fn cached_tails_run_as_plain_tails() {
                 assert_eq!(
                     (
                         world.control.block,
-                        world.control.retired,
+                        world.control.retired(),
                         world.control.hits
                     ),
-                    (plain.block, plain.retired, plain.hits),
+                    (plain.block, plain.retired(), plain.hits),
                     "{pc:#x}"
                 );
                 compared += 1;

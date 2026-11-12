@@ -573,8 +573,7 @@ fn predicted_tails_complete_pac_branches_as_lookup_tails() {
                 0x5555
             };
             let base = ChainControl {
-                budget: [0, 1, 2, 5, 9][rng.below(5) as usize],
-                retired: 100,
+                count: ChainControl::counting([0, 1, 2, 5, 9][rng.below(5) as usize], 100),
                 block: 7,
                 contexts,
                 table: table.address(),
@@ -631,8 +630,7 @@ fn predicted_tails_complete_pac_branches_as_lookup_tails() {
                 u64::from(word.encoded() | RAN << ExitWord::RAN_SHIFT),
             );
             let entered = ChainControl {
-                budget: base.budget.wrapping_sub(1),
-                retired: base.retired + u64::from(RAN),
+                count: base.count + TRANSFER + u64::from(RAN),
                 block: u64::from(cell.block) | u64::from(case.btype) << BLOCK_BTYPE_SHIFT,
                 ..base
             };
@@ -641,8 +639,10 @@ fn predicted_tails_complete_pac_branches_as_lookup_tails() {
                 && !(held.pc == predicted && held.key == cell.key)
                 && lookup == exit
                 && controls[0] == base
-                && if base.budget == 0 {
-                    linked_way == exit && controls[1].budget == u64::MAX
+                && if base.remaining() == 0 {
+                    linked_way == exit
+                        && controls[1].remaining() == EXHAUSTED
+                        && controls[1].retired() == base.retired()
                 } else {
                     linked_way == (0x7700 + u64::from(cell.block), 99)
                         && ChainControl {
@@ -756,7 +756,7 @@ fn branch_cell_probes_take_entries_that_accept_their_btype() {
             );
             put(&region, 0, &code);
             let mut control = ChainControl {
-                budget: 5,
+                count: ChainControl::counting(5, 0),
                 contexts: [CONTEXTS[0], CONTEXTS[1]],
                 table: table.address(),
                 itlb: itlb.address(),
@@ -777,11 +777,11 @@ fn branch_cell_probes_take_entries_that_accept_their_btype() {
             if targets & 1 << btype != 0 {
                 assert_eq!(result, (0x7703, 99), "btype {btype} targets {targets:#b}");
                 assert_eq!(control.block, 3 | u64::from(btype) << BLOCK_BTYPE_SHIFT);
-                assert_eq!((control.budget, control.retired), (4, 2));
+                assert_eq!((control.remaining(), control.retired()), (4, 2));
             } else {
                 let exit = u64::from(word.encoded() | 2 << ExitWord::RAN_SHIFT);
                 assert_eq!(result, (pc, exit), "btype {btype} targets {targets:#b}");
-                assert_eq!((control.block, control.budget), (0, 5));
+                assert_eq!((control.block, control.remaining()), (0, 5));
             }
         }
     }

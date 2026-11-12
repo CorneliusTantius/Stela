@@ -138,7 +138,7 @@ fn readers_take_whole_entries_while_one_writer_rewrites_them() {
                 let (mut hits, mut exits) = (0u64, 0u64);
                 let mut round = 0u64;
                 while !stop.load(Ordering::Acquire) {
-                    control.budget = 1;
+                    control.set_budget(1);
                     control.block = 0;
                     // SAFETY: the table's stamps, which outlive the runners;
                     // each runner's own, and nothing of its runs meanwhile.

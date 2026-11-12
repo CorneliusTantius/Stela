@@ -338,7 +338,7 @@ impl Program {
         assert!(stub.len() <= BLOCKS_AT);
         arena.write(STUB_AT, &stub);
         let control = Box::new(ChainControl {
-            budget: 1 << 20,
+            count: ChainControl::counting(1 << 20, 0),
             ..ChainControl::default()
         });
         Self {
@@ -664,16 +664,16 @@ fn the_cost_decoder_classes_transfer_instructions() {
 fn transfers_cost_what_their_path_runs() {
     let costs = transfer_costs();
     let expected = [
-        ("b forward", Cost::new(7, 1, 1, 2)),
-        ("b back", Cost::new(10, 3, 1, 2)),
-        ("cbz back, fallthrough", Cost::new(9, 1, 1, 2)),
-        ("cbz back, taken", Cost::new(13, 3, 1, 2)),
-        ("cbz forward, side exit", Cost::new(9, 1, 1, 2)),
+        ("b forward", Cost::new(6, 1, 1, 1)),
+        ("b back", Cost::new(9, 3, 1, 1)),
+        ("cbz back, fallthrough", Cost::new(8, 1, 1, 1)),
+        ("cbz back, taken", Cost::new(12, 3, 1, 1)),
+        ("cbz forward, side exit", Cost::new(8, 1, 1, 1)),
     ];
     assert_eq!(costs, expected);
     // An iteration inside a self-loop, and one through its polled link.
     assert_eq!(loop_iteration(true), Cost::new(6, 1, 0, 1));
-    assert_eq!(loop_iteration(false), Cost::new(13, 3, 1, 2));
+    assert_eq!(loop_iteration(false), Cost::new(12, 3, 1, 1));
 }
 
 /// The scanner's linked blocks count what they ran: its counts, the
@@ -686,13 +686,13 @@ fn a_linked_scanner_counts_every_transfer_and_instruction() {
     let mut program = Program::new(&SCANNER, 0, true);
     assert_eq!(program.blocks.len(), 6);
     let mut frame = scanner_frame(&mut program, &text);
-    let budget = program.control.budget;
+    let budget = program.control.remaining();
     let (next, _) = program.run(&mut frame);
     assert_eq!(next, BASE + 15 * 4);
     assert_eq!((frame.x[9], frame.x[12], frame.x[14]), (words, lines, 0));
     let control = &program.control;
-    assert_eq!(control.retired, retired);
-    assert_eq!(budget - control.budget, transfers);
+    assert_eq!(control.retired(), retired);
+    assert_eq!(budget - control.remaining(), transfers);
 }
 
 /// The host time and instructions the scanner takes per guest instruction
@@ -713,7 +713,7 @@ fn scanner_time_on_this_host() {
     for _ in 0..5 {
         let start = std::time::Instant::now();
         for _ in 0..REPEATS {
-            program.control.budget = 1 << 20;
+            program.control.count = ChainControl::counting(1 << 20, 0);
             let mut frame = scanner_frame(&mut program, &text);
             program.run(&mut frame);
         }
@@ -731,4 +731,72 @@ fn scanner_time_on_this_host() {
         per_guest(cost.modifies),
         retired as f64 / transfers as f64,
     );
+}
+
+/// The instructions each transfer of [`SCANNER`] over `text` leaves its
+/// block with, in order: the blocks each byte's path runs through.
+fn scanner_transfers(text: &[u8]) -> Vec<u64> {
+    let mut transfers = Vec::new();
+    let mut inside = false;
+    for &byte in text {
+        let path: &[u64] = if byte > b' ' {
+            if core::mem::replace(&mut inside, true) {
+                &[5, 2]
+            } else {
+                &[4, 3, 2]
+            }
+        } else {
+            inside = false;
+            if byte == b'\n' {
+                &[3, 5, 2]
+            } else {
+                &[3, 2, 2, 2]
+            }
+        };
+        transfers.extend_from_slice(path);
+    }
+    transfers
+}
+
+/// A run of the scanner whose budget runs out stops at the first transfer
+/// past it, through the exit that transfer would have taken: the count
+/// holds exactly the instructions of the blocks the allowed transfers left,
+/// and says no budget was left. A pending interruption stops it at the
+/// first polled transfer with nothing of that transfer counted.
+#[test]
+fn a_scanner_out_of_budget_stops_with_exact_counts() {
+    let text = text(512);
+    let transfers = scanner_transfers(&text);
+    assert_eq!(transfers.iter().sum::<u64>(), scanned(&text).2);
+    let mut program = Program::new(&SCANNER, 0, true);
+    for budget in [0, 1, 2, 3, 7, 50, 333, transfers.len() as u64 - 1] {
+        program.control.count = ChainControl::counting(budget, 0);
+        let mut frame = scanner_frame(&mut program, &text);
+        let (next, word) = program.run(&mut frame);
+        let control = &program.control;
+        let expected: u64 = transfers[..budget as usize].iter().sum();
+        assert_eq!(control.retired(), expected, "budget {budget}");
+        assert_eq!(control.remaining(), EXHAUSTED, "budget {budget}");
+        // The exit of the block the refused transfer left: its target and
+        // the instructions it skipped.
+        assert!(next >= BASE && next < BASE + 4 * SCANNER.len() as u64);
+        let (_, skipped) = ExitWord::split(word);
+        assert!(u64::from(skipped) < 5, "budget {budget}");
+    }
+    // Every transfer allowed: the run ends at its BRK.
+    program.control.count = ChainControl::counting(transfers.len() as u64, 0);
+    let mut frame = scanner_frame(&mut program, &text);
+    assert_eq!(program.run(&mut frame).0, BASE + 15 * 4);
+    assert_eq!(program.control.remaining(), 0);
+    // A pending interruption: the first polled transfer (the back edge)
+    // exits, having counted only the forward transfers before it.
+    program.control.count = ChainControl::counting(100, 0);
+    program.control.interrupt_epoch = 1;
+    let mut frame = scanner_frame(&mut program, &text);
+    let (next, _) = program.run(&mut frame);
+    assert_eq!(next, BASE);
+    let path = scanner_transfers(&text[..1]);
+    let forward = &path[..path.len() - 1];
+    assert_eq!(program.control.retired(), forward.iter().sum::<u64>());
+    assert_eq!(program.control.remaining(), 100 - forward.len() as u64);
 }

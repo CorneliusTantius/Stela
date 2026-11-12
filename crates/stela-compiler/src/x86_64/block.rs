@@ -368,7 +368,7 @@ fn settle_loop(asm: &mut Asm, less: u8, counts: bool) {
     asm.alu(
         Alu::Add,
         Size::Qword,
-        Mem::base(Gpr::Rcx, super::chain::RETIRED_OFFSET),
+        Mem::base(Gpr::Rcx, super::chain::COUNT_OFFSET),
         Gpr::Rax,
     );
     // The engine's counts, while it profiles: the entry and what its

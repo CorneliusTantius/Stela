@@ -129,9 +129,12 @@ fn duplicate_safe_attachment_refuses_without_replacing_the_live_owner() {
         first.enter_parallel(Arc::clone(&hub)),
         Err(ParallelAdmissionError::MachineAttached)
     );
-    first.chain.budget().store(17, Ordering::Relaxed);
+    first
+        .chain
+        .count()
+        .store(chain::ChainControl::counting(17, 0), Ordering::Relaxed);
     hub.interrupt(0);
-    assert_eq!(first.chain.budget().load(Ordering::Relaxed), 17);
+    assert_eq!(first.chain.remaining(), 17);
     let pending = first.chain.snapshot();
     assert_ne!(pending.interrupt_epoch, pending.observed_interrupt_epoch);
     drop(first);
@@ -178,8 +181,8 @@ fn an_interrupt_borrow_survives_detach_and_reuse_without_a_raw_pointer_lease() {
     let snapshot = control.snapshot();
     assert_eq!(
         (
-            snapshot.budget,
-            snapshot.retired,
+            snapshot.remaining(),
+            snapshot.retired(),
             snapshot.hits,
             snapshot.linked
         ),
@@ -1007,7 +1010,7 @@ fn notification_after_drain_survives_native_budget_reset() {
     hub.post(0, |mail| mail.event = true);
     machine.chain.begin(0, 4096);
     let entered = machine.chain.snapshot();
-    assert_eq!(entered.budget, 4096);
+    assert_eq!(entered.remaining(), 4096);
     assert_ne!(entered.interrupt_epoch, entered.observed_interrupt_epoch);
     assert_eq!(entered.observed_interrupt_epoch, drained.interrupt_epoch);
     machine.read_mail().unwrap();
@@ -1063,13 +1066,15 @@ fn mail_reaches_running_pes_and_kicks_only_a_sleeping_one() {
 fn a_broadcast_is_applied_once_every_running_pe_acknowledged_it() {
     let (hub, kicks) = hub(3);
     let (attached, control) = Attached::new(&hub, 1, false).unwrap();
-    control.budget().store(4096, Ordering::Relaxed);
+    control
+        .count()
+        .store(chain::ChainControl::counting(4096, 0), Ordering::Relaxed);
     let mut posted = hub.broadcast(0, &[Maintenance::Code(None)]);
     assert_eq!(posted, [(1, 1), (2, 1)]);
     assert!(!hub.applied(&mut posted));
     // The running PE leaves native code at its next chained transfer.
     drop(attached);
-    assert_eq!(control.budget().load(Ordering::Relaxed), 4096);
+    assert_eq!(control.remaining(), 4096);
     let interrupted = control.snapshot();
     assert_ne!(
         interrupted.interrupt_epoch,

@@ -29,11 +29,11 @@ impl Storage {
             control: UnsafeCell::new(ChainControl::default()),
         })
     }
-    fn budget(&self) -> &AtomicU64 {
-        // SAFETY: the live allocation has ChainControl's aligned u64 budget.
+    fn count(&self) -> &AtomicU64 {
+        // SAFETY: the live allocation has ChainControl's aligned u64 count.
         // Rust never reads/writes this field non-atomically after publication;
         // native chaining uses its aligned architectural accesses at this ABI.
-        unsafe { AtomicU64::from_ptr(core::ptr::addr_of_mut!((*self.control.get()).budget)) }
+        unsafe { AtomicU64::from_ptr(core::ptr::addr_of_mut!((*self.control.get()).count)) }
     }
     pub(super) fn interrupt_epoch(&self) -> &AtomicU64 {
         // SAFETY: the control has a naturally aligned epoch field.
@@ -90,8 +90,21 @@ impl Owner {
             _attachment: Some(attachment),
         }
     }
-    pub(super) fn budget(&self) -> &AtomicU64 {
-        self.storage.budget()
+    /// The count native code adds its transfers to ([`ChainControl::count`]).
+    pub(super) fn count(&self) -> &AtomicU64 {
+        self.storage.count()
+    }
+    /// The decoded control's count, for its budget and instructions.
+    fn counted(&self) -> ChainControl {
+        ChainControl {
+            count: self.count().load(Ordering::Relaxed),
+            ..ChainControl::default()
+        }
+    }
+    /// The transfers the last native call's count still allows: more than
+    /// it began with once a transfer found none left.
+    pub(super) fn remaining(&self) -> u64 {
+        self.counted().remaining()
     }
     pub(super) fn address(&self) -> u64 {
         self.storage.control.get() as u64
@@ -109,7 +122,6 @@ impl Owner {
         // SAFETY: this Owner is the sole local writer, with no native call
         // in progress. Disjoint raw writes never borrow the shared epoch.
         unsafe {
-            core::ptr::addr_of_mut!((*control).retired).write(0);
             core::ptr::addr_of_mut!((*control).block).write(0);
             core::ptr::addr_of_mut!((*control).contexts).write(contexts);
             core::ptr::addr_of_mut!((*control).salts).write(salts(contexts, masks));
@@ -120,7 +132,8 @@ impl Owner {
             core::ptr::addr_of_mut!((*control).linked).write(0);
             core::ptr::addr_of_mut!((*control).observed_interrupt_epoch).write(0);
         }
-        self.budget().store(0, Ordering::Relaxed);
+        self.count()
+            .store(ChainControl::counting(0, 0), Ordering::Relaxed);
     }
     /// Acknowledge only the Acquire snapshot taken before a successful drain.
     /// MAX is never acknowledged, so exhausted notification state stays sticky.
@@ -218,11 +231,11 @@ impl Owner {
         }
     }
     pub(super) fn begin(&mut self, block: usize, budget: u64) {
+        let budget = budget.min(chain::MAX_BUDGET);
         let control = self.storage.control.get();
         // SAFETY: the sole owner prepares these disjoint fields before its
         // synchronous native call; remote writers touch only the epoch.
         unsafe {
-            core::ptr::addr_of_mut!((*control).retired).write(0);
             core::ptr::addr_of_mut!((*control).block).write(block as u64);
             core::ptr::addr_of_mut!((*control).hits).write(0);
             core::ptr::addr_of_mut!((*control).linked).write(0);
@@ -230,16 +243,19 @@ impl Owner {
         // SAFETY: `set_stamps` stored 0 or the board's table's stamps for
         // this PE, and its native code does not run.
         unsafe { chain::next_jump_serial(self.stamps().0) };
-        self.budget().store(budget, Ordering::Relaxed);
+        self.count()
+            .store(ChainControl::counting(budget, 0), Ordering::Relaxed);
         self.entered = budget;
     }
     /// The block that ended the last native call, the instructions of the
     /// blocks it chained out of, the transfers lookup probes made and the
     /// others. Native code counts no other transfers: each spends one of the
-    /// budget, which wraps when a transfer finds none left.
+    /// budget, and one that finds none left leaves more remaining than any
+    /// budget.
     pub(super) fn completed(&self) -> (u64, u64, u64, u64) {
         let control = self.storage.control.get();
-        let remaining = self.budget().load(Ordering::Relaxed);
+        let counted = self.counted();
+        let remaining = counted.remaining();
         let chained = if remaining > self.entered {
             self.entered
         } else {
@@ -247,13 +263,13 @@ impl Owner {
         };
         // SAFETY: the synchronous native call has returned; no other owner
         // touches these fields, including while a peer posts an interruption.
-        let (block, retired, hits) = unsafe {
+        let (block, hits) = unsafe {
             (
                 core::ptr::addr_of!((*control).block).read(),
-                core::ptr::addr_of!((*control).retired).read(),
                 core::ptr::addr_of!((*control).hits).read(),
             )
         };
+        let retired = counted.retired();
         (block, retired, hits, chained.saturating_sub(hits))
     }
     #[cfg(test)]
@@ -262,12 +278,11 @@ impl Owner {
     }
     #[cfg(test)]
     pub(super) fn snapshot(&self) -> ChainControl {
-        let (block, retired, hits, linked) = self.completed();
+        let (block, _, hits, linked) = self.completed();
         let control = self.storage.control.get();
         ChainControl {
-            budget: self.budget().load(Ordering::Relaxed),
+            count: self.count().load(Ordering::Relaxed),
             block,
-            retired,
             hits,
             linked,
             contexts: self.contexts(),

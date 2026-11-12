@@ -140,8 +140,7 @@ fn exited(value: u128) -> (u64, u64) {
 #[test]
 fn epoch_mismatch_exits_before_spending_or_changing_accounting() {
     let mut control = Box::new(ChainControl {
-        budget: 17,
-        retired: 19,
+        count: ChainControl::counting(17, 19),
         linked: 23,
         block: 29,
         interrupt_epoch: 1,
@@ -157,8 +156,8 @@ fn epoch_mismatch_exits_before_spending_or_changing_accounting() {
     );
     assert_eq!(
         (
-            control.budget,
-            control.retired,
+            control.remaining(),
+            control.retired(),
             control.linked,
             control.block
         ),
@@ -172,8 +171,8 @@ fn epoch_mismatch_exits_before_spending_or_changing_accounting() {
     );
     assert_eq!(
         (
-            control.budget,
-            control.retired,
+            control.remaining(),
+            control.retired(),
             control.linked,
             control.block
         ),
@@ -185,8 +184,7 @@ fn epoch_mismatch_exits_before_spending_or_changing_accounting() {
 fn dynamic_lookup_pending_and_saturated_epochs_never_touch_the_invalid_table() {
     for (kind, btype) in [(ExitKind::Return, 0), (ExitKind::Indirect, 3)] {
         let mut control = Box::new(ChainControl {
-            budget: 17,
-            retired: 19,
+            count: ChainControl::counting(17, 19),
             hits: 23,
             linked: 29,
             block: 31,
@@ -204,8 +202,8 @@ fn dynamic_lookup_pending_and_saturated_epochs_never_touch_the_invalid_table() {
             control.interrupt_epoch = epoch;
             control.observed_interrupt_epoch = observed;
             let prior = (
-                control.budget,
-                control.retired,
+                control.remaining(),
+                control.retired(),
                 control.hits,
                 control.linked,
                 control.block,
@@ -213,8 +211,8 @@ fn dynamic_lookup_pending_and_saturated_epochs_never_touch_the_invalid_table() {
             assert_eq!(exited(native.run(address)), (TARGET.0, kind as u64));
             assert_eq!(
                 (
-                    control.budget,
-                    control.retired,
+                    control.remaining(),
+                    control.retired(),
                     control.hits,
                     control.linked,
                     control.block
@@ -230,13 +228,13 @@ fn dynamic_lookup_pending_and_saturated_epochs_never_touch_the_invalid_table() {
 /// the local prefix; the notifying CPU writes only the separate epoch word.
 #[repr(C, align(64))]
 struct Shared {
-    budget: AtomicU64,
-    retired: AtomicU64,
+    count: AtomicU64,
     block: AtomicU64,
     contexts: [AtomicU64; 2],
     table: AtomicU64,
     hits: AtomicU64,
     linked: AtomicU64,
+    stamps: AtomicU64,
     epoch: AtomicU64,
     observed: AtomicU64,
     salts: [AtomicU32; 2],
@@ -247,15 +245,24 @@ const _: () = assert!(core::mem::offset_of!(Shared, observed) == OBSERVED_INTERR
 const _: () = assert!(core::mem::offset_of!(Shared, linked) == LINKED as usize);
 const _: () = assert!(core::mem::offset_of!(Shared, itlb) == ITLB as usize);
 impl Shared {
+    /// The transfers and instructions its count holds now.
+    fn counted(&self) -> (u64, u64) {
+        let control = ChainControl {
+            count: self.count.load(Ordering::Acquire),
+            ..ChainControl::default()
+        };
+        (control.remaining(), control.retired())
+    }
+
     fn new() -> Self {
         Self {
-            budget: AtomicU64::new(INTERRUPT_TEST_BUDGET),
-            retired: AtomicU64::new(0),
+            count: AtomicU64::new(ChainControl::counting(INTERRUPT_TEST_BUDGET, 0)),
             block: AtomicU64::new(0),
             contexts: [AtomicU64::new(0), AtomicU64::new(0)],
             table: AtomicU64::new(0),
             hits: AtomicU64::new(0),
             linked: AtomicU64::new(0),
+            stamps: AtomicU64::new(0),
             epoch: AtomicU64::new(0),
             observed: AtomicU64::new(0),
             salts: [AtomicU32::new(0), AtomicU32::new(0)],
@@ -303,13 +310,17 @@ impl InterruptionOutcome {
 fn rendezvous_backedge(native: &Mapping, control: u64, gate: u64, policy: Interruption) -> Vec<u8> {
     let mut prefix = Code::new();
     prefix.asm().mov_imm64(Rcx, control);
-    // Thunks count a transfer only in the budget they spend.
-    prefix.asm().alu_imm32(
-        Alu::Cmp,
-        Qword,
-        Mem::base(Rcx, 0),
-        (INTERRUPT_TEST_BUDGET - RENDEZVOUS_AFTER) as i32,
+    // Each transfer counts its 7 instructions with it.
+    prefix.asm().mov_imm64(
+        Rdx,
+        ChainControl::counting(
+            INTERRUPT_TEST_BUDGET - RENDEZVOUS_AFTER,
+            7 * RENDEZVOUS_AFTER,
+        ),
     );
+    prefix
+        .asm()
+        .alu_load(Alu::Cmp, Qword, Rdx, Mem::base(Rcx, COUNT));
     let ordinary = prefix.asm().jcc8(Cond::Ne);
     prefix.asm().mov_imm64(Rax, gate);
     {
@@ -396,15 +407,16 @@ fn interrupt_at_rendezvous(policy: Interruption) -> InterruptionOutcome {
     }
     // Ready synchronizes the native accounting prefix. Publish before opening
     // the rendezvous; the next production guard must observe the epoch.
-    let published = INTERRUPT_TEST_BUDGET - control.budget.load(Ordering::Acquire);
+    let published = INTERRUPT_TEST_BUDGET - control.counted().0;
     control.epoch.fetch_add(1, Ordering::Release);
     gate.release.store(1, Ordering::Release);
     let (result, retained, _retained_gate) = worker.join().unwrap();
+    let (budget, retired) = retained.counted();
     InterruptionOutcome {
         published,
-        linked: transfers(retained.budget.load(Ordering::Acquire)),
-        retired: retained.retired.load(Ordering::Acquire),
-        budget: retained.budget.load(Ordering::Acquire),
+        linked: transfers(budget),
+        retired,
+        budget,
         block: retained.block.load(Ordering::Acquire),
         epoch: retained.epoch.load(Ordering::Acquire),
         observed: retained.observed.load(Ordering::Acquire),
@@ -429,7 +441,7 @@ fn rendezvous_oracle_rejects_an_ignored_epoch() {
         (RENDEZVOUS_AFTER, 1, 0)
     );
     assert_eq!(outcome.linked, INTERRUPT_TEST_BUDGET);
-    assert_eq!(outcome.budget, u64::MAX);
+    assert_eq!(outcome.budget, EXHAUSTED);
     assert_eq!(outcome.retired, INTERRUPT_TEST_BUDGET * 7);
     assert_eq!(outcome.result, (TARGET.0, ExitKind::Direct as u64));
 }
@@ -437,7 +449,7 @@ fn rendezvous_oracle_rejects_an_ignored_epoch() {
 #[test]
 fn an_already_checked_native_boundary_allows_one_transfer_then_stops() {
     let mut control = Box::new(ChainControl {
-        budget: 17,
+        count: ChainControl::counting(17, 0),
         interrupt_epoch: 1,
         ..ChainControl::default()
     });
@@ -460,7 +472,11 @@ fn an_already_checked_native_boundary_allows_one_transfer_then_stops() {
     );
     assert_eq!(body[15], 0x75);
     assert_eq!(AFTER_GUARD + usize::from(body[16]), body.len() - JUMP_BYTES);
-    assert_eq!(&body[AFTER_GUARD..AFTER_GUARD + 4], &[0x48, 0x83, 0x29, 1]);
+    assert_eq!(&body[AFTER_GUARD..AFTER_GUARD + 3], &[0x48, 0x81, 0x01]);
+    assert_eq!(
+        body[AFTER_GUARD + 3..AFTER_GUARD + 7],
+        ((TRANSFER + 7) as u32).to_le_bytes()
+    );
     let distance = relative(
         native.address() + enter_tail.end() as u64,
         at + AFTER_GUARD as u64,
@@ -477,9 +493,9 @@ fn an_already_checked_native_boundary_allows_one_transfer_then_stops() {
     );
     assert_eq!(
         (
-            control.budget,
+            control.remaining(),
             control.linked,
-            control.retired,
+            control.retired(),
             control.block
         ),
         (16, 0, 7, 3)
@@ -602,15 +618,15 @@ fn native_interruption_gate_costs() {
             fs::write(output.join(format!("{name}.bin")), &code).unwrap();
             let mut samples = Vec::new();
             for sample in 0..8 {
-                control.0.budget = ITERATIONS;
-                control.0.retired = 0;
+                control.0.set_budget(ITERATIONS);
+                control.0.set_retired(0);
                 control.0.hits = 0;
                 let start = Instant::now();
                 let result = native.run(pointer);
                 let elapsed = start.elapsed();
                 assert_eq!(exited(result), (TARGET.0, ExitKind::Direct as u64));
-                assert_eq!(control.0.retired, ITERATIONS * 7);
-                assert_eq!(control.0.budget, u64::MAX);
+                assert_eq!(control.0.retired(), ITERATIONS * 7);
+                assert_eq!(control.0.remaining(), EXHAUSTED);
                 let hits = if mode == Mode::Lookup { ITERATIONS } else { 0 };
                 assert_eq!(control.0.hits, hits);
                 if sample != 0 {
@@ -724,8 +740,8 @@ fn ring_costs(report: &mut fs::File) {
         }
         let mut samples = Vec::new();
         for sample in 0..8 {
-            control.0.budget = ITERATIONS;
-            control.0.retired = 0;
+            control.0.set_budget(ITERATIONS);
+            control.0.set_retired(0);
             control.0.hits = 0;
             let mut state = frame((&mut control.0 as *mut ChainControl) as u64);
             let start = Instant::now();
@@ -742,7 +758,7 @@ fn ring_costs(report: &mut fs::File) {
                 ExitKind::Return as u64
             );
             assert_eq!(control.0.hits, ITERATIONS);
-            assert_eq!(control.0.retired, ITERATIONS * 3);
+            assert_eq!(control.0.retired(), ITERATIONS * 3);
             if sample != 0 {
                 samples.push(elapsed.as_nanos() as f64 / ITERATIONS as f64);
             }

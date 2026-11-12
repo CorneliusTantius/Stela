@@ -353,7 +353,7 @@ fn measure(ring: Ring, host: &mut impl Host, installed: NativeCode) -> Option<(f
     let hz = local::state().tsc_hz.max(1);
     let mut best = u64::MAX;
     for _ in 0..3 {
-        control.budget = TRANSFERS;
+        control.count = ChainControl::counting(TRANSFERS, 0);
         let started = rdtsc();
         // SAFETY: as above; the ring touches only `state`, `control`, the
         // tables and this stack.

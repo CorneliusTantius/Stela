@@ -105,7 +105,7 @@ fn run_while_patching(
         std::thread::spawn(move || {
             let _page = page;
             let mut control = Box::new(ChainControl {
-                budget: u64::MAX >> 1,
+                count: ChainControl::counting(MAX_BUDGET, 0),
                 ..ChainControl::default()
             });
             let mut frame = Box::new(GuestState::default());

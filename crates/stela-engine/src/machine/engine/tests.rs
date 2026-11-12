@@ -314,9 +314,8 @@ impl Host for FakeHost {
             // outside native execution. Match native disjoint field writes;
             // the budget is always accessed atomically, even in fixtures.
             unsafe {
-                AtomicU64::from_ptr(core::ptr::addr_of_mut!((*control).budget))
-                    .store(chained.budget, Ordering::Relaxed);
-                core::ptr::addr_of_mut!((*control).retired).write(chained.retired);
+                AtomicU64::from_ptr(core::ptr::addr_of_mut!((*control).count))
+                    .store(chained.count, Ordering::Relaxed);
                 core::ptr::addr_of_mut!((*control).block).write(chained.block);
                 core::ptr::addr_of_mut!((*control).contexts).write(chained.contexts);
                 core::ptr::addr_of_mut!((*control).table).write(chained.table);
@@ -2946,8 +2945,7 @@ fn direct_exits_chain_into_their_successors_in_the_page() {
     machine.host.chained = Some((
         machine.chain.address() as *mut ChainControl,
         ChainControl {
-            budget: CHAIN_LIMIT - 1,
-            retired: 2,
+            count: ChainControl::counting(CHAIN_LIMIT - 1, 2),
             block: 1,
             linked: 1,
             ..current
@@ -2967,8 +2965,7 @@ fn direct_exits_chain_into_their_successors_in_the_page() {
     machine.host.chained = Some((
         machine.chain.address() as *mut ChainControl,
         ChainControl {
-            budget: u64::MAX,
-            retired: 2 * budget,
+            count: ChainControl::exhausted(2 * budget),
             block: 0,
             linked: budget,
             ..current
@@ -2987,8 +2984,7 @@ fn direct_exits_chain_into_their_successors_in_the_page() {
     machine.host.chained = Some((
         machine.chain.address() as *mut ChainControl,
         ChainControl {
-            budget: CHAIN_LIMIT - 1,
-            retired: 2,
+            count: ChainControl::counting(CHAIN_LIMIT - 1, 2),
             block: 1,
             linked: 1,
             ..current
@@ -4391,8 +4387,7 @@ fn indirect_branches_go_through_lookups_that_check_the_target() {
     machine.host.chained = Some((
         machine.chain.address() as *mut ChainControl,
         ChainControl {
-            budget: CHAIN_LIMIT - 1,
-            retired: 1,
+            count: ChainControl::counting(CHAIN_LIMIT - 1, 1),
             block: 0b10 << chain::BLOCK_BTYPE_SHIFT | target as u64,
             linked: 1,
             ..current

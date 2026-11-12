@@ -220,8 +220,7 @@ fn chained_load_case(branch: u32, btype: u8, landing_pad: bool) {
     machine.host.chained = Some((
         machine.chain.address() as *mut ChainControl,
         ChainControl {
-            budget: CHAIN_LIMIT - 1,
-            retired: 1,
+            count: ChainControl::counting(CHAIN_LIMIT - 1, 1),
             block: (u64::from(btype) << chain::BLOCK_BTYPE_SHIFT) | target as u64,
             linked: 1,
             ..current

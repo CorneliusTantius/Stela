@@ -1794,7 +1794,7 @@ mod tests {
                 machine.host.chained = Some((
                     machine.chain.address() as *mut ChainControl,
                     ChainControl {
-                        budget: u64::MAX,
+                        count: ChainControl::exhausted(0),
                         block: 1,
                         ..current
                     },

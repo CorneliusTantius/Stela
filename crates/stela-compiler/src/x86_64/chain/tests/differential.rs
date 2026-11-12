@@ -80,12 +80,14 @@ fn legacy_dispatcher(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     asm.pop(R8);
     asm.mov(Dword, R8, R8);
     asm.place(Rcx, CONTROL);
-    spend_budget(&mut asm, policy);
-    misses.push(asm.jcc(Cond::B));
-    asm.shift_imm(ShiftOp::Shr, Dword, Rdx, ExitWord::RAN_SHIFT as u8);
-    asm.alu(Alu::Add, Qword, Mem::base(Rcx, RETIRED), Rdx);
+    count_transfer_from_word(&mut asm, policy, R10);
+    let exhausted = asm.jcc(Cond::B);
     asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
     legacy_found(&mut asm);
+    // A transfer the budget does not allow takes its instructions off.
+    asm.bind(exhausted);
+    uncount_by(&mut asm, R10);
+    misses.push(asm.jmp8());
     for miss in misses {
         asm.bind(miss);
     }
@@ -159,10 +161,8 @@ fn legacy_dispatcher(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     let torn = legacy_seqlock_check(&mut asm);
     asm.pop(R9);
     asm.place(Rcx, CONTROL);
-    spend_budget(&mut asm, policy);
-    misses.push(asm.jcc(Cond::B));
-    asm.shift_imm(ShiftOp::Shr, Dword, Rdx, ExitWord::RAN_SHIFT as u8);
-    asm.alu(Alu::Add, Qword, Mem::base(Rcx, RETIRED), Rdx);
+    count_transfer_from_word(&mut asm, policy, R10);
+    let exhausted = asm.jcc(Cond::B);
     asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, HITS), 1);
     for bit in 0..2 {
         if btype & 1 << bit != 0 {
@@ -171,6 +171,10 @@ fn legacy_dispatcher(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     }
     asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
     legacy_found(&mut asm);
+    // A transfer the budget does not allow takes its instructions off.
+    asm.bind(exhausted);
+    uncount_by(&mut asm, R10);
+    misses.push(asm.jmp8());
     for miss in torn {
         asm.bind(miss);
     }
@@ -426,8 +430,7 @@ fn probes_without_the_stack_transfer_as_the_probes_before_them() {
         put(&old, 0, &stub);
         put(&old, 3, &before);
         let base = ChainControl {
-            budget: [0, 1, 2, 5][rng.below(4) as usize],
-            retired: 100,
+            count: ChainControl::counting([0, 1, 2, 5][rng.below(4) as usize], 100),
             block: 7,
             contexts: match rng.below(4) {
                 0 => [

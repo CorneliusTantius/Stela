@@ -3,13 +3,15 @@
 //! successor's code, so the dispatcher runs once for a chain of blocks.
 //!
 //! Each PE owns one [`ChainControl`] that [`Anchor::Control`] names. Before it
-//! enters a block it sets `budget` to the chained transfers it allows,
-//! `retired`, `linked` and `hits` to 0 and `block` to the entered block's
-//! index. Each thunk takes one transfer from `budget` (or, when none is
-//! left, exits exactly as the redirected exit would), adds the
-//! instructions of the block it leaves to `retired` and names the block it
-//! enters in `block`; only a table probe counts its transfers apart, in
-//! `hits`, and the engine takes the others from the budget spent. Notifications publish a monotonic interrupt epoch;
+//! enters a block it sets `count` to the chained transfers it allows and no
+//! instructions retired ([`ChainControl::counting`]), `linked` and `hits` to
+//! 0 and `block` to the entered block's index. Each thunk counts its
+//! transfer and the instructions of the block it leaves with one addition
+//! to `count` ([`TRANSFER`]); a transfer the budget does not allow carries
+//! out of it, takes its instructions off again and exits exactly as the
+//! redirected exit would. It then names the block it enters in `block`;
+//! only a table probe counts its transfers apart, in `hits`, and the engine
+//! takes the others from the budget spent. Notifications publish a monotonic interrupt epoch;
 //! every thunk compares it with the owner's acknowledged pre-drain snapshot
 //! before spending the local budget. A mismatch takes the original exit. After the native
 //! call returns, `block` is the block whose exit or fault ended the run, in
@@ -92,8 +94,12 @@ pub const PATCH_BYTES: usize = JUMP_BYTES;
 /// The most NOP bytes before a patch point that keep its instruction in
 /// one aligned 8-byte word ([`patch_pad`]).
 const MAX_PAD: usize = 4;
-/// Bytes of a [`link`]'s body, without and with the interruption gate.
-pub const LINK_BODY_BYTES: usize = 34;
+/// Bytes of a [`link`]'s path into its target: the control's address, the
+/// count, its carry's branch, the block's name and the jump.
+const LINK_HOT_BYTES: usize = 7 + 7 + 2 + 8 + 5;
+/// Bytes of a [`link`]'s body, without and with the interruption gate: its
+/// path into the target and the largest [`uncount`].
+pub const LINK_BODY_BYTES: usize = LINK_HOT_BYTES + 7;
 pub const POLLED_LINK_BODY_BYTES: usize = LINK_BODY_BYTES + 10;
 /// Bytes in the largest [`thunk`]: the body and a return's `mov edx; ret`.
 pub const THUNK_BYTES: usize = POLLED_LINK_BODY_BYTES + 6;
@@ -181,8 +187,9 @@ pub const KEY_STATES: u32 = 1 << (u64::BITS - KEY_STATE_SHIFT);
 const CONTROL: Place = Place::new(Anchor::Control, 0);
 /// The PE's [`ChainControl`], for code outside the chain's thunks.
 pub(crate) const CONTROL_PLACE: Place = CONTROL;
-/// [`ChainControl::retired`], from the control's address.
-pub(crate) const RETIRED_OFFSET: i32 = RETIRED;
+/// [`ChainControl::count`], from the control's address: its low
+/// [`RETIRED_BITS`] are the instructions the run retired.
+pub(crate) const COUNT_OFFSET: i32 = COUNT;
 /// [`ChainControl::loop_entries`] and [`ChainControl::loop_iterated`].
 pub(crate) const LOOP_ENTRIES_OFFSET: i32 =
     core::mem::offset_of!(ChainControl, loop_entries) as i32;
@@ -243,15 +250,33 @@ impl From<ExitKind> for ExitWord {
     }
 }
 
+/// The low bits of [`ChainControl::count`]: the instructions of the blocks
+/// a run chained out of. The transfers it may still make are above them.
+pub const RETIRED_BITS: u32 = 30;
+/// What a transfer adds to [`ChainControl::count`] besides the
+/// instructions of the block it leaves: one step of the transfers above
+/// [`RETIRED_BITS`], with its instructions one 32-bit immediate.
+pub const TRANSFER: u64 = 1 << RETIRED_BITS;
+/// The instructions in a count.
+pub const RETIRED_MASK: u64 = TRANSFER - 1;
+/// The transfers field of a count, all ones: what a count allowing no
+/// transfer holds there.
+const TRANSFERS_FULL: u64 = u64::MAX >> RETIRED_BITS;
+/// The most transfers one count allows ([`ChainControl::counting`]).
+pub const MAX_BUDGET: u64 = TRANSFERS_FULL - 1;
+
 /// The engine's chaining state, which thunks find through [`Anchor::Control`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct ChainControl {
-    /// Chained transfers still allowed; only the attached engine/native path
-    /// writes it. Wraps below zero when a thunk finds none left.
-    pub budget: u64,
-    /// Instructions of the blocks chained out of.
-    pub retired: u64,
+    /// The chained transfers still allowed and the instructions retired, in
+    /// one word that a transfer adds [`TRANSFER`] and its instructions to
+    /// ([`ChainControl::counting`]); only the attached engine/native path
+    /// writes it. A transfer the budget does not allow carries out of it,
+    /// which leaves the transfers field 0, and takes its instructions off
+    /// again before it exits. Instructions never reach [`TRANSFER`]: a run's
+    /// transfers are bounded and so are a block's instructions.
+    pub count: u64,
     /// The index of the block running, and above it the BTYPE it was
     /// entered with.
     pub block: u64,
@@ -266,6 +291,9 @@ pub struct ChainControl {
     /// Kept 0 by native code: the engine counts the other transfers from the
     /// budget they spent.
     pub linked: u64,
+    /// The host address of this PE's stamps ([`STAMP_TABLE_BYTES`]), which
+    /// [`stamped_tail`]s check, or 0.
+    pub stamps: u64,
     /// Sources are published before a Release increment by a notifier.
     /// Saturates at MAX; no owner may acknowledge that exhausted epoch.
     pub interrupt_epoch: u64,
@@ -279,9 +307,6 @@ pub struct ChainControl {
     /// The block table's slot mask and the ITLB's set mask
     /// ([`LookupTable::mask`]): both tables are sized from host memory.
     pub masks: [u32; 2],
-    /// The host address of this PE's stamps ([`STAMP_TABLE_BYTES`]), which
-    /// [`stamped_tail`]s check, or 0.
-    pub stamps: u64,
     /// The host address of the block table's first [`STAMPED_CELLS`] cells
     /// ([`LookupTable::stamped_cells`]), or 0.
     pub cells: u64,
@@ -300,7 +325,53 @@ pub struct ChainControl {
 // and storage owners keep the mapped control alive for every embedded address.
 const _: () = assert!(core::mem::offset_of!(ChainControl, interrupt_epoch) == 64);
 const _: () = assert!(core::mem::offset_of!(ChainControl, observed_interrupt_epoch) == 72);
-const _: () = assert!(core::mem::size_of::<ChainControl>() == 144);
+const _: () = assert!(core::mem::size_of::<ChainControl>() == 136);
+
+impl ChainControl {
+    /// The count of a run that allows `budget` more transfers, at most
+    /// [`MAX_BUDGET`], and has retired `retired` instructions.
+    pub const fn counting(budget: u64, retired: u64) -> u64 {
+        let budget = if budget < MAX_BUDGET {
+            budget
+        } else {
+            MAX_BUDGET
+        };
+        (TRANSFERS_FULL - budget) << RETIRED_BITS | retired & RETIRED_MASK
+    }
+
+    /// The count of a run whose last transfer found no budget left, having
+    /// retired `retired` instructions.
+    pub const fn exhausted(retired: u64) -> u64 {
+        retired & RETIRED_MASK
+    }
+
+    /// The transfers the count still allows: more than [`MAX_BUDGET`] once
+    /// a transfer found none left.
+    pub const fn remaining(&self) -> u64 {
+        TRANSFERS_FULL - (self.count >> RETIRED_BITS)
+    }
+
+    /// The instructions of the blocks the run chained out of.
+    pub const fn retired(&self) -> u64 {
+        self.count & RETIRED_MASK
+    }
+
+    /// The count of `budget` more transfers, the instructions kept.
+    #[cfg(test)]
+    pub(crate) fn set_budget(&mut self, budget: u64) {
+        self.count = Self::counting(budget, self.retired());
+    }
+
+    /// The count of `retired` instructions, the transfers kept.
+    #[cfg(test)]
+    pub(crate) fn set_retired(&mut self, retired: u64) {
+        self.count = self.count & !RETIRED_MASK | retired & RETIRED_MASK;
+    }
+}
+
+/// [`ChainControl::remaining`] once a transfer found no budget left.
+#[cfg(test)]
+pub(crate) const EXHAUSTED: u64 = TRANSFERS_FULL;
 
 /// In the block table, one block a fetch at `pc` runs while its page
 /// translates to the frame and fetch state `key` names ([`block_key`]). In
@@ -1764,8 +1835,9 @@ pub const fn lookup_slot(pc: u64, key: u64, mask: u32) -> usize {
 }
 
 // `sub qword [rcx],1` addresses the budget at offset 0.
-const _: () = assert!(core::mem::offset_of!(ChainControl, budget) == 0);
-const RETIRED: i32 = core::mem::offset_of!(ChainControl, retired) as i32;
+const COUNT: i32 = core::mem::offset_of!(ChainControl, count) as i32;
+// A transfer's addition is one sign-extended 32-bit immediate.
+const _: () = assert!(TRANSFER + RETIRED_MASK <= i32::MAX as u64);
 const BLOCK: i32 = core::mem::offset_of!(ChainControl, block) as i32;
 const CONTEXTS: i32 = core::mem::offset_of!(ChainControl, contexts) as i32;
 const SALTS: i32 = core::mem::offset_of!(ChainControl, salts) as i32;
@@ -1854,14 +1926,61 @@ fn gate(
         Interruption::LockedBudget | Interruption::Legacy => None,
     }
 }
-fn spend_budget(asm: &mut crate::x86_64::asm::Asm, policy: Interruption) {
+/// Count a transfer out of a block that retired `retired` instructions, RCX
+/// at the control: [`TRANSFER`] and the instructions in one addition to
+/// `count`, which carries out (CF) when the budget allows no transfer.
+/// `None` when the instructions exceed a count's.
+fn count_transfer(
+    asm: &mut crate::x86_64::asm::Asm,
+    policy: Interruption,
+    retired: u32,
+) -> Option<()> {
+    let retired = u64::from(retired);
+    (retired <= RETIRED_MASK).then_some(())?;
+    locked(asm, policy);
+    // This local counter has no foreign writer in the epoch protocol.
+    asm.alu_imm32(
+        Alu::Add,
+        Qword,
+        Mem::base(Rcx, COUNT),
+        (TRANSFER + retired) as i32,
+    );
+    Some(())
+}
+
+/// [`count_transfer`] of the instructions a probe's tail left in EDX
+/// above [`ExitWord::RAN_SHIFT`], through `scratch`, which then holds
+/// [`TRANSFER`] and them for [`uncount_by`]. EDX stays the exit's word.
+fn count_transfer_from_word(asm: &mut crate::x86_64::asm::Asm, policy: Interruption, scratch: Gpr) {
+    asm.mov(Dword, scratch, Rdx);
+    asm.shift_imm(ShiftOp::Shr, Dword, scratch, ExitWord::RAN_SHIFT as u8);
+    asm.bit_imm(BitTest::Bts, Qword, scratch, RETIRED_BITS as u8);
+    locked(asm, policy);
+    asm.alu(Alu::Add, Qword, Mem::base(Rcx, COUNT), scratch);
+}
+
+fn locked(asm: &mut crate::x86_64::asm::Asm, policy: Interruption) {
     #[cfg(all(test, target_arch = "x86_64", target_os = "linux"))]
     if policy == Interruption::LockedBudget {
         asm.lock();
     }
-    let _ = policy;
-    // This local counter has no foreign writer in the epoch protocol.
-    asm.alu_imm8(Alu::Sub, Qword, Mem::base(Rcx, 0), 1);
+    let _ = (asm, policy);
+}
+
+/// Take the `retired` instructions of a transfer that carried out of the
+/// count back off it: only its transfers field changed then, to 0.
+fn uncount(asm: &mut crate::x86_64::asm::Asm, retired: u32) {
+    match i8::try_from(retired) {
+        Ok(0) => {}
+        Ok(retired) => asm.alu_imm8(Alu::Sub, Qword, Mem::base(Rcx, COUNT), retired),
+        Err(_) => asm.alu_imm32(Alu::Sub, Qword, Mem::base(Rcx, COUNT), retired as i32),
+    }
+}
+
+/// [`uncount`] of what [`count_transfer_from_word`] left in `scratch`.
+fn uncount_by(asm: &mut crate::x86_64::asm::Asm, scratch: Gpr) {
+    asm.bit_imm(BitTest::Btr, Qword, scratch, RETIRED_BITS as u8);
+    asm.alu(Alu::Sub, Qword, Mem::base(Rcx, COUNT), scratch);
 }
 struct ThunkPlan {
     at: u64,
@@ -2210,7 +2329,9 @@ enum Fall {
 }
 
 /// The code of a link at host address `at`: count, name and jump, or
-/// `fall`. Only a `polled` one has the interruption gate.
+/// `fall`. Only a `polled` one has the interruption gate. A transfer the
+/// budget does not allow takes its instructions off the count again
+/// ([`uncount`]) on its way to `fall`; an interruption goes there at once.
 fn link_body(
     at: u64,
     polled: bool,
@@ -2220,7 +2341,6 @@ fn link_body(
     fall: Fall,
     policy: Interruption,
 ) -> Option<Vec<u8>> {
-    let retired = i32::try_from(retired).ok()?;
     let block = i32::try_from(block).ok()?;
     let mut code = Code::new();
     let mut asm = code.asm();
@@ -2228,35 +2348,51 @@ fn link_body(
     let interrupted = polled
         .then(|| interruption_gate(&mut asm, policy, Rdx))
         .flatten();
-    spend_budget(&mut asm, policy);
+    count_transfer(&mut asm, policy, retired)?;
     let exhausted = asm.jcc8(Cond::B);
-    asm.alu_imm32(Alu::Add, Qword, Mem::base(Rcx, RETIRED), retired);
     asm.mov_rm_imm32(Qword, Mem::base(Rcx, BLOCK), block);
     let transfer = asm.jmp();
     let distance = relative(at + transfer.end() as u64, entry)?;
-    let body = code.len();
+    let hot = code.len();
     debug_assert_eq!(
-        body,
-        LINK_BODY_BYTES + usize::from(polled) * policy.extra_bytes()
+        hot,
+        LINK_HOT_BYTES + usize::from(polled) * policy.extra_bytes()
     );
-    let fallen = match fall {
+    let mut undo = Code::new();
+    uncount(&mut undo.asm(), retired);
+    let (undone, fallen) = match fall {
         Fall::Thunk(Fallback::Return(word)) => {
+            code.append(undo);
+            let fallen = code.len();
             let mut asm = code.asm();
             asm.mov_imm32(Rdx, word.encoded());
             asm.ret();
-            body
+            (hot, fallen)
         }
         Fall::Thunk(Fallback::Jump(exit)) => {
+            code.append(undo);
+            let fallen = code.len();
             let back = code.asm().jmp();
             let back_distance = relative(at + back.end() as u64, exit)?;
             code.patch(back.offset(), back_distance.to_le_bytes());
-            body
+            (hot, fallen)
         }
-        // Past the body's end: the slot's INT3s up to the exit stay.
-        Fall::After(exit) => usize::try_from(exit.checked_sub(at)?).ok()?,
+        // The undo ends the slot and falls into the exit after it.
+        Fall::After(exit) => {
+            let fallen = usize::try_from(exit.checked_sub(at)?).ok()?;
+            let undone = fallen
+                .checked_sub(undo.len())
+                .filter(|&start| start >= hot)?;
+            for _ in hot..undone {
+                code.asm().int3();
+            }
+            code.append(undo);
+            (undone, fallen)
+        }
     };
-    for patch in core::iter::once(exhausted).chain(interrupted) {
-        crate::x86_64::asm::resolve(&mut code, patch, fallen);
+    crate::x86_64::asm::resolve(&mut code, exhausted, undone);
+    if let Some(interrupted) = interrupted {
+        crate::x86_64::asm::resolve(&mut code, interrupted, fallen);
     }
     code.patch(transfer.offset(), distance.to_le_bytes());
     Some(code.into_bytes())
@@ -2359,15 +2495,15 @@ fn dispatcher_with_policy(btype: u8, policy: Interruption) -> Option<Vec<u8>> {
     asm.mov_load(Dword, R8, Mem::base(R10, ENTRY_BLOCK));
     asm.mov_load(Qword, R9, Mem::base(R10, ENTRY_CODE));
     misses.extend(seqlock_check(&mut asm, R10));
-    spend_budget(&mut asm, policy);
-    misses.push(asm.jcc(Cond::B));
-    asm.shift_imm(ShiftOp::Shr, Dword, Rdx, ExitWord::RAN_SHIFT as u8);
-    asm.alu(Alu::Add, Qword, Mem::base(Rcx, RETIRED), Rdx);
+    count_transfer_from_word(&mut asm, policy, R10);
+    let exhausted = asm.jcc(Cond::B);
     asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, HITS), 1);
     fill_jump_cache(&mut asm);
     entered_btype(&mut asm, R8, btype);
     asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
     found(&mut asm);
+    asm.bind(exhausted);
+    uncount_by(&mut asm, R10);
     for miss in misses {
         asm.bind(miss);
     }
@@ -2447,16 +2583,16 @@ fn cell_probe(
     asm.lea(Qword, R10, Mem::base(Rcx, HEAT));
     asm.cmov(Cond::Ae, Qword, R11, R10);
     asm.alu_imm8(Alu::Add, Dword, Mem::base(R11, 0), 1);
-    spend_budget(&mut asm, policy);
-    misses.push(asm.jcc(Cond::B));
-    asm.shift_imm(ShiftOp::Shr, Dword, Rdx, ExitWord::RAN_SHIFT as u8);
-    asm.alu(Alu::Add, Qword, Mem::base(Rcx, RETIRED), Rdx);
+    count_transfer_from_word(&mut asm, policy, R10);
+    let exhausted = asm.jcc(Cond::B);
     entered_btype(&mut asm, R8, btype);
     asm.mov_store(Qword, Mem::base(Rcx, BLOCK), R8);
     if stamping {
         stamp(&mut asm);
     }
     found(&mut asm);
+    asm.bind(exhausted);
+    uncount_by(&mut asm, R10);
     for miss in misses {
         asm.bind(miss);
     }
@@ -2656,14 +2792,8 @@ fn stamped_with_policy(
         Mem::base(R10, StampCount::Hits.offset()),
         1,
     );
-    spend_budget(&mut asm, policy);
+    count_transfer(&mut asm, policy, ran)?;
     let exhausted = asm.jcc8(Cond::B);
-    asm.alu_imm32(
-        Alu::Add,
-        Qword,
-        Mem::base(Rcx, RETIRED),
-        i32::try_from(ran).ok()?,
-    );
     if btype == 0 {
         asm.mov_rm_imm32(Qword, Mem::base(Rcx, BLOCK), block);
     } else {
@@ -2676,6 +2806,7 @@ fn stamped_with_policy(
     code.patch(transfer.offset(), distance.to_le_bytes());
     let mut asm = code.asm();
     asm.bind(exhausted);
+    uncount(&mut asm, ran);
     asm.mov_imm32(Rdx, word.encoded() | ran << ExitWord::RAN_SHIFT);
     asm.ret();
     // A miss counts its cause and takes the cell tail.
@@ -2837,9 +2968,8 @@ fn lookup_tail_with_policy(
         asm.test_imm(Size::Byte, entry(JUMP_TARGETS), 1 << btype);
         misses.push(asm.jcc8(Cond::E));
     }
-    spend_budget(&mut asm, policy);
+    count_transfer(&mut asm, policy, ran)?;
     let exhausted = asm.jcc8(Cond::B);
-    asm.alu_imm32(Alu::Add, Qword, Mem::base(Rcx, RETIRED), ran as i32);
     asm.alu_imm8(Alu::Add, Qword, Mem::base(Rcx, HITS), 1);
     asm.mov_load(Dword, R8, entry(JUMP_BLOCK));
     entered_btype(&mut asm, R8, btype);
@@ -2847,6 +2977,7 @@ fn lookup_tail_with_policy(
     asm.jmp_rm(entry(JUMP_CODE));
     // A spent budget returns as the probe's would, its word in EDX whole.
     asm.bind(exhausted);
+    uncount(&mut asm, ran);
     asm.mov_imm32(Rdx, word.encoded() | ran << ExitWord::RAN_SHIFT);
     missed(&mut asm);
     for miss in misses {
@@ -3390,30 +3521,37 @@ mod tests {
         let code = thunk(0x1000, 7, 3, 0x2000, Fallback::Return(word)).unwrap();
         let mut expected = vec![0x48, 0x8b, 0x8f];
         expected.extend(824u32.to_le_bytes());
-        expected.extend([0x48, 0x8b, 0x51, 0x40, 0x48, 0x3b, 0x51, 0x48, 0x75, 27]);
-        expected.extend([0x48, 0x83, 0x29, 0x01, 0x72, 21]);
-        expected.extend([0x48, 0x81, 0x41, 0x08, 7, 0, 0, 0]);
-        expected.extend([0x48, 0xc7, 0x41, 0x10, 3, 0, 0, 0]);
-        // The jump ends 0x2c bytes into the thunk.
+        // The gate goes to the return, past the transfer's undo.
+        expected.extend([0x48, 0x8b, 0x51, 0x40, 0x48, 0x3b, 0x51, 0x48, 0x75, 26]);
+        // One addition counts the transfer and its 7 instructions; its
+        // carry goes to the undo.
+        expected.extend([0x48, 0x81, 0x01]);
+        expected.extend(((TRANSFER + 7) as u32).to_le_bytes());
+        expected.extend([0x72, 13]);
+        expected.extend([0x48, 0xc7, 0x41, 0x08, 3, 0, 0, 0]);
+        // The jump ends 0x27 bytes into the thunk.
         expected.extend([0xe9]);
-        expected.extend((0x2000i32 - 0x102c).to_le_bytes());
+        expected.extend((0x2000i32 - 0x1027).to_le_bytes());
+        expected.extend([0x48, 0x83, 0x29, 7]);
         expected.push(0xba);
         expected.extend(word.encoded().to_le_bytes());
         expected.push(0xc3);
         assert_eq!(code, expected);
-        assert_eq!(code.len(), THUNK_BYTES);
+        assert!(code.len() <= THUNK_BYTES);
         let back = thunk(0x1000, 7, 3, 0x2000, Fallback::Jump(0x800)).unwrap();
+        let fallen = expected.len() - 6;
+        assert_eq!(back[..fallen], expected[..fallen]);
+        assert_eq!(back.len(), fallen + JUMP_BYTES);
+        assert_eq!(back[fallen], 0xe9);
         assert_eq!(
-            back[..POLLED_LINK_BODY_BYTES],
-            expected[..POLLED_LINK_BODY_BYTES]
-        );
-        assert_eq!(back.len(), POLLED_LINK_BODY_BYTES + JUMP_BYTES);
-        assert_eq!(back[POLLED_LINK_BODY_BYTES], 0xe9);
-        assert_eq!(
-            back[POLLED_LINK_BODY_BYTES + 1..],
+            back[fallen + 1..],
             (0x800i32 - 0x1000 - back.len() as i32).to_le_bytes()
         );
+        // The most instructions a block has take the undo's longest form.
+        let long = thunk(0x1000, 256, 3, 0x2000, Fallback::Return(word)).unwrap();
+        assert_eq!(long.len(), THUNK_BYTES);
         assert!(thunk(0, 0, 0, 1 << 40, Fallback::Return(word)).is_none());
+        assert!(thunk(0, 1 << 30, 0, 0, Fallback::Return(word)).is_none());
     }
 
     #[test]
@@ -3562,28 +3700,36 @@ mod tests {
                 targets: 0b0111,
             };
             table.set(lookup_slot(TARGET, KEY), entry);
-            control.budget = 2;
+            control.set_budget(2);
             // No translation of the target's page yet: the exit returns.
             assert_eq!(
                 exit(dynamic(frame, TARGET)),
                 (TARGET, ExitKind::Return as u64)
             );
-            assert_eq!(control.budget, 2);
+            assert_eq!(control.remaining(), 2);
             translate(&mut itlb, TARGET, 7);
             assert_eq!(exit(dynamic(frame, TARGET)), (0x5151, 99));
             assert_eq!(
-                (control.budget, control.retired, control.hits, control.block),
+                (
+                    control.remaining(),
+                    control.retired(),
+                    control.hits,
+                    control.block
+                ),
                 (1, 9, 1, 42)
             );
             assert_eq!(exit(fixed(frame, 0)), (0x5151, 99));
-            assert_eq!((control.budget, control.retired, control.hits), (0, 12, 2));
+            assert_eq!(
+                (control.remaining(), control.retired(), control.hits),
+                (0, 12, 2)
+            );
             // No budget left: the budget wraps and the exit is taken.
             assert_eq!(
                 exit(dynamic(frame, TARGET)),
                 (TARGET, ExitKind::Return as u64)
             );
-            assert_eq!((control.budget, control.retired), (u64::MAX, 12));
-            control.budget = 5;
+            assert_eq!((control.remaining(), control.retired()), (EXHAUSTED, 12));
+            control.set_budget(5);
             // Another PC in the slot misses.
             let other = TARGET ^ (1 << (2 + LOOKUP_BITS) | 1 << 2);
             translate(&mut itlb, other, 7);
@@ -3593,16 +3739,16 @@ mod tests {
                 (other, ExitKind::Return as u64)
             );
             // The set's other entry serves too.
-            let (hits, retired) = (control.hits, control.retired);
+            let (hits, retired) = (control.hits, control.retired());
             table.insert(lookup_slot(TARGET, KEY), LookupEntry { pc: other, ..entry });
             assert_eq!(table.entry(neighbour(lookup_slot(TARGET, KEY))).pc, TARGET);
             assert_eq!(exit(dynamic(frame, TARGET)), (0x5151, 99));
             assert_eq!(table.find(lookup_slot(TARGET, KEY), TARGET, KEY).pc, TARGET);
             assert_eq!(exit(dynamic(frame, other)), (0x5151, 99));
             assert_eq!(control.hits, hits + 2);
-            control.retired = retired;
+            control.set_retired(retired);
             control.hits = hits;
-            control.budget = 5;
+            control.set_budget(5);
             table.set(neighbour(lookup_slot(TARGET, KEY)), LookupEntry::default());
             // An entry of another key, another frame or fetch state, misses.
             table.set(
@@ -3617,7 +3763,10 @@ mod tests {
                 (TARGET, ExitKind::Return as u64)
             );
             assert_eq!(exit(fixed(frame, 0)), (TARGET, ExitKind::Call as u64));
-            assert_eq!((control.budget, control.hits, control.block), (5, 2, 42));
+            assert_eq!(
+                (control.remaining(), control.hits, control.block),
+                (5, 2, 42)
+            );
             table.set(lookup_slot(TARGET, KEY), entry);
             // A new context translates the page anew, and then finds the
             // table's entry, which outlived the old one.
@@ -3629,7 +3778,7 @@ mod tests {
             );
             translate(&mut itlb, TARGET, 9);
             assert_eq!(exit(dynamic(frame, TARGET)), (0x5151, 99));
-            assert_eq!((control.budget, control.hits), (4, 3));
+            assert_eq!((control.remaining(), control.hits), (4, 3));
             // The lower half's context translates a lower-half target.
             let lower = TARGET & !(1 << 55);
             table.set(lookup_slot(lower, KEY), LookupEntry { pc: lower, ..entry });
@@ -3640,7 +3789,7 @@ mod tests {
             );
             translate(&mut itlb, lower, 5);
             assert_eq!(exit(dynamic(frame, lower)), (0x5151, 99));
-            assert_eq!((control.budget, control.hits), (3, 4));
+            assert_eq!((control.remaining(), control.hits), (3, 4));
             // A BR with BTYPE 0b11 needs the entry to accept it, and names
             // the BTYPE beside the block.
             assert_eq!(
@@ -3656,15 +3805,20 @@ mod tests {
             );
             assert_eq!(exit(branch(frame, TARGET)), (0x5151, 99));
             assert_eq!(
-                (control.budget, control.retired, control.hits, control.block),
+                (
+                    control.remaining(),
+                    control.retired(),
+                    control.hits,
+                    control.block
+                ),
                 (2, 35, 5, 3 << BLOCK_BTYPE_SHIFT | 42)
             );
-            control.budget = 5;
+            control.set_budget(5);
             control.interrupt_epoch = 1;
             control.observed_interrupt_epoch = 0;
             let prior = (
-                control.budget,
-                control.retired,
+                control.remaining(),
+                control.retired(),
                 control.hits,
                 control.linked,
                 control.block,
@@ -3680,8 +3834,8 @@ mod tests {
             );
             assert_eq!(
                 (
-                    control.budget,
-                    control.retired,
+                    control.remaining(),
+                    control.retired(),
                     control.hits,
                     control.linked,
                     control.block
@@ -3690,7 +3844,7 @@ mod tests {
             );
             control.observed_interrupt_epoch = 1;
             assert_eq!(exit(dynamic(frame, TARGET)), (0x5151, 99));
-            assert_eq!(control.budget, 4);
+            assert_eq!(control.remaining(), 4);
             assert_eq!(munmap(page, PAGE), 0);
         }
     }
@@ -3912,15 +4066,20 @@ mod tests {
                     let word = (result >> 64) as u64;
                     (result as u64, ExitWord::split(word).0)
                 };
-                control.budget = 3;
+                control.set_budget(3);
                 // The target's page untranslated: the exit returns.
                 assert_eq!(exit(run(frame)), (target, ExitKind::Call as u64));
-                assert_eq!(control.budget, 3);
+                assert_eq!(control.remaining(), 3);
                 let translated = LookupEntry::page(target & !0xfff, context, KEY);
                 itlb.insert(itlb_slot(target, context), translated);
                 assert_eq!(exit(run(frame)), (0x5111, 99));
                 assert_eq!(
-                    (control.budget, control.retired, control.hits, control.block),
+                    (
+                        control.remaining(),
+                        control.retired(),
+                        control.hits,
+                        control.block
+                    ),
                     (2, 5, 0, 42)
                 );
                 // Another key: the table's entry, a lookup hit.
@@ -3933,7 +4092,7 @@ mod tests {
                     (target, ExitKind::Call as u64),
                     "no table entry"
                 );
-                assert_eq!(control.budget, 2);
+                assert_eq!(control.remaining(), 2);
                 table.set(lookup_slot(target, KEY), table_entry);
                 // The set filled the cell with the table's entry.
                 assert_eq!(table.site_cell(1), Some(table_entry));
@@ -3943,7 +4102,12 @@ mod tests {
                 };
                 assert_eq!(exit(run(frame)), (0x5122, 99));
                 assert_eq!(
-                    (control.budget, control.retired, control.hits, control.block),
+                    (
+                        control.remaining(),
+                        control.retired(),
+                        control.hits,
+                        control.block
+                    ),
                     (1, 10, 1, 43)
                 );
                 // A cell of another PC is never entered.
@@ -3952,17 +4116,17 @@ mod tests {
                     ..cell_entry
                 };
                 assert_eq!(exit(run(frame)), (0x5122, 99));
-                assert_eq!((control.budget, control.hits), (0, 2));
+                assert_eq!((control.remaining(), control.hits), (0, 2));
                 // No budget: one spend wraps it, and the exit returns.
                 *(cell as *mut LookupEntry) = cell_entry;
                 assert_eq!(exit(run(frame)), (target, ExitKind::Call as u64));
-                assert_eq!((control.budget, control.retired), (u64::MAX, 15));
+                assert_eq!((control.remaining(), control.retired()), (EXHAUSTED, 15));
                 // Another context of the same salt: the page translates
                 // anew, whatever the cell holds.
-                control.budget = 5;
+                control.set_budget(5);
                 control.contexts[half] = context + LOOKUP_SALTS as u64;
                 assert_eq!(exit(run(frame)), (target, ExitKind::Call as u64));
-                assert_eq!(control.budget, 5);
+                assert_eq!(control.remaining(), 5);
                 control.contexts[half] = context;
                 // A cell a writer holds (or changed while it was read): the
                 // table probe looks the target up anew by its key and finds
@@ -3972,12 +4136,20 @@ mod tests {
                     ..cell_entry
                 };
                 assert_eq!(exit(run(frame)), (0x5122, 99));
-                assert_eq!((control.budget, control.hits, control.block), (4, 3, 43));
+                assert_eq!(
+                    (control.remaining(), control.hits, control.block),
+                    (4, 3, 43)
+                );
                 *(cell as *mut LookupEntry) = cell_entry;
-                control.budget = 5;
+                control.set_budget(5);
                 // A pending interruption: nothing spent or counted.
                 control.interrupt_epoch = 1;
-                let prior = (control.budget, control.retired, control.hits, control.block);
+                let prior = (
+                    control.remaining(),
+                    control.retired(),
+                    control.hits,
+                    control.block,
+                );
                 assert_eq!(exit(run(frame)), (target, ExitKind::Call as u64));
                 *(cell as *mut LookupEntry) = LookupEntry {
                     key: 0,
@@ -3985,13 +4157,18 @@ mod tests {
                 };
                 assert_eq!(exit(run(frame)), (target, ExitKind::Call as u64));
                 assert_eq!(
-                    (control.budget, control.retired, control.hits, control.block),
+                    (
+                        control.remaining(),
+                        control.retired(),
+                        control.hits,
+                        control.block
+                    ),
                     prior
                 );
                 control.observed_interrupt_epoch = 1;
                 *(cell as *mut LookupEntry) = cell_entry;
                 assert_eq!(exit(run(frame)), (0x5111, 99));
-                assert_eq!(control.budget, 4);
+                assert_eq!(control.remaining(), 4);
                 assert_eq!(munmap(page, PAGE), 0);
             }
         }
@@ -4075,7 +4252,7 @@ mod tests {
             assert_eq!(mprotect(page, PAGE, 5), 0);
             let ret: unsafe extern "sysv64" fn(u64, u64) -> u128 = core::mem::transmute(page);
             let exit = |result: u128| (result as u64, ExitWord::split((result >> 64) as u64).0);
-            control.budget = 100;
+            control.set_budget(100);
             // Returns to each caller in turn, through one site's tail.
             for round in 0..3 {
                 for (index, &caller) in callers.iter().enumerate() {
@@ -4087,7 +4264,7 @@ mod tests {
                     assert_eq!(control.block, index as u64);
                 }
             }
-            assert_eq!((control.hits, control.retired), (9, 36));
+            assert_eq!((control.hits, control.retired()), (9, 36));
             // A return past its caller, to where no entry is, and to a
             // poisoned address exit with the target as computed.
             let poisoned = callers[0] ^ 1 << 53;
@@ -4102,7 +4279,7 @@ mod tests {
                 (callers[1], ExitKind::Return as u64)
             );
             assert_eq!(exit(ret(frame, callers[2])), (0x5102, 99));
-            assert_eq!((control.hits, control.budget), (10, 90));
+            assert_eq!((control.hits, control.remaining()), (10, 90));
             assert_eq!(munmap(page, PAGE), 0);
         }
     }

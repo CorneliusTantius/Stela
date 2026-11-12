@@ -622,7 +622,13 @@ fn commit(
     asm.mov_load(Qword, Rcx, to(offset_of!(Record, to)));
     asm.mov_store(Qword, segment(offset_of!(Segment, to)), Rcx);
     asm.place(Rcx, super::chain::CONTROL_PLACE);
-    asm.mov_load(Qword, Rcx, Mem::base(Rcx, super::chain::RETIRED_OFFSET));
+    asm.mov_load(Qword, Rcx, Mem::base(Rcx, super::chain::COUNT_OFFSET));
+    asm.alu_imm32(
+        Alu::And,
+        Size::Dword,
+        Rcx,
+        super::chain::RETIRED_MASK as i32,
+    );
     if ending != 0 {
         let ending = i32::try_from(ending).expect("a block's instructions");
         asm.alu_imm32(Alu::Add, Qword, Rcx, ending);
@@ -1324,7 +1330,7 @@ mod tests {
             record.chain = record_chain;
             record.contexts_generation = contexts_generation;
             rig.table.logged = logged;
-            rig.control.retired = 40;
+            rig.control.set_retired(40);
             rig.clock.offset.store(5_000, Relaxed);
             let exit = rig.run(&thunk);
             assert_eq!(
@@ -1382,7 +1388,7 @@ mod tests {
             let record = &mut rig.table.records[2][GUARDED_ENTER];
             record.chain = 1;
             record.contexts_generation = contexts_generation;
-            rig.control.retired = 40;
+            rig.control.set_retired(40);
             rig.clock.offset.store(now, Relaxed);
             rig.words.instructions = instructions;
             rig.words.cycles = cycles;

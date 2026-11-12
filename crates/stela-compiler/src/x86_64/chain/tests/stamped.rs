@@ -254,8 +254,7 @@ fn stamped_tails_transfer_as_their_cell_tails() {
         tail(&stamped, &table, site, pc, linked, ran);
         tail(&plain, &table, site, pc, None, ran);
         let base = ChainControl {
-            budget: [0, 1, 2, 5, 9][rng.below(5) as usize],
-            retired: 100,
+            count: ChainControl::counting([0, 1, 2, 5, 9][rng.below(5) as usize], 100),
             block: 7,
             contexts,
             table: table.address(),
@@ -300,7 +299,7 @@ fn stamped_tails_transfer_as_their_cell_tails() {
             && linked.is_some_and(|linked| linked.entry == cell.entry)
             && (ra == (0x7700 + u64::from(cell.block), 99)
                 // Or no budget: the stamped tail spent it, as a transfer.
-                || (ra == exit && base.budget == 0 && a.budget == u64::MAX));
+                || (ra == exit && base.remaining() == 0 && a.remaining() == EXHAUSTED));
         if evicted {
             refilled += 1;
             continue;
@@ -344,7 +343,7 @@ fn stamps_go_with_drops_contexts_and_cell_changes() {
     table.settle_heat(number);
     tail(&region, &table, 0x1000, pc, Some(held), 4);
     let mut control = ChainControl {
-        budget: 100,
+        count: ChainControl::counting(100, 0),
         contexts: [CONTEXTS[0], context],
         table: table.address(),
         itlb: itlb.address(),
@@ -379,7 +378,10 @@ fn stamps_go_with_drops_contexts_and_cell_changes() {
     // hits the stamp.
     assert_eq!(through(&mut control, &table), ((0x7703, 99), true));
     assert_eq!(through(&mut control, &table), ((0x7703, 99), false));
-    assert_eq!((control.budget, control.retired, control.block), (98, 8, 3));
+    assert_eq!(
+        (control.remaining(), control.retired(), control.block),
+        (98, 8, 3)
+    );
     assert_eq!(counts(), [1, 1, 0, 0, 1, 0]);
     // A drop in the half: the probe again, which stamps again.
     itlb.forget_range_where(0..=0, |_| true);
@@ -438,22 +440,22 @@ fn stamps_go_with_drops_contexts_and_cell_changes() {
     assert_eq!(run(&region, &mut control, pc), (0x7703, 99));
     assert_eq!(count(was, StampCount::Restamped), 1);
     assert_eq!(count(was, StampCount::Hits), 1);
-    control.budget = 0;
+    control.set_budget(0);
     assert_eq!(run(&region, &mut control, pc), (pc, word));
-    assert_eq!(control.budget, u64::MAX);
+    assert_eq!(control.remaining(), EXHAUSTED);
     // A pending interruption: the probe's exit, nothing spent.
-    control.budget = 10;
+    control.set_budget(10);
     control.interrupt_epoch = 1;
     let was = counts();
     assert_eq!(run(&region, &mut control, pc), (pc, word));
     assert_eq!(count(was, StampCount::Interrupted), 1);
-    assert_eq!(control.budget, 10);
+    assert_eq!(control.remaining(), 10);
     control.interrupt_epoch = 0;
     // A cell made hot: its exit's link comes back from the sweep once.
     table.link_cell(0x1000, pc, Some(held));
     let number = table.site_cell_number(0x1000).unwrap();
     tail(&region, &table, 0x1000, pc, None, 4);
-    control.budget = 1000;
+    control.set_budget(1000);
     let link = CellLink {
         site: 0x1000,
         pc,
@@ -525,7 +527,7 @@ fn a_cell_changed_on_another_core_ends_its_stamps_there() {
             done.store(true, Ordering::SeqCst);
         });
         let mut control = ChainControl {
-            budget: u64::MAX / 2,
+            count: ChainControl::counting(MAX_BUDGET, 0),
             contexts: [context, CONTEXTS[1]],
             table: address,
             itlb: itlb.address(),
