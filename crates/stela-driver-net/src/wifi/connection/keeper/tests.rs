@@ -170,6 +170,8 @@ struct Recovering {
     end: Option<Result<(), String>>,
     calls: Vec<u64>,
     recoverable: bool,
+    /// The BSSs a scan found.
+    observed: Vec<Bss>,
 }
 
 impl Recovering {
@@ -181,6 +183,7 @@ impl Recovering {
             end: None,
             calls: Vec::new(),
             recoverable,
+            observed: Vec::new(),
         }
     }
 }
@@ -285,7 +288,7 @@ impl Radio for Recovering {
         unreachable!()
     }
     fn bss(&self) -> Vec<(u8, &Bss)> {
-        Vec::new()
+        self.observed.iter().map(|bss| (0, bss)).collect()
     }
     fn observation(&self, _: u8) -> Result<Arc<NativeBssObservation>, String> {
         unreachable!()
@@ -374,6 +377,10 @@ const MODEL: Clock = Clock {
 };
 
 fn keeper(radio: Recovering) -> Keeper<Recovering> {
+    keeper_with(radio, Secret::parse(b"correct horse battery").unwrap())
+}
+
+fn keeper_with(radio: Recovering, secret: Secret) -> Keeper<Recovering> {
     core::mem::forget(crate::test_clock::virtualize());
     struct Zero;
     impl Entropy for Zero {
@@ -384,7 +391,7 @@ fn keeper(radio: Recovering) -> Keeper<Recovering> {
     }
     let network = Network {
         ssid: b"x".to_vec(),
-        secret: Secret::parse(b"correct horse battery").unwrap(),
+        secret,
         country: None,
     };
     Keeper::keep(radio, network, Arc::new(Zero), MODEL)
@@ -535,4 +542,28 @@ fn an_open_network_takes_only_a_bss_without_privacy_rsn_or_wpa() {
     assert!(protected(&bss));
     bss.elements = vec![221, 4, 0, 0x50, 0xf2, 2];
     assert!(!protected(&bss));
+}
+
+/// An open network's station never joins a protected AP of its name: with
+/// only one in range it joins nothing, says why once, and scans again.
+#[test]
+fn an_open_network_refuses_a_protected_ap_of_its_name() {
+    let mut radio = Recovering::new(false, Vec::new());
+    radio.stage = Stage::Idle;
+    let mut protected = ap(1, 2, CHANNEL_1, AP_MLD, &[]);
+    protected.ssid = Some(b"x".to_vec());
+    protected.capabilities |= connection::PRIVACY;
+    let mut other = protected.clone();
+    other.ssid = Some(b"y".to_vec());
+    other.capabilities &= !connection::PRIVACY;
+    radio.observed = vec![protected, other];
+    let mut keeper = keeper_with(radio, Secret::Open);
+    // The radio's join is unreachable: choosing either AP would panic.
+    keeper.choose(0);
+    keeper.choose(0);
+    assert!(matches!(keeper.state, State::Waiting { .. }));
+    assert_eq!(
+        notices(&mut keeper),
+        ["model: x is protected, and the network has no key"]
+    );
 }
