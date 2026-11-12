@@ -7,7 +7,7 @@
 //! [`Rtl8822c`]: super::station::Rtl8822c
 use super::{
     bootstrap::{Native, Up},
-    calibrate::Calibration,
+    calibrate::{Calibration, DpkRun, GapkRun},
     coex::{Coex, Event, Order, Wifi},
     commands::{self, Report},
     deep::Deep,
@@ -15,7 +15,7 @@ use super::{
     download,
     dynamic::{self, Dynamic, set_mask},
     features,
-    firmware_control::{self, Control},
+    firmware_control::{self, Control, IqkWait},
     interrupt::{self, Controller},
     io::{Bar, Io},
     link::Link,
@@ -26,6 +26,7 @@ use super::{
     receive::{self, Ring},
     regd,
     registers::{REG_BCN_CTRL, REG_CR},
+    rfk::{self, Progress},
     station::{CamKey, Device, Incoming, MAC_ID, PORT, Received, Watched},
     templates::{self, Templates},
     transmit::{self, Queue, Rings},
@@ -48,9 +49,10 @@ const POWER_BIT_BY_HARDWARE: u32 = 1 << 7;
 const UPDATE_TIM_ELEMENT: u32 = 1 << 5;
 /// `REG_DTIM_COUNTER_ROOT`.
 const REG_DTIM_COUNTER_ROOT: u32 = 0x5a8;
-/// `LEAVE_LPS_TRY_CNT` and its 20 ms.
-const LEAVE_POWER_SAVE_TRIES: u32 = 5;
-const LEAVE_POWER_SAVE_WAIT_US: u64 = 20_000;
+/// `LEAVE_LPS_TRY_CNT` times its 20 ms.
+const LEAVE_POWER_SAVE_US: u64 = 100_000;
+/// How many hurried steps end any calibration, with room to spare.
+const HURRIED_STEPS: usize = 16;
 
 /// `rtw_vif_port[0]`.
 const REG_MAC_ADDRESS: u32 = 0x610;
@@ -124,6 +126,12 @@ const RECEIVE_TAG_SLIPPED: &str =
 const IQK_UNFINISHED: &str = "an IQK calibration firmware did not report done within 300 ms";
 /// rtw88's "failed to send h2c command", after which it goes on.
 const MAILBOX_BUSY: &str = "firmware commands dropped while its mailbox stayed busy";
+/// rtw88's "firmware failed to leave lps state", after which it clears the
+/// power bit itself.
+const POWER_SAVE_HELD: &str = "firmware that did not leave power save in time";
+/// A calibration another request cut short; the next transmission on the
+/// channel calibrates again.
+const CALIBRATION_CUT_SHORT: &str = "a calibration another request cut short";
 /// The arbiter waits a few steps for a calibration, not rtw88's 600 ms at once.
 const COEX_WAIT_CUT: &str = "an antenna path set while a Bluetooth calibration still ran";
 /// The synthesizer lock waits 20 ms, not rtw88's 100.
@@ -215,6 +223,13 @@ pub struct Hardware {
     limitations: Vec<&'static str>,
     /// Limitations already told once, which a repeat does not tell again.
     reported: Vec<&'static str>,
+    /// `rtw8822c_phy_calibration` under way, a step each poll.
+    rfk: Option<rfk::Run<Hardware>>,
+    /// `rtw_leave_lps`'s wait for firmware to clear the power bit, until.
+    leaving: Option<u64>,
+    /// Bluetooth's reports while a calibration holds the arbiter, as rtw88's
+    /// C2H work waits for its mutex.
+    held_reports: Vec<Report>,
 }
 
 impl Hardware {
@@ -309,6 +324,9 @@ impl Hardware {
             vector,
             limitations,
             reported: Vec::new(),
+            rfk: None,
+            leaving: None,
+            held_reports: Vec::new(),
         })
     }
 
@@ -386,6 +404,7 @@ impl Hardware {
     /// `rtw_leave_lps_deep`, ahead of anything past the bus's own registers.
     /// Deep power save comes back with the watchdog's next `rtw_enter_lps`.
     fn rouse(&mut self) -> Result<(), String> {
+        self.settle()?;
         if !self.deep.active() {
             return Ok(());
         }
@@ -459,19 +478,84 @@ impl Hardware {
         Ok(())
     }
 
-    /// `rtw_leave_lps_core`'s wait for the power bit in frames to clear.
-    fn wait_for_power_save_to_end(&mut self) -> Result<(), String> {
+    /// One look of `rtw_leave_lps_core`'s wait for the power bit in frames to
+    /// clear. Past its 100 ms, or with `force`, the bit is cleared here, as
+    /// rtw88 clears it, and the arbiter hears of the return.
+    fn look_leaving(&mut self, force: bool) -> Result<(), String> {
+        let Some(end) = self.leaving else {
+            return Ok(());
+        };
         let io = self.control.io().map_err(failed("registers"))?;
-        for _ in 0..LEAVE_POWER_SAVE_TRIES {
-            let control = io.read32(REG_TCR).map_err(failed("power save"))?;
-            if control & POWER_BIT_BY_HARDWARE == 0 {
+        let now = io.now_us().map_err(failed("clock"))?;
+        let control = io.read32(REG_TCR).map_err(failed("power save"))?;
+        if control & POWER_BIT_BY_HARDWARE != 0 {
+            if !force && now <= end {
                 return Ok(());
             }
-            io.delay_us(LEAVE_POWER_SAVE_WAIT_US);
+            set_mask(io, REG_TCR, POWER_BIT_BY_HARDWARE, 0).map_err(failed("power save"))?;
+            self.limit_once(POWER_SAVE_HELD);
         }
-        set_mask(io, REG_TCR, POWER_BIT_BY_HARDWARE, 0).map_err(failed("power save"))?;
-        self.limitations
-            .push("firmware that did not leave power save in time");
+        self.leaving = None;
+        self.arbitrate(Event::Sleeping(false))
+    }
+
+    /// Whether frames wait: for a calibration, or for power save to end.
+    fn holding(&self) -> bool {
+        self.rfk.is_some() || self.leaving.is_some()
+    }
+
+    /// One step of the calibration under way, and one look at power save
+    /// ending.
+    fn advance(&mut self) -> Result<(), String> {
+        self.step_calibration(false)?;
+        self.look_leaving(false)
+    }
+
+    fn step_calibration(&mut self, hurry: bool) -> Result<(), String> {
+        let Some(mut run) = self.rfk.take() else {
+            return Ok(());
+        };
+        match run.step(self, hurry)? {
+            Progress::Running => self.rfk = Some(run),
+            Progress::Done { hurried } => {
+                self.limitations.extend(self.calibration.take_shortfalls());
+                if hurried {
+                    self.calibrate = true;
+                    self.limit_once(CALIBRATION_CUT_SHORT);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// End the calibration under way in a few hurried steps, before work that
+    /// cannot wait for it.
+    fn settle(&mut self) -> Result<(), String> {
+        for _ in 0..HURRIED_STEPS {
+            if self.rfk.is_none() {
+                return Ok(());
+            }
+            self.step_calibration(true)?;
+        }
+        Err(String::from("a calibration that hurried steps did not end"))
+    }
+
+    /// Bluetooth's reports, unless a calibration holds the arbiter.
+    fn hear_bluetooth(&mut self, reports: Vec<Report>) -> Result<(), String> {
+        self.held_reports.extend(reports);
+        if self.rfk.is_some() {
+            return Ok(());
+        }
+        for report in core::mem::take(&mut self.held_reports) {
+            match report {
+                Report::Bluetooth { bytes, length } => {
+                    self.arbitrate(Event::Bluetooth(&bytes[..usize::from(length)]))?;
+                }
+                Report::BluetoothAnswer(answer) => self.arbitrate(Event::Answer(&answer))?,
+                Report::BluetoothHid(bytes) => self.arbitrate(Event::BluetoothHid(bytes))?,
+                _ => {}
+            }
+        }
         Ok(())
     }
 
@@ -537,21 +621,6 @@ impl Hardware {
             set_mask(io, REG_GAIN, mask, u32::from(gain)).map_err(failed("gain"))?;
         }
         Ok(())
-    }
-
-    /// `rtw8822c_rfk_handshake`.
-    fn calibration_handshake(&mut self, starting: bool) -> Result<(), String> {
-        if starting {
-            let io = self.control.io().map_err(failed("registers"))?;
-            self.calibration
-                .await_bluetooth(io)
-                .map_err(failed("bluetooth calibration"))?;
-        }
-        self.send(commands::calibration(starting), "calibration notice")?;
-        let io = self.control.io().map_err(failed("registers"))?;
-        self.calibration
-            .await_firmware(io)
-            .map_err(failed("calibration handshake"))
     }
 
     /// `rtw8822c_rfk_power_save`.
@@ -679,33 +748,23 @@ impl Device for Hardware {
     }
 
     /// `rtw_ops_mgd_prepare_tx`, with `rtw8822c_phy_calibration` once a channel
-    /// needs it.
+    /// needs it. The calibration runs a step each poll; frames wait for it.
     fn prepare_transmit(&mut self) -> Result<(), String> {
         self.arbitrate(Event::Connecting)?;
-        if !core::mem::take(&mut self.calibrate) {
-            return Ok(());
+        if core::mem::take(&mut self.calibrate) {
+            self.rfk = Some(rfk::Run::start(self)?);
         }
-        self.calibration_power_save(false)?;
-        self.calibration_handshake(true)?;
-        let io = self.control.io().map_err(failed("registers"))?;
-        // SAFETY: the only worker owns the radio and its frames wait for it.
-        unsafe { self.calibration.even_gains(io, &self.report) }.map_err(failed("gains"))?;
-        self.calibration_handshake(false)?;
-        // SAFETY: as above.
-        let iqk =
-            unsafe { self.control.iqk(&mut self.transmit, self.pages) }.map_err(failed("iqk"))?;
-        if !iqk.completed() {
-            self.limit_once(IQK_UNFINISHED);
-        }
-        let io = self.control.io().map_err(failed("registers"))?;
-        // SAFETY: as above.
-        unsafe { self.calibration.predistort(io, &self.report) }
-            .map_err(failed("predistortion"))?;
-        self.limitations.extend(self.calibration.take_shortfalls());
-        self.calibration_power_save(true)
+        Ok(())
+    }
+
+    fn ready(&self) -> bool {
+        !self.holding()
     }
 
     fn transmit(&mut self, queue: Queue, packet: &Packet, mpdu: &[u8]) -> Result<bool, String> {
+        if self.holding() {
+            return Ok(false);
+        }
         if !self.deep.transmit_wakes() {
             self.rouse()?;
         }
@@ -725,6 +784,7 @@ impl Device for Hardware {
     /// `rtw_pci_interrupt_threadfn`: the causes first, so that what arrives
     /// while the rings drain raises the MSI again.
     fn receive(&mut self, sink: &mut dyn FnMut(Incoming)) -> Result<(), String> {
+        self.advance()?;
         if self.vector {
             self.interrupts.capture().map_err(failed("interrupt"))?;
         }
@@ -762,16 +822,7 @@ impl Device for Hardware {
         self.transmit
             .reclaim_h2c()
             .map_err(failed("command reclaim"))?;
-        for report in bluetooth {
-            match report {
-                Report::Bluetooth { bytes, length } => {
-                    self.arbitrate(Event::Bluetooth(&bytes[..usize::from(length)]))?;
-                }
-                Report::BluetoothAnswer(answer) => self.arbitrate(Event::Answer(&answer))?,
-                Report::BluetoothHid(bytes) => self.arbitrate(Event::BluetoothHid(bytes))?,
-                _ => {}
-            }
-        }
+        self.hear_bluetooth(bluetooth)?;
         if self.vector {
             // SAFETY: this worker is the handler, between its capture and now.
             unsafe { self.interrupts.enable(false) }.map_err(failed("interrupt"))?;
@@ -793,6 +844,7 @@ impl Device for Hardware {
     /// `rtw_enter_lps` and `rtw_leave_lps`. Whether firmware reports the return
     /// or not, it clears the bit it set, so this waits on that.
     fn set_power_save(&mut self, on: bool) -> Result<(), String> {
+        self.look_leaving(true)?;
         if on {
             if !self.asleep && !self.coex.stays_awake() {
                 self.arbitrate(Event::Sleeping(true))?;
@@ -813,8 +865,10 @@ impl Device for Hardware {
         self.asleep = false;
         self.set_link_power(false)?;
         self.send(commands::power_mode(false, PORT), "power mode")?;
-        self.wait_for_power_save_to_end()?;
-        self.arbitrate(Event::Sleeping(false))
+        let io = self.control.io().map_err(failed("registers"))?;
+        let now = io.now_us().map_err(failed("clock"))?;
+        self.leaving = Some(now.saturating_add(LEAVE_POWER_SAVE_US));
+        self.look_leaving(false)
     }
 
     /// `rtw_ops_bss_info_changed`'s `BSS_CHANGED_BEACON_INT`, and
@@ -835,6 +889,9 @@ impl Device for Hardware {
     /// The arbiter's time, and rtw88's delayed works that came due.
     fn coexist(&mut self, now: u64) -> Result<(), String> {
         self.now = now;
+        if self.holding() {
+            return Ok(());
+        }
         if self.deep.active() && !self.coex.deadline_passed(now) {
             return Ok(());
         }
@@ -915,6 +972,13 @@ impl Device for Hardware {
 
     /// `rtw_phy_dynamic_mechanism`.
     fn watchdog(&mut self, scanning: bool, stbc: bool) -> Result<Watched, String> {
+        // rtw88's watchdog work waits for the mutex the calibration holds.
+        if self.holding() {
+            return Ok(Watched {
+                level: self.dynamic.level(),
+                busy: true,
+            });
+        }
         let traffic = self.dynamic.close_period();
         if traffic.busy != core::mem::replace(&mut self.busy, traffic.busy) {
             self.arbitrate(Event::Traffic)?;
@@ -1011,6 +1075,147 @@ impl Device for Hardware {
             || self.transmit.quarantined()
             || self.interrupts.state() == interrupt::State::Quarantined
             || self.phy.is_none()
+    }
+}
+
+/// The calibration's steps on this radio. Frames wait while a calibration
+/// runs ([`Hardware::holding`]), and each step comes from the radio's only
+/// worker, which is what each register sequence asks of its caller.
+impl rfk::Bench for Hardware {
+    type Gapk = GapkRun;
+    type Iqk = IqkWait;
+    type Dpk = DpkRun;
+
+    fn now(&mut self) -> Result<u64, String> {
+        let io = self.control.io().map_err(failed("registers"))?;
+        io.now_us().map_err(failed("clock"))
+    }
+
+    fn power_save(&mut self, on: bool) -> Result<(), String> {
+        self.calibration_power_save(on)
+    }
+
+    fn bluetooth_idle(&mut self) -> Result<bool, String> {
+        let io = self.control.io().map_err(failed("registers"))?;
+        self.calibration
+            .bluetooth_idle(io)
+            .map_err(failed("bluetooth calibration"))
+    }
+
+    fn bluetooth_outlasted(&mut self) {
+        self.calibration.bluetooth_outlasted();
+    }
+
+    fn inform(&mut self, starting: bool) -> Result<(), String> {
+        self.send(commands::calibration(starting), "calibration notice")
+    }
+
+    fn firmware_answered(&mut self) -> Result<bool, String> {
+        let io = self.control.io().map_err(failed("registers"))?;
+        Calibration::firmware_answered(io).map_err(failed("calibration handshake"))
+    }
+
+    fn firmware_unanswered(&mut self) {
+        self.calibration.firmware_unanswered();
+    }
+
+    fn gapk_begin(&mut self) -> Result<Option<GapkRun>, String> {
+        let io = self.control.io().map_err(failed("registers"))?;
+        // SAFETY: this worker owns the radio, and its frames wait for it.
+        unsafe { self.calibration.gapk_begin(io, &self.report) }.map_err(failed("gains"))
+    }
+
+    fn gapk_start(&mut self, run: &mut GapkRun, at: usize) -> Result<(), String> {
+        let io = self.control.io().map_err(failed("registers"))?;
+        // SAFETY: as above, within the run `run` began.
+        unsafe { self.calibration.gapk_start(io, &self.report, run, at) }.map_err(failed("gains"))
+    }
+
+    fn gapk_measured(&mut self) -> Result<bool, String> {
+        let io = self.control.io().map_err(failed("registers"))?;
+        Calibration::gapk_measured(io).map_err(failed("gains"))
+    }
+
+    fn gapk_finish(&mut self, run: &mut GapkRun, at: usize, done: bool) -> Result<(), String> {
+        let io = self.control.io().map_err(failed("registers"))?;
+        // SAFETY: as above.
+        unsafe {
+            self.calibration
+                .gapk_finish(io, &self.report, run, at, done)
+        }
+        .map_err(failed("gains"))
+    }
+
+    fn gapk_end(&mut self, run: GapkRun, measured: bool) -> Result<(), String> {
+        let io = self.control.io().map_err(failed("registers"))?;
+        // SAFETY: as above.
+        unsafe { self.calibration.gapk_end(io, &self.report, run, measured) }
+            .map_err(failed("gains"))
+    }
+
+    fn iqk_start(&mut self) -> Result<IqkWait, String> {
+        // SAFETY: as above; the IQK's command goes out on this radio's rings.
+        unsafe { self.control.start_iqk(&mut self.transmit, self.pages) }.map_err(failed("iqk"))
+    }
+
+    fn iqk_poll(&mut self, wait: &mut IqkWait, hurry: bool) -> Result<Option<bool>, String> {
+        let Some(observed) = self
+            .control
+            .poll_iqk(&mut self.transmit, wait, hurry)
+            .map_err(failed("iqk"))?
+        else {
+            return Ok(None);
+        };
+        if !observed.completed() && !hurry {
+            self.limit_once(IQK_UNFINISHED);
+        }
+        Ok(Some(observed.completed()))
+    }
+
+    fn dpk_begin(&mut self) -> Result<Option<DpkRun>, String> {
+        let io = self.control.io().map_err(failed("registers"))?;
+        // SAFETY: as above.
+        unsafe { self.calibration.dpk_begin(io, &self.report) }.map_err(failed("predistortion"))
+    }
+
+    fn dpk_gain(&mut self, run: &mut DpkRun, at: usize) -> Result<(), String> {
+        let io = self.control.io().map_err(failed("registers"))?;
+        // SAFETY: as above, within the run `run` began.
+        unsafe { self.calibration.dpk_gain(io, &self.report, run, at) }
+            .map_err(failed("predistortion"))
+    }
+
+    fn dpk_search(&mut self, run: &mut DpkRun, at: usize) -> Result<bool, String> {
+        let io = self.control.io().map_err(failed("registers"))?;
+        // SAFETY: as above.
+        unsafe { self.calibration.dpk_search(io, &self.report, run, at) }
+            .map_err(failed("predistortion"))
+    }
+
+    fn dpk_measure(&mut self, run: &mut DpkRun, at: usize) -> Result<(), String> {
+        let io = self.control.io().map_err(failed("registers"))?;
+        // SAFETY: as above.
+        unsafe { self.calibration.dpk_measure(io, &self.report, run, at) }
+            .map_err(failed("predistortion"))
+    }
+
+    fn dpk_skip(&mut self, at: usize) -> Result<(), String> {
+        let io = self.control.io().map_err(failed("registers"))?;
+        // SAFETY: as above.
+        unsafe { self.calibration.dpk_skip(io, &self.report, at) }.map_err(failed("predistortion"))
+    }
+
+    fn dpk_turn_on(&mut self, at: usize) -> Result<(), String> {
+        let io = self.control.io().map_err(failed("registers"))?;
+        // SAFETY: as above.
+        unsafe { self.calibration.dpk_turn_on(io, &self.report, at) }
+            .map_err(failed("predistortion"))
+    }
+
+    fn dpk_end(&mut self, run: DpkRun) -> Result<(), String> {
+        let io = self.control.io().map_err(failed("registers"))?;
+        // SAFETY: as above.
+        unsafe { self.calibration.dpk_end(io, &self.report, run) }.map_err(failed("predistortion"))
     }
 }
 

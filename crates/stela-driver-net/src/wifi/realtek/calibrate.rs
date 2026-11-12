@@ -215,6 +215,14 @@ const COEFFICIENT_READS: [u32; 20] = [
 ];
 /// `DPK_CHANNEL_WIDTH_80` of `RF_CFGCH`'s width.
 const WIDTH_80: u32 = 1;
+/// `rtw8822c_txgapk_read_offset`'s wait for its report: 100 looks 1 ms apart.
+#[cfg(test)]
+const GAPK_POLLS: usize = 100;
+#[cfg(test)]
+const GAPK_POLL_US: u64 = 1000;
+/// The path's `REG_RSV_CTRL` or `REG_WLRF1`, whose RFC direct bits the gain
+/// measurement takes.
+const GAPK_DIRECT: [u32; 2] = [REG_RSV_CTRL, REG_WLRF1];
 /// `check_hw_ready`.
 const READY_POLLS: usize = 1000;
 const READY_POLL_US: u64 = 10;
@@ -425,6 +433,48 @@ struct Gapk {
     channel: u32,
 }
 
+/// What a GAPK keeps between its steps: the transmit registers its pause
+/// changed, and those the measurement of the path under way holds.
+#[derive(Debug)]
+pub struct GapkRun {
+    held: [(u32, u32); 2],
+    measuring: [Result<u32, io::Error>; 5],
+}
+
+/// One path of a DPK between its steps: where its gain search started, the
+/// temperature before it, and the search itself.
+#[derive(Clone, Copy, Debug)]
+struct DpkPath {
+    start_gain: u32,
+    start_agc: u32,
+    before: u8,
+    tries: u32,
+    gain: u32,
+    state: Agc,
+}
+
+impl Default for DpkPath {
+    fn default() -> Self {
+        Self {
+            start_gain: 0,
+            start_agc: 0,
+            before: 0,
+            tries: 0,
+            gain: 0,
+            state: Agc::Read,
+        }
+    }
+}
+
+/// What a DPK keeps between its steps: the registers it puts back at the
+/// end, and each path's search.
+#[derive(Debug)]
+pub struct DpkRun {
+    held: [u32; DPK_REGISTERS.len()],
+    held_rf: [[u32; 2]; DPK_RF_REGISTERS.len()],
+    paths: [DpkPath; 2],
+}
+
 /// `sizeof(struct rtw_lps_pg_dpk_hdr)`.
 const POWER_GATE_PAGE: usize = 169;
 
@@ -514,44 +564,74 @@ impl Calibration {
         }
     }
 
-    /// The half of `rtw8822c_rfk_handshake` before firmware hears of a start.
-    pub fn await_bluetooth<I: Io>(&mut self, io: &mut I) -> Result<(), Error> {
-        if self.bluetooth_stuck {
-            return Ok(());
-        }
-        for _ in 0..30_000 {
-            if io.read32(REG_PMC_DBG_CTRL1)? & BITS_PMC_BT_IQK_STS == 0 {
-                return Ok(());
-            }
-            io.delay_us(20);
-        }
+    /// One look at what the half of `rtw8822c_rfk_handshake` before firmware
+    /// hears of a start waits for: Bluetooth's own calibration over, or one
+    /// that outlasted an earlier wait, which rtw88 no longer waits for.
+    pub fn bluetooth_idle<I: Io>(&self, io: &mut I) -> Result<bool, Error> {
+        Ok(self.bluetooth_stuck || io.read32(REG_PMC_DBG_CTRL1)? & BITS_PMC_BT_IQK_STS == 0)
+    }
+
+    /// Bluetooth's calibration outlasted its 600 ms: `dm->is_bt_iqk_timeout`.
+    pub fn bluetooth_outlasted(&mut self) {
         self.bluetooth_stuck = true;
         self.fall_short("Bluetooth's calibration, which outlasted the wait");
-        Ok(())
     }
 
-    /// The half of `rtw8822c_rfk_handshake` after firmware hears.
-    pub fn await_firmware<I: Io>(&mut self, io: &mut I) -> Result<(), Error> {
-        for _ in 0..5_000 {
-            if io.read32(REG_ARFR4)? & BIT_WL_RFK == 1 {
-                return Ok(());
-            }
-            io.delay_us(20);
-        }
+    /// One look at what the half of `rtw8822c_rfk_handshake` after firmware
+    /// hears waits for: its answer.
+    pub fn firmware_answered<I: Io>(io: &mut I) -> Result<bool, Error> {
+        Ok(io.read32(REG_ARFR4)? & BIT_WL_RFK == 1)
+    }
+
+    /// Firmware did not answer within 100 ms; rtw88 goes on.
+    pub fn firmware_unanswered(&mut self) {
         self.fall_short("firmware's calibration handshake");
-        Ok(())
     }
 
-    /// `rtw8822c_txgapk`.
+    /// `rtw8822c_txgapk` in one call, its measurements waited for in place.
     ///
     /// # Safety
     /// As [`rf::Registers::new`]: `io` and `report` are one radio's, whose
     /// frames wait while this worker owns it.
+    #[cfg(test)]
     pub unsafe fn even_gains<I: Io>(&mut self, io: &mut I, report: &Report) -> Result<(), Error> {
+        // SAFETY: forwarded from the caller.
+        let Some(mut run) = (unsafe { self.gapk_begin(io, report) })? else {
+            return Ok(());
+        };
+        for at in 0..2 {
+            // SAFETY: as above.
+            unsafe { self.gapk_start(io, report, &mut run, at) }?;
+            let mut done = false;
+            for _ in 0..GAPK_POLLS {
+                done = Self::gapk_measured(io)?;
+                if done {
+                    break;
+                }
+                io.delay_us(GAPK_POLL_US);
+            }
+            // SAFETY: as above.
+            unsafe { self.gapk_finish(io, report, &mut run, at, done) }?;
+        }
+        // SAFETY: as above.
+        unsafe { self.gapk_end(io, report, run, true) }
+    }
+
+    /// The start of `rtw8822c_txgapk`, up to its first path: `None` where
+    /// thermal power tracking does not apply and nothing more follows.
+    ///
+    /// # Safety
+    /// As [`rf::Registers::new`]: `io` and `report` are one radio's, whose
+    /// frames wait while this worker owns it, from here to [`Self::gapk_end`].
+    pub unsafe fn gapk_begin<I: Io>(
+        &mut self,
+        io: &mut I,
+        report: &Report,
+    ) -> Result<Option<GapkRun>, Error> {
         let mut bench = Bench { io, report };
         self.save_gains(&mut bench)?;
         if !self.thermal_power {
-            return Ok(());
+            return Ok(None);
         }
         let held = [
             (REG_TX_PTCL_CTRL, bench.io.read32(REG_TX_PTCL_CTRL)?),
@@ -560,19 +640,78 @@ impl Calibration {
         if !bench.pause_transmit()? {
             self.fall_short("a transmit pause for calibration");
         }
-        for (at, path) in paths() {
-            self.gapk.channel = bench.rf_get(path, RF_CFGCH, RF_WHOLE)? & MASK_BYTE0;
-            Self::gain_setup(&mut bench, at)?;
-            Self::gain_analog(&mut bench, at, IQK_AFE_CALIBRATING, &AFE_CALIBRATING)?;
-            self.measure_gains(&mut bench, at, path)?;
-            bench.rf_set(path, RF_MODE_TRXAGC, BIT_RF_MODE, 3)?;
-            bench.rf_set(path, RF_DEBUG, BIT_DE_TRXBW, 0)?;
-            bench.rf_set(path, RF_EXT_TIA_BW, BIT_PW_EXT_TIA, 0)?;
-            Self::gain_analog(&mut bench, at, IQK_AFE_RUNNING, &AFE_RUNNING)?;
-            Self::gain_teardown(&mut bench, at, path)?;
+        Ok(Some(GapkRun {
+            held,
+            measuring: [Ok(0); 5],
+        }))
+    }
+
+    /// Path `at`'s setup and the start of its gain measurement, which
+    /// [`Self::gapk_measured`] looks for, up to 100 ms.
+    ///
+    /// # Safety
+    /// As [`Self::gapk_begin`].
+    pub unsafe fn gapk_start<I: Io>(
+        &mut self,
+        io: &mut I,
+        report: &Report,
+        run: &mut GapkRun,
+        at: usize,
+    ) -> Result<(), Error> {
+        let path = paths()[at].1;
+        let mut bench = Bench { io, report };
+        self.gapk.channel = bench.rf_get(path, RF_CFGCH, RF_WHOLE)? & MASK_BYTE0;
+        Self::gain_setup(&mut bench, at)?;
+        Self::gain_analog(&mut bench, at, IQK_AFE_CALIBRATING, &AFE_CALIBRATING)?;
+        run.measuring = self.measure_start(&mut bench, at, path)?;
+        Ok(())
+    }
+
+    /// Whether the gain measurement finished.
+    pub fn gapk_measured<I: Io>(io: &mut I) -> Result<bool, Error> {
+        let value = io.read32(REG_RPT_CIP)?;
+        Ok((value & BIT_RPT_CIP_STATUS) >> BIT_RPT_CIP_STATUS.trailing_zeros() == 0x55)
+    }
+
+    /// The rest of path `at`, its measurement `done` or given up on.
+    ///
+    /// # Safety
+    /// As [`Self::gapk_begin`].
+    pub unsafe fn gapk_finish<I: Io>(
+        &mut self,
+        io: &mut I,
+        report: &Report,
+        run: &mut GapkRun,
+        at: usize,
+        done: bool,
+    ) -> Result<(), Error> {
+        let path = paths()[at].1;
+        let mut bench = Bench { io, report };
+        self.measure_finish(&mut bench, at, run.measuring, done)?;
+        bench.rf_set(path, RF_MODE_TRXAGC, BIT_RF_MODE, 3)?;
+        bench.rf_set(path, RF_DEBUG, BIT_DE_TRXBW, 0)?;
+        bench.rf_set(path, RF_EXT_TIA_BW, BIT_PW_EXT_TIA, 0)?;
+        Self::gain_analog(&mut bench, at, IQK_AFE_RUNNING, &AFE_RUNNING)?;
+        Self::gain_teardown(&mut bench, at, path)
+    }
+
+    /// The end of `rtw8822c_txgapk`: the gains written where both paths
+    /// were `measured`, and the transmit pause lifted.
+    ///
+    /// # Safety
+    /// As [`Self::gapk_begin`].
+    pub unsafe fn gapk_end<I: Io>(
+        &mut self,
+        io: &mut I,
+        report: &Report,
+        run: GapkRun,
+        measured: bool,
+    ) -> Result<(), Error> {
+        let mut bench = Bench { io, report };
+        if measured {
+            self.write_gains(&mut bench)?;
         }
-        self.write_gains(&mut bench)?;
-        for (register, value) in held {
+        for (register, value) in run.held {
             bench.write(register, value)?;
         }
         Ok(())
@@ -667,13 +806,14 @@ impl Calibration {
         Ok(())
     }
 
-    /// `rtw8822c_txgapk_calculate_offset`.
-    fn measure_gains<I: Io>(
+    /// `rtw8822c_txgapk_calculate_offset` up to its wait: the registers it
+    /// holds.
+    fn measure_start<I: Io>(
         &mut self,
         bench: &mut Bench<'_, I>,
         at: usize,
         path: Path,
-    ) -> Result<(), Error> {
+    ) -> Result<[Result<u32, io::Error>; 5], Error> {
         let registers = [
             REG_ANTMAP0,
             REG_TXLGMAP,
@@ -720,15 +860,34 @@ impl Calibration {
                 bench.set(REG_TABLE_SEL, BIT_Q_GAIN_SEL, select)?;
             }
         }
-        self.read_offsets(bench, at, path)?;
+        self.start_offsets(bench, at, path)?;
+        Ok(held)
+    }
+
+    /// The rest of `rtw8822c_txgapk_calculate_offset`, and `held` restored.
+    fn measure_finish<I: Io>(
+        &mut self,
+        bench: &mut Bench<'_, I>,
+        at: usize,
+        held: [Result<u32, io::Error>; 5],
+        done: bool,
+    ) -> Result<(), Error> {
+        let registers = [
+            REG_ANTMAP0,
+            REG_TXLGMAP,
+            REG_TXANTSEG,
+            REG_ORITXCODE[0],
+            REG_ORITXCODE[1],
+        ];
+        self.finish_offsets(bench, at, done)?;
         for (register, value) in registers.into_iter().zip(held) {
             bench.write(register, value?)?;
         }
         Ok(())
     }
 
-    /// `rtw8822c_txgapk_read_offset`.
-    fn read_offsets<I: Io>(
+    /// `rtw8822c_txgapk_read_offset` up to its wait for the report.
+    fn start_offsets<I: Io>(
         &mut self,
         bench: &mut Bench<'_, I>,
         at: usize,
@@ -736,13 +895,12 @@ impl Calibration {
     ) -> Result<(), Error> {
         const FIRST: [u32; 2] = [0xd18, 0xd2a];
         const SECOND: [u32; 2] = [0xd19, 0xd2b];
-        const DIRECT: [u32; 2] = [REG_RSV_CTRL, REG_WLRF1];
         bench.set(REG_ANTMAP0, BIT_ANT_PATH, at as u32 + 1)?;
         bench.write(REG_TXLGMAP, 0xe4e40000)?;
         bench.set(REG_TXANTSEG, BIT_ANTSEG, 3)?;
         bench.set(REG_ORITXCODE[at], RF_WHOLE, 0x33312)?;
         bench.set(REG_ORITXCODE[at], BIT_PATH_EN, 1)?;
-        bench.set(DIRECT[at], BITS_RFC_DIRECT, 0)?;
+        bench.set(GAPK_DIRECT[at], BITS_RFC_DIRECT, 0)?;
         bench.rf_set(path, RF_LUTDBG, BIT_TXA_TANK, 1)?;
         bench.rf_set(path, RF_IDAC, BIT_TX_MODE, 0x820)?;
         bench.set(REG_NCTL0, BIT_SEL_PATH, at as u32)?;
@@ -757,19 +915,20 @@ impl Calibration {
         bench.set(REG_R_CONFIG, MASK_BYTE0, swing)?;
         bench.io.delay_us(1000);
         bench.write(REG_NCTL0, FIRST[at])?;
-        bench.write(REG_NCTL0, SECOND[at])?;
-        let mut done = false;
-        for _ in 0..100 {
-            done = bench.get(REG_RPT_CIP, BIT_RPT_CIP_STATUS)? == 0x55;
-            if done {
-                break;
-            }
-            bench.io.delay_us(1000);
-        }
+        bench.write(REG_NCTL0, SECOND[at])
+    }
+
+    /// The rest of `rtw8822c_txgapk_read_offset`, its report `done` or not.
+    fn finish_offsets<I: Io>(
+        &mut self,
+        bench: &mut Bench<'_, I>,
+        at: usize,
+        done: bool,
+    ) -> Result<(), Error> {
         if !done {
             self.fall_short("the gain measurement");
         }
-        bench.set(DIRECT[at], BITS_RFC_DIRECT, 2)?;
+        bench.set(GAPK_DIRECT[at], BITS_RFC_DIRECT, 2)?;
         bench.set(REG_NCTL0, BIT_SEL_PATH, at as u32)?;
         bench.set(REG_RXSRAM_CTL, BIT_RPT_EN, 1)?;
         bench.set(REG_RXSRAM_CTL, BIT_RPT_SEL, 0x12)?;
@@ -836,16 +995,47 @@ impl Calibration {
         Ok(())
     }
 
-    /// `rtw8822c_do_dpk`.
+    /// `rtw8822c_do_dpk` in one call.
     ///
     /// # Safety
     /// As [`Self::even_gains`].
+    #[cfg(test)]
     pub unsafe fn predistort<I: Io>(&mut self, io: &mut I, report: &Report) -> Result<(), Error> {
+        // SAFETY: forwarded from the caller.
+        let Some(mut run) = (unsafe { self.dpk_begin(io, report) })? else {
+            return Ok(());
+        };
+        // SAFETY: as above, for each step of the same run.
+        unsafe {
+            for at in 0..2 {
+                self.dpk_gain(io, report, &mut run, at)?;
+                while !self.dpk_search(io, report, &mut run, at)? {}
+                self.dpk_measure(io, report, &mut run, at)?;
+            }
+            for at in 0..2 {
+                self.dpk_turn_on(io, report, at)?;
+            }
+            self.dpk_end(io, report, run)
+        }
+    }
+
+    /// The start of `rtw8822c_do_dpk`: `None` where the channel's curves were
+    /// learned before and are back in place, so nothing more follows.
+    ///
+    /// # Safety
+    /// As [`rf::Registers::new`]: `io` and `report` are one radio's, whose
+    /// frames wait while this worker owns it, from here to [`Self::dpk_end`].
+    pub unsafe fn dpk_begin<I: Io>(
+        &mut self,
+        io: &mut I,
+        report: &Report,
+    ) -> Result<Option<DpkRun>, Error> {
         let mut bench = Bench { io, report };
         let bench = &mut bench;
         let channel = bench.rf_get(Path::A, RF_CFGCH, RF_WHOLE)?;
         if channel & MASK_BYTE0 == self.dpk.channel {
-            return self.reload(bench);
+            self.reload(bench)?;
+            return Ok(None);
         }
         self.dpk.internal = [0; 2];
         self.dpk.two_ghz = channel & (1 << 16) == 0;
@@ -870,14 +1060,178 @@ impl Calibration {
         Self::analog_on(bench)?;
         self.prepare(bench)?;
         self.reset_results(bench)?;
-        self.measure(bench, 0, Path::A)?;
-        self.measure(bench, 1, Path::B)?;
-        self.turn_on(bench, 0)?;
-        self.turn_on(bench, 1)?;
+        Ok(Some(DpkRun {
+            held,
+            held_rf,
+            paths: [DpkPath::default(); 2],
+        }))
+    }
+
+    /// `rtw8822c_dpk_gainloss` of path `at` up to its search.
+    ///
+    /// # Safety
+    /// As [`Self::dpk_begin`].
+    pub unsafe fn dpk_gain<I: Io>(
+        &mut self,
+        io: &mut I,
+        report: &Report,
+        run: &mut DpkRun,
+        at: usize,
+    ) -> Result<(), Error> {
+        let path = paths()[at].1;
+        let mut bench = Bench { io, report };
+        let bench = &mut bench;
+        let start_gain = self.rf_setting(bench, path)?;
+        let start_agc = bench.rf_get(path, RF_MODE_TRXAGC, BIT_TXAGC)?;
+        Self::settle_dc(bench, path)?;
+        self.shot(bench, at, Shot::Gain)?;
+        Self::digital_gain(bench)?;
+        if Self::dc_off(bench)? {
+            Self::settle_dc(bench, path)?;
+            self.shot(bench, at, Shot::Gain)?;
+            Self::dc_off(bench)?;
+        }
+        run.paths[at] = DpkPath {
+            start_gain,
+            start_agc,
+            before: bench.thermal(path)?,
+            ..DpkPath::default()
+        };
+        Ok(())
+    }
+
+    /// `rtw8822c_dpk_pas_agc` with `loss_only`, the search rtw88 runs, up to
+    /// one measurement a call: whether it is over.
+    ///
+    /// # Safety
+    /// As [`Self::dpk_begin`].
+    pub unsafe fn dpk_search<I: Io>(
+        &mut self,
+        io: &mut I,
+        report: &Report,
+        run: &mut DpkRun,
+        at: usize,
+    ) -> Result<bool, Error> {
+        let path = paths()[at].1;
+        let mut bench = Bench { io, report };
+        let search = &mut run.paths[at];
+        loop {
+            let state = search.state;
+            if state == Agc::Done {
+                return Ok(true);
+            }
+            search.state = self.search_step(&mut bench, at, path, search)?;
+            if state == Agc::Measure {
+                return Ok(search.state == Agc::Done);
+            }
+        }
+    }
+
+    /// The rest of `rtw8822c_dpk_gainloss` and `rtw8822c_dpk_calibrate` of
+    /// path `at`, its search over.
+    ///
+    /// # Safety
+    /// As [`Self::dpk_begin`].
+    pub unsafe fn dpk_measure<I: Io>(
+        &mut self,
+        io: &mut I,
+        report: &Report,
+        run: &mut DpkRun,
+        at: usize,
+    ) -> Result<(), Error> {
+        let path = paths()[at].1;
+        let mut bench = Bench { io, report };
+        let bench = &mut bench;
+        let search = run.paths[at];
+        bench.page(at)?;
+        bench.set(REG_DPK_LOSS_SELECT, 1 << 14, 1)?;
+        bench.write(REG_RXSRAM_CTL, 0x00060000)?;
+        let found = bench.get(REG_STAT_RPT, 0xf0)?;
+        bench.set(REG_DPK_LOSS_SELECT, 1 << 14, 0)?;
+        let gain = search.gain.saturating_sub(found);
+        bench.rf_set(path, RF_TX_GAIN, BIT_GAIN_TXBB, gain)?;
+        let after = bench.thermal(path)?;
+        self.dpk.thermal_delta[at] = search.before.abs_diff(after);
+        let agc = search
+            .start_agc
+            .wrapping_sub(search.start_gain.wrapping_sub(gain));
+        let finished = self.shot(bench, at, Shot::Predistort)?;
+        bench.page(at)?;
+        let failed = !finished || bench.get(REG_DPD_CTL1_S0, 1 << 26)? != 0;
+        bench.rf_set(path, RF_MODE_TRXAGC, RF_WHOLE, 0x33e14)?;
+        self.read_coefficients(bench, at)?;
+        let good = !failed && !self.dpk.coefficients[at].iter().copied().any(railed);
+        bench.page(at)?;
+        let value = if good { agc.wrapping_sub(6) as u8 } else { 0 };
+        self.set_path_result(bench, at, value, good)?;
+        if !good {
+            self.fall_short("predistortion on one of its paths");
+        }
+        Ok(())
+    }
+
+    /// Path `at` left out of a run cut short: the flat curve of a path that
+    /// failed, as `rtw8822c_dpk_calibrate` leaves one.
+    ///
+    /// # Safety
+    /// As [`Self::dpk_begin`].
+    pub unsafe fn dpk_skip<I: Io>(
+        &mut self,
+        io: &mut I,
+        report: &Report,
+        at: usize,
+    ) -> Result<(), Error> {
+        let mut bench = Bench { io, report };
+        bench.page(at)?;
+        self.set_path_result(&mut bench, at, 0, false)
+    }
+
+    /// A path's AGC and curve, and whether it is good.
+    fn set_path_result<I: Io>(
+        &mut self,
+        bench: &mut Bench<'_, I>,
+        at: usize,
+        agc: u8,
+        good: bool,
+    ) -> Result<(), Error> {
+        bench.io.write8(REG_DPD_AGC, agc)?;
+        self.dpk.txagc[at] = bench.io.read8(REG_DPD_AGC)?;
+        self.write_coefficients(bench, at, good)?;
+        self.dpk.ok[at] = good;
+        Ok(())
+    }
+
+    /// `rtw8822c_dpk_on` of path `at`.
+    ///
+    /// # Safety
+    /// As [`Self::dpk_begin`].
+    pub unsafe fn dpk_turn_on<I: Io>(
+        &mut self,
+        io: &mut I,
+        report: &Report,
+        at: usize,
+    ) -> Result<(), Error> {
+        let mut bench = Bench { io, report };
+        self.turn_on(&mut bench, at)
+    }
+
+    /// The end of `rtw8822c_do_dpk`: the scale, the curves on and what the
+    /// run changed put back.
+    ///
+    /// # Safety
+    /// As [`Self::dpk_begin`].
+    pub unsafe fn dpk_end<I: Io>(
+        &mut self,
+        io: &mut I,
+        report: &Report,
+        run: DpkRun,
+    ) -> Result<(), Error> {
+        let mut bench = Bench { io, report };
+        let bench = &mut bench;
         self.scale(bench)?;
         Self::analog_off(bench)?;
         self.enable(bench)?;
-        for (value, address) in held_rf.iter().zip(DPK_RF_REGISTERS) {
+        for (value, address) in run.held_rf.iter().zip(DPK_RF_REGISTERS) {
             for (at, path) in paths() {
                 bench.rf_set(path, address, RF_WHOLE, value[at])?;
             }
@@ -885,7 +1239,7 @@ impl Calibration {
         for (_, path) in paths() {
             Self::settle_dc(bench, path)?;
         }
-        for (value, register) in held.iter().zip(DPK_REGISTERS) {
+        for (value, register) in run.held.iter().zip(DPK_REGISTERS) {
             bench.write(register, *value)?;
         }
         bench.common_page()?;
@@ -1090,111 +1444,52 @@ impl Calibration {
         Ok(i.wrapping_mul(i).wrapping_add(q.wrapping_mul(q)))
     }
 
-    /// `rtw8822c_dpk_pas_agc` with `loss_only`, the search rtw88 runs.
-    fn search_gain<I: Io>(
+    /// One state of `rtw8822c_dpk_pas_agc`'s search.
+    fn search_step<I: Io>(
         &self,
         bench: &mut Bench<'_, I>,
         at: usize,
         path: Path,
-    ) -> Result<u32, Error> {
-        let mut tries = 0;
-        let mut gain = 0;
-        let mut state = Agc::Read;
-        while state != Agc::Done {
-            state = match state {
-                Agc::Read => {
-                    gain = bench.rf_get(path, RF_TX_GAIN, BIT_GAIN_TXBB)?;
-                    tries += 1;
-                    if tries >= 6 { Agc::Done } else { Agc::Measure }
+        search: &mut DpkPath,
+    ) -> Result<Agc, Error> {
+        Ok(match search.state {
+            Agc::Read => {
+                search.gain = bench.rf_get(path, RF_TX_GAIN, BIT_GAIN_TXBB)?;
+                search.tries += 1;
+                if search.tries >= 6 {
+                    Agc::Done
+                } else {
+                    Agc::Measure
                 }
-                Agc::Measure => {
-                    self.shot(bench, at, Shot::GainLoss)?;
-                    let power = Self::returned_power(bench, at)?;
-                    if power < 0x4000000 {
-                        Agc::TooQuiet
-                    } else {
-                        let loss = (3 * log2_hundredths(power >> 13)).wrapping_sub(3870);
-                        match loss {
-                            loss if loss > 1000 => Agc::TooLoud,
-                            loss if loss < 250 => Agc::TooQuiet,
-                            _ => Agc::Done,
-                        }
+            }
+            Agc::Measure => {
+                self.shot(bench, at, Shot::GainLoss)?;
+                let power = Self::returned_power(bench, at)?;
+                if power < 0x4000000 {
+                    Agc::TooQuiet
+                } else {
+                    let loss = (3 * log2_hundredths(power >> 13)).wrapping_sub(3870);
+                    match loss {
+                        loss if loss > 1000 => Agc::TooLoud,
+                        loss if loss < 250 => Agc::TooQuiet,
+                        _ => Agc::Done,
                     }
                 }
-                Agc::TooLoud if gain == 0 => Agc::Done,
-                Agc::TooQuiet if gain == BIT_GAIN_TXBB => Agc::Done,
-                Agc::TooLoud => {
-                    gain = gain.saturating_sub(2);
-                    bench.rf_set(path, RF_TX_GAIN, BIT_GAIN_TXBB, gain)?;
-                    Agc::Read
-                }
-                Agc::TooQuiet => {
-                    gain = (gain + 3).min(BIT_GAIN_TXBB);
-                    bench.rf_set(path, RF_TX_GAIN, BIT_GAIN_TXBB, gain)?;
-                    Agc::Read
-                }
-                Agc::Done => Agc::Done,
-            };
-        }
-        Ok(gain)
-    }
-
-    /// `rtw8822c_dpk_gainloss`: the transmit AGC predistortion runs at.
-    fn gain_loss<I: Io>(
-        &mut self,
-        bench: &mut Bench<'_, I>,
-        at: usize,
-        path: Path,
-    ) -> Result<u32, Error> {
-        let start_gain = self.rf_setting(bench, path)?;
-        let start_agc = bench.rf_get(path, RF_MODE_TRXAGC, BIT_TXAGC)?;
-        Self::settle_dc(bench, path)?;
-        self.shot(bench, at, Shot::Gain)?;
-        Self::digital_gain(bench)?;
-        if Self::dc_off(bench)? {
-            Self::settle_dc(bench, path)?;
-            self.shot(bench, at, Shot::Gain)?;
-            Self::dc_off(bench)?;
-        }
-        let before = bench.thermal(path)?;
-        let found = self.search_gain(bench, at, path)?;
-        bench.page(at)?;
-        bench.set(REG_DPK_LOSS_SELECT, 1 << 14, 1)?;
-        bench.write(REG_RXSRAM_CTL, 0x00060000)?;
-        let search = bench.get(REG_STAT_RPT, 0xf0)?;
-        bench.set(REG_DPK_LOSS_SELECT, 1 << 14, 0)?;
-        let gain = found.saturating_sub(search);
-        bench.rf_set(path, RF_TX_GAIN, BIT_GAIN_TXBB, gain)?;
-        let after = bench.thermal(path)?;
-        self.dpk.thermal_delta[at] = before.abs_diff(after);
-        Ok(start_agc.wrapping_sub(start_gain.wrapping_sub(gain)))
-    }
-
-    /// `rtw8822c_dpk_calibrate`.
-    fn measure<I: Io>(
-        &mut self,
-        bench: &mut Bench<'_, I>,
-        at: usize,
-        path: Path,
-    ) -> Result<(), Error> {
-        let agc = self.gain_loss(bench, at, path)?;
-        let finished = self.shot(bench, at, Shot::Predistort)?;
-        bench.page(at)?;
-        let failed = !finished || bench.get(REG_DPD_CTL1_S0, 1 << 26)? != 0;
-        bench.rf_set(path, RF_MODE_TRXAGC, RF_WHOLE, 0x33e14)?;
-        self.read_coefficients(bench, at)?;
-        let good = !failed && !self.dpk.coefficients[at].iter().copied().any(railed);
-        bench.page(at)?;
-        let value = if good { agc.wrapping_sub(6) as u8 } else { 0 };
-        bench.io.write8(REG_DPD_AGC, value)?;
-        self.dpk.txagc[at] = bench.io.read8(REG_DPD_AGC)?;
-        self.write_coefficients(bench, at, good)?;
-        if good {
-            self.dpk.ok[at] = true;
-        } else {
-            self.fall_short("predistortion on one of its paths");
-        }
-        Ok(())
+            }
+            Agc::TooLoud if search.gain == 0 => Agc::Done,
+            Agc::TooQuiet if search.gain == BIT_GAIN_TXBB => Agc::Done,
+            Agc::TooLoud => {
+                search.gain = search.gain.saturating_sub(2);
+                bench.rf_set(path, RF_TX_GAIN, BIT_GAIN_TXBB, search.gain)?;
+                Agc::Read
+            }
+            Agc::TooQuiet => {
+                search.gain = (search.gain + 3).min(BIT_GAIN_TXBB);
+                bench.rf_set(path, RF_TX_GAIN, BIT_GAIN_TXBB, search.gain)?;
+                Agc::Read
+            }
+            Agc::Done => Agc::Done,
+        })
     }
 
     /// `rtw8822c_dpk_get_coef`.

@@ -91,6 +91,11 @@ struct Air {
     /// The device quarantined itself, and each look for frames since.
     lost: bool,
     looks: usize,
+    /// The looks a calibration takes, those it has left, and the frames
+    /// offered while it ran.
+    calibration_looks: usize,
+    calibrating: usize,
+    offered_while_calibrating: usize,
 }
 
 impl Air {
@@ -174,11 +179,17 @@ impl Device for Model {
         Ok(())
     }
     fn prepare_transmit(&mut self) -> Result<(), String> {
-        self.0.borrow_mut().prepared += 1;
+        let mut air = self.0.borrow_mut();
+        air.prepared += 1;
+        air.calibrating = air.calibration_looks;
         Ok(())
     }
     fn transmit(&mut self, queue: Queue, packet: &Packet, mpdu: &[u8]) -> Result<bool, String> {
         let mut air = self.0.borrow_mut();
+        if air.calibrating > 0 {
+            air.offered_while_calibrating += 1;
+            return Ok(false);
+        }
         if air.full {
             return Ok(false);
         }
@@ -188,6 +199,7 @@ impl Device for Model {
     fn receive(&mut self, sink: &mut dyn FnMut(Incoming)) -> Result<(), String> {
         let mut air = self.0.borrow_mut();
         air.looks += 1;
+        air.calibrating = air.calibrating.saturating_sub(1);
         if air.lost {
             return Err(String::from("receive ring: Quarantined"));
         }
@@ -255,6 +267,9 @@ impl Device for Model {
     }
     fn lost(&self) -> bool {
         self.0.borrow().lost
+    }
+    fn ready(&self) -> bool {
+        self.0.borrow().calibrating == 0
     }
 }
 
@@ -806,6 +821,28 @@ fn a_refused_frame_between_good_ones_is_dropped_and_counted_and_the_rest_arrive(
     assert_eq!(values, [0x45, 0x45]);
     assert!(wifi.radio().dropped() > before);
     assert!(wifi.carrier());
+}
+
+#[test]
+fn authentication_starts_once_the_join_calibration_has_ended() {
+    let (mut wifi, model) = wifi(&OPEN, 1);
+    // 150 looks, 5 ms apart: longer than an authentication's whole wait.
+    model.0.borrow_mut().calibration_looks = 150;
+    assert!(run(&mut wifi, &model, |wifi, _| {
+        wifi.radio().station().phase() == Peering::Associated
+    }));
+    let air = model.0.borrow();
+    assert!(air.prepared >= 1);
+    assert_eq!(air.offered_while_calibrating, 0, "nothing was sent early");
+    let authentications = air
+        .sent
+        .iter()
+        .filter(|(_, _, bytes)| bytes[0] == 0xb0)
+        .count();
+    assert_eq!(
+        authentications, 1,
+        "its timer started after the calibration"
+    );
 }
 
 #[test]

@@ -34,6 +34,7 @@ pub mod receive;
 pub mod regd;
 pub mod registers;
 pub mod rf;
+pub mod rfk;
 pub mod station;
 pub mod templates;
 pub mod transmit;
