@@ -1486,13 +1486,13 @@ fn installed_disk_preserves_boot_choices_and_partitions() {
         (partition_bytes(&f, REGION), partition_bytes(&f, NOR)),
         disks
     );
-    // The engine profile turns on for every choice, and off again.
+    // The profile log level turns on for every choice, and off again.
     let on = rerun(&f, |c| {
         c.action = Action::Configure;
         c.profile = true;
     })
     .unwrap();
-    assert!(on.contains("profile        on"), "{on}");
+    assert!(on.contains("log            profile"), "{on}");
     let config = || fs::read_to_string(f.esp.join("EFI/stela/stela.cfg")).unwrap();
     assert!(config().trim_end().ends_with("--profile"), "{}", config());
     let choices = Choices::parse(&fs::read_to_string(f.esp.join(CHOICES_PATH)).unwrap()).unwrap();

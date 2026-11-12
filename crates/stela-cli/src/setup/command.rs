@@ -3,7 +3,7 @@
 //! the options it takes, so the parser refuses every other combination.
 //! Each form becomes one [`Request`] for the action it names.
 use super::{Action, NextBoot, Request, builds, ecid::Ecid, wifi};
-use clap::{Args, Subcommand, builder::TypedValueParser};
+use clap::{Args, Subcommand, ValueEnum, builder::TypedValueParser};
 use std::path::PathBuf;
 use stela_boot_core::options::Uuid;
 
@@ -652,10 +652,15 @@ struct Configure {
     /// held), or `auto` for setup's choice.
     #[arg(long, value_name = "SECONDS|auto", value_parser = wait)]
     chooser_timeout: Option<Wait>,
-    /// Turn the engine profile on for every startup choice.
+    /// How much every boot logs: `default` keeps what diagnoses a problem,
+    /// with the heartbeat once a minute; `profile` adds the engine's timing
+    /// and counters every 10 s, for performance work.
+    #[arg(long, value_name = "LEVEL", conflicts_with_all = ["profile", "no_profile"])]
+    log: Option<LogLevel>,
+    /// `--log profile`.
     #[arg(long, conflicts_with = "no_profile", hide = true)]
     profile: bool,
-    /// Turn the engine profile off.
+    /// `--log default`.
     #[arg(long, hide = true)]
     no_profile: bool,
     #[command(flatten)]
@@ -691,8 +696,8 @@ impl Configure {
             default_install: self.default_install,
             remove_install: self.remove_install,
             chooser_timeout: self.chooser_timeout,
-            profile: self.profile,
-            no_profile: self.no_profile,
+            profile: self.profile || self.log == Some(LogLevel::Profile),
+            no_profile: self.no_profile || self.log == Some(LogLevel::Default),
             no_wifi: self.no_wifi,
             usb4_approve: self.usb4_approve,
             no_usb4_approve: self.no_usb4_approve,
@@ -705,6 +710,13 @@ impl Configure {
         self.addressing.apply(&mut request);
         request
     }
+}
+
+/// The boot log's levels (`stela_boot_core::log_level::Level`).
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum LogLevel {
+    Default,
+    Profile,
 }
 
 #[derive(Subcommand)]

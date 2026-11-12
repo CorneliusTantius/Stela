@@ -250,6 +250,7 @@ mod tests {
             &["state", "restore", "state.bin", "--nor", "sdc3"],
             &["boot-log"],
             &["configure", "--no-profile", "--chooser-timeout", "0"],
+            &["configure", "--log", "profile"],
             &["host-firmware", "install", "package"],
             &[
                 "host-firmware",
@@ -268,6 +269,8 @@ mod tests {
             &["status", "--target", "sdc2"][..],
             &["uninstall", "--ipsw", "a.ipsw"],
             &["configure", "--profile", "--no-profile"],
+            &["configure", "--log", "verbose"],
+            &["configure", "--log", "default", "--profile"],
             &["state", "backup", "state.bin", "--chooser-timeout", "0"],
             &["--target", "sdc2", "status"],
             &["status", "repair"],

@@ -317,7 +317,7 @@ pub(super) fn add(environment: &Environment<'_>, command: &Request) -> Result<St
 }
 
 /// Settings of an existing setup: the default install, removing one, the
-/// engine profile and the startup choices' timeout.
+/// boot log's level and the startup choices' timeout.
 pub(super) fn configure(environment: &Environment<'_>, command: &Request) -> Result<String> {
     let mut record = read_record(environment, &command.usb)?;
     check_installed_efi(environment, &record)?;
@@ -361,10 +361,10 @@ pub(super) fn configure(environment: &Environment<'_>, command: &Request) -> Res
         record.profile = command.profile;
         writeln!(
             text,
-            "  profile        {}",
+            "  log            {}",
             match record.profile {
-                true => "on: each heartbeat of the boot log times the engine's phases",
-                false => "off",
+                true => "profile: every heartbeat also times the engine's phases and counters",
+                false => "default",
             }
         )?;
     }
