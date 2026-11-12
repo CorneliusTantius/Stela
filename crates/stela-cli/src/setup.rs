@@ -684,7 +684,12 @@ impl Request {
         // Without a USB, `boot-log` reads every disk.
         if boot_log && self.usb.as_os_str().is_empty() {
             let logs = crate::boot_log::scan(&host::System)?;
-            return crate::boot_log::write_logs(&logs, true, self.output.as_deref());
+            return crate::boot_log::write_logs(
+                &logs,
+                true,
+                self.output.as_deref(),
+                crate::boot_log::Shown::default(),
+            );
         }
         debug_assert_eq!(
             stela_loader::boot_bundle::SCHEMA_VERSION,

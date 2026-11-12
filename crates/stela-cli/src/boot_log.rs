@@ -37,10 +37,17 @@ pub(crate) struct BootLog {
     /// computer is read directly (with sudo for disks only root may read),
     /// so the USB Stela booted from only needs to be plugged in.
     file: Option<PathBuf>,
-    /// Write the logs to this file instead of the terminal, as the boot
-    /// wrote them, to attach to a report.
+    /// Write the logs to this file instead of the terminal, to attach to a
+    /// report.
     #[arg(short, long, value_name = "FILE")]
     output: Option<PathBuf>,
+    /// Only the newest boot of each log.
+    #[arg(long)]
+    last: bool,
+    /// Only the boots that failed: a stop, a failed step, or a log that
+    /// ends while a step runs.
+    #[arg(long)]
+    failed: bool,
     /// Only the machine-state partition with this unique GUID in FILE's
     /// GPT.
     #[arg(long, conflicts_with = "offset", requires = "file", hide = true)]
@@ -67,7 +74,11 @@ impl BootLog {
             }
             Some(file) => (vec![(String::new(), self.load(file)?)], false),
         };
-        write_logs(&logs, headings, self.output.as_deref())
+        let shown = Shown {
+            last: self.last,
+            failed: self.failed,
+        };
+        write_logs(&logs, headings, self.output.as_deref(), shown)
     }
 
     fn load(&self, path: &Path) -> Result<Log> {
@@ -118,13 +129,15 @@ impl BootLog {
 }
 
 /// Print `logs` in order, each after a heading naming its place when
-/// `headings`, or write them to `output` and say where they went. Each
-/// stream is written as the boot wrote it, oldest boot first; each log's
-/// one-line summary goes to standard error.
+/// `headings`, or write them to `output` and say where they went. Each log
+/// is printed by boot, oldest first, as [`render`] lays it out; each log's
+/// one-line summary goes to standard error, and a closing line says what
+/// to attach to a report.
 pub(crate) fn write_logs(
     logs: &[(String, Log)],
     headings: bool,
     output: Option<&Path>,
+    shown: Shown,
 ) -> Result<()> {
     let mut sink: Box<dyn Write> = match output {
         Some(path) => Box::new(
@@ -139,7 +152,7 @@ pub(crate) fn write_logs(
             written = writeln!(sink, "=== {place} ===");
         }
         eprint!("{}", summary(log));
-        match written.and_then(|()| sink.write_all(&log.stream)) {
+        match written.and_then(|()| sink.write_all(render(log, shown).as_bytes())) {
             // A reader that closed the pipe early (`| head`) has what it
             // asked for.
             Err(error) if output.is_none() && error.kind() == std::io::ErrorKind::BrokenPipe => {
@@ -152,18 +165,227 @@ pub(crate) fn write_logs(
         Err(error) if output.is_none() && error.kind() == std::io::ErrorKind::BrokenPipe => {}
         result => result.context("cannot write the boot log")?,
     }
-    if let Some(path) = output {
-        eprintln!("{}", saved(logs.len(), path));
+    match output {
+        Some(path) => eprintln!("{}", saved(logs.len(), path)),
+        None => eprintln!("{ATTACH}"),
     }
     Ok(())
 }
 
+/// The closing line of a log printed to the terminal.
+const ATTACH: &str = "To attach this to a report, run `stela boot-log --output stela-log.txt` \
+                      and attach stela-log.txt. Disk serial numbers and volume IDs are shortened.";
+
 /// Where `count` logs were written, as the full path to attach.
 fn saved(count: usize, path: &Path) -> String {
-    match count {
-        1 => format!("Saved the boot log to {}", shown(path).display()),
-        _ => format!("Saved {count} boot logs to {}", shown(path).display()),
+    let logs = match count {
+        1 => String::from("the boot log"),
+        _ => format!("{count} boot logs"),
+    };
+    format!(
+        "Saved {logs} to {}. Attach that file to your report.",
+        shown(path).display()
+    )
+}
+
+/// Which boots `stela boot-log` prints.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct Shown {
+    /// Only the newest boot of each log.
+    pub(crate) last: bool,
+    /// Only boots that failed: a fatal stop, a failed step, or a log that
+    /// ends while a step runs.
+    pub(crate) failed: bool,
+}
+
+/// One boot of a log's stream: its number (none for the part of a boot the
+/// ring overwrote the start of) and its lines.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Boot<'a> {
+    pub(crate) number: Option<u64>,
+    pub(crate) text: &'a str,
+}
+
+/// The stream's boots, oldest first, split at each `=== STELA BOOT n ===`
+/// line the log writes as a boot opens it.
+pub(crate) fn boots(stream: &str) -> Vec<Boot<'_>> {
+    let mut boots = Vec::new();
+    let mut number = None;
+    let mut start = 0;
+    let mut at = 0;
+    for line in stream.split_inclusive('\n') {
+        let marker = line
+            .trim_end()
+            .strip_prefix("=== STELA BOOT ")
+            .and_then(|rest| rest.strip_suffix(" ==="))
+            .and_then(|n| n.parse::<u64>().ok());
+        if let Some(next) = marker {
+            if at > start || number.is_some() {
+                boots.push(Boot {
+                    number,
+                    text: &stream[start..at],
+                });
+            }
+            number = Some(next);
+            start = at + line.len();
+        }
+        at += line.len();
     }
+    if at > start || number.is_some() {
+        boots.push(Boot {
+            number,
+            text: &stream[start..],
+        });
+    }
+    boots
+}
+
+/// How a boot ended, as its lines tell, and whether it failed.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Outcome {
+    pub(crate) text: String,
+    pub(crate) failed: bool,
+    /// The boot wrote its own outcome block.
+    pub(crate) recorded: bool,
+}
+
+/// The step a line begins, in this release's form (`STEP  title`) or an
+/// older one's (`STEP title t=1.2`).
+fn step_begins(line: &str) -> Option<&str> {
+    if let Some(title) = line.strip_prefix(stela_boot_core::log_style::STEP) {
+        return Some(title.trim());
+    }
+    let rest = line.strip_prefix("STEP ")?;
+    if ["o ", "w ", "f ", "DETAIL "]
+        .iter()
+        .any(|mark| rest.starts_with(mark))
+    {
+        return None;
+    }
+    Some(
+        rest.rsplit_once(" t=")
+            .map_or(rest, |(title, _)| title)
+            .trim(),
+    )
+}
+
+/// Whether a line ends a step, and whether as failed.
+fn step_ends(line: &str) -> Option<bool> {
+    use stela_boot_core::log_style::{FAIL, OK, WARN};
+    if [OK, WARN, "STEP o ", "STEP w "]
+        .iter()
+        .any(|mark| line.starts_with(mark))
+    {
+        return Some(false);
+    }
+    (line.starts_with(FAIL) || line.starts_with("STEP f ")).then_some(true)
+}
+
+/// How `text`, one boot's lines, ended: its own `OUTCOME` line when it has
+/// one, else what its last lines show.
+pub(crate) fn outcome(text: &str) -> Outcome {
+    let (mut running, mut last, mut failed_step) = (None, None, false);
+    let (mut fatal, mut stop, mut recorded) = (None, None, None);
+    for line in text.lines() {
+        let line = stela_boot_core::log_style::unlay(strip_stamp(line));
+        let line = line.as_ref();
+        if let Some(title) = step_begins(line) {
+            running = Some(title.to_owned());
+        } else if let Some(failed) = step_ends(line) {
+            failed_step |= failed;
+            last = running.take().or(last);
+        } else if let Some(message) = line.strip_prefix("STELA FATAL ") {
+            fatal = Some(message.to_owned());
+        } else if let Some(message) = line.strip_prefix("STOP ") {
+            stop = Some(message.to_owned());
+        } else if let Some(text) = line.strip_prefix("OUTCOME ") {
+            recorded = Some(text.to_owned());
+        }
+    }
+    let failed = fatal.is_some() || failed_step || running.is_some();
+    if let Some(text) = recorded {
+        return Outcome {
+            text,
+            failed,
+            recorded: true,
+        };
+    }
+    let text = match (&fatal, &running, &stop) {
+        (Some(message), Some(step), _) => format!("stopped in \"{step}\": {message}"),
+        (Some(message), None, _) => format!("stopped: {message}"),
+        (None, Some(step), _) => format!(
+            "the log ends during \"{step}\": the boot hung, lost power, or stopped before its \
+             log was written again; the screen showed why"
+        ),
+        (None, None, Some(stop)) => format!("stopped: {stop}"),
+        (None, None, None) => match &last {
+            Some(step) => format!("the log ends after \"{step}\" with no stop recorded"),
+            None => String::from("the log holds no step of this boot"),
+        },
+    };
+    Outcome {
+        text,
+        failed,
+        recorded: false,
+    }
+}
+
+/// `line` without the `[   12.345] ` time column the USB log adds.
+fn strip_stamp(line: &str) -> &str {
+    if let Some(rest) = line.strip_prefix('[')
+        && let Some((time, text)) = rest.split_once("] ")
+        && time
+            .trim_start()
+            .bytes()
+            .all(|b| b.is_ascii_digit() || b == b'.')
+    {
+        return text;
+    }
+    line
+}
+
+/// `log` as `stela boot-log` prints it: each boot `shown` under a title
+/// with its number and outcome, newest last, with private identifiers
+/// shortened, and an outcome block from the tool for a boot that wrote
+/// none.
+pub(crate) fn render(log: &Log, shown: Shown) -> String {
+    let stream = String::from_utf8_lossy(&log.stream);
+    let mut boots: Vec<(Boot<'_>, Outcome)> = boots(&stream)
+        .into_iter()
+        .map(|boot| {
+            let outcome = outcome(boot.text);
+            (boot, outcome)
+        })
+        .collect();
+    if shown.failed {
+        boots.retain(|(_, outcome)| outcome.failed);
+    }
+    if shown.last && boots.len() > 1 {
+        boots.drain(..boots.len() - 1);
+    }
+    let rule = "#".repeat(80);
+    let mut text = String::new();
+    for (boot, outcome) in &boots {
+        let name = match boot.number {
+            Some(number) => format!("Boot {number}"),
+            None => String::from("Older boot, its start overwritten"),
+        };
+        let mark = if outcome.failed { "FAILED" } else { "ended" };
+        let _ = writeln!(text, "{rule}\n# {name}: {mark}: {}\n{rule}", outcome.text);
+        for line in boot.text.lines() {
+            let _ = writeln!(text, "{}", stela_boot_core::log_style::redact(line));
+        }
+        if !outcome.recorded {
+            let _ = writeln!(
+                text,
+                "{}\nOUTCOME (from stela boot-log) {}\n{}",
+                "-".repeat(80),
+                outcome.text,
+                "=".repeat(80)
+            );
+        }
+    }
+    text
 }
 
 /// `path` in full, as a file to attach is found again.
@@ -647,6 +869,8 @@ pub(crate) mod tests {
         BootLog {
             file: Some(file.into()),
             output: None,
+            last: false,
+            failed: false,
             partition: partition.map(Into::into),
             offset,
             in_target: false,
@@ -945,25 +1169,122 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn boot_log_output_holds_the_streams_as_written() {
+    fn boot_log_output_holds_each_boot_with_its_outcome() {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("log.txt");
-        let mut log = boot_log::read(&region(&["caf\u{e9} \x01\n"])).unwrap();
-        log.stream.push(0xff);
+        let log = boot_log::read(&region(&["caf\u{e9} \x01\n"])).unwrap();
         let logs = [
             (String::from("USB"), log.clone()),
-            (String::from("disk"), log),
+            (String::from("disk"), log.clone()),
         ];
-        write_logs(&logs, true, Some(&output)).unwrap();
-        let mut expected = b"=== USB ===\n".to_vec();
-        expected.extend_from_slice(&logs[0].1.stream);
-        expected.extend_from_slice(b"=== disk ===\n");
-        expected.extend_from_slice(&logs[1].1.stream);
-        assert_eq!(std::fs::read(&output).unwrap(), expected);
+        write_logs(&logs, true, Some(&output), Shown::default()).unwrap();
+        let rendered = render(&log, Shown::default());
+        assert_eq!(
+            std::fs::read_to_string(&output).unwrap(),
+            format!("=== USB ===\n{rendered}=== disk ===\n{rendered}")
+        );
         let said = saved(2, &output);
         assert!(said.starts_with("Saved 2 boot logs to "), "{said}");
-        assert!(said.ends_with("log.txt"), "{said}");
-        let error = write_logs(&logs, false, Some(&dir.path().join("no/such/dir")));
+        assert!(
+            said.ends_with("log.txt. Attach that file to your report."),
+            "{said}"
+        );
+        let error = write_logs(
+            &logs,
+            false,
+            Some(&dir.path().join("no/such/dir")),
+            Shown::default(),
+        );
         assert!(format!("{:#}", error.unwrap_err()).contains("cannot create"));
+    }
+
+    /// Three boots as release 0.2.0 wrote them (identifiers made up): one
+    /// that went on, and two that ended in the same step, the second with
+    /// its stop recorded in this release's form.
+    const BOOTS: [&str; 3] = [
+        "[   31.349] STEP Opening the boot log on the USB t=31.349\n\
+         [   31.365] STEP o Opening the boot log on the USB ms=15\n\
+         [   73.399] CHOSEN DISK 2111082561276:5E1A0000-0000-4000-8000-0000000000C0\n\
+         [   95.164] STEP Taking control of the other processors t=95.164\n",
+        "[   27.527] STEP  Opening the boot log on the USB\n\
+         [   27.544] OK    Opening the boot log on the USB (16 ms)\n\
+         [   36.656]       INSTALLER      disk SATA \"PNY\" serial=PNY123456789 size=1.0GiB\n\
+         [   95.164] STEP  Taking control of the other processors\n",
+        "[   27.527] STEP  Reading the boot files\n\
+         [   28.000] FAIL  Reading the boot files (a file is short, 473 ms)\n\
+         \nSTELA FATAL a bundle file ended early\n\
+         --------------------------------------------------------------------------------\n\
+         OUTCOME stopped in \"Reading the boot files\" at 28.1 s, code 0x11: a bundle file \
+         ended early\n\
+         ================================================================================\n",
+    ];
+
+    #[test]
+    fn boots_are_numbered_with_their_outcomes() {
+        let log = boot_log::read(&region(&BOOTS)).unwrap();
+        let text = String::from_utf8(log.stream.clone()).unwrap();
+        let split = boots(&text);
+        assert_eq!(
+            split.iter().map(|boot| boot.number).collect::<Vec<_>>(),
+            [Some(1), Some(2), Some(3)]
+        );
+        let outcomes: Vec<_> = split.iter().map(|boot| outcome(boot.text)).collect();
+        assert!(outcomes[0].failed && !outcomes[0].recorded);
+        assert!(
+            outcomes[0]
+                .text
+                .starts_with("the log ends during \"Taking control of the other processors\""),
+            "{}",
+            outcomes[0].text
+        );
+        assert!(outcomes[1].failed);
+        assert!(outcomes[2].failed && outcomes[2].recorded);
+        assert!(
+            outcomes[2]
+                .text
+                .starts_with("stopped in \"Reading the boot files\" at 28.1 s")
+        );
+
+        let rendered = render(&log, Shown::default());
+        // Private identifiers are shortened; the boot's own lines stay.
+        assert!(!rendered.contains("5E1A0000-0000-4000-8000-0000000000C0"));
+        assert!(rendered.contains("CHOSEN DISK ..1276:..00C0"), "{rendered}");
+        assert!(rendered.contains("serial=..6789"), "{rendered}");
+        assert!(
+            rendered.contains("# Boot 1: FAILED: the log ends during"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("OUTCOME (from stela boot-log) the log ends during"));
+        // The boot that recorded its outcome gets no second one.
+        assert_eq!(rendered.matches("OUTCOME").count(), 3, "{rendered}");
+
+        let last = render(
+            &log,
+            Shown {
+                last: true,
+                failed: false,
+            },
+        );
+        assert!(
+            last.starts_with(&format!("{}\n# Boot 3: FAILED", "#".repeat(80))),
+            "{last}"
+        );
+        assert_eq!(last.matches("# Boot ").count(), 1);
+        // A clean boot is left out of the failures.
+        let clean =
+            boot_log::read(&region(&["[ 1.000] STEP  A\n[ 2.000] OK    A (1 ms)\n"])).unwrap();
+        assert_eq!(
+            render(
+                &clean,
+                Shown {
+                    last: false,
+                    failed: true
+                }
+            ),
+            ""
+        );
+        assert!(
+            render(&clean, Shown::default()).contains("# Boot 1: ended: the log ends after \"A\"")
+        );
     }
 }
