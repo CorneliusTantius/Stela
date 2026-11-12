@@ -5,7 +5,7 @@
 //! separate observations. None creates OS/air or independent stop permission.
 use super::{
     features::Report,
-    identity::{Chip, Profile},
+    identity::Profile,
     io::{self, Io},
     registers::*,
     transmit,
@@ -157,7 +157,7 @@ impl<I: Io> Control<I> {
             iqk_active: false,
             clock_last: 0,
         };
-        if profile.chip() != Chip::Rtl8822C || report.profile() != profile {
+        if profile.rtw88().is_none() || report.profile() != profile {
             return Err(Error::WrongProfile);
         }
         let cap = report.capabilities();

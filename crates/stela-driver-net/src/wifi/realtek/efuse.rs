@@ -3,15 +3,18 @@
 //! RTL8822C read-only physical efuse transport, logical map and raw board data.
 //! Raw OTP/regulatory/calibration fields do not attest calibrated radio policy.
 use super::{
-    identity::{Chip, Profile},
+    chip::{EfuseSize, RTL8822C},
+    identity::Profile,
     io::{self, Io, sleep},
     registers::*,
 };
 use crate::wifi::stepped::yield_now;
+/// The physical efuse every rtw88 chip here has.
 const PHYSICAL: usize = 512;
-const PROTECTED: usize = 124;
+/// The largest logical map, whose tail a smaller chip leaves unprogrammed.
 const LOGICAL: usize = 768;
-const USABLE: usize = PHYSICAL - PROTECTED;
+#[cfg(test)]
+const USABLE: usize = PHYSICAL - 124;
 const POLLS: usize = 1_000_000;
 /// Looks at one byte's read that wait in place, about a millisecond, before
 /// each further look ends the step; and the bytes read a step.
@@ -66,7 +69,7 @@ impl Physical {
     pub fn logical(&self) -> Result<Logical, Error> {
         Ok(Logical {
             profile: self.profile,
-            bytes: logical_map(&self.bytes)?,
+            bytes: logical_map_sized(&self.bytes, efuse_size(self.profile)?)?,
         })
     }
 }
@@ -166,9 +169,8 @@ impl Board {
 /// source PHY power-policy defaults, calibration, channel or station setup.
 pub async unsafe fn read<I: Io>(io: &mut I) -> Result<Physical, Error> {
     let profile = io.profile();
-    if profile.chip() != Chip::Rtl8822C {
-        return Err(Error::WrongChip);
-    }
+    let spec = profile.rtw88().ok_or(Error::WrongChip)?;
+    efuse_size(profile)?;
     let mut a = Attempt { io, done: false };
     verify(a.io, profile)?;
     let ready = a.io.read16(REG_MCUFW_CTRL)?;
@@ -180,8 +182,10 @@ pub async unsafe fn read<I: Io>(io: &mut I) -> Result<Physical, Error> {
     }
     let bank = a.io.read32(REG_LDO_EFUSE_CTRL)?;
     a.io.write32(REG_LDO_EFUSE_CTRL, bank & !0x300)?;
-    let ldo = a.io.read8(REG_ANAPARLDO_POW_MAC)?;
-    a.io.write8(REG_ANAPARLDO_POW_MAC, ldo & !BIT_LDOE25_PON)?;
+    // The chip's cfg_ldo25(false).
+    let (register, bit) = spec.ldo25;
+    let ldo = a.io.read8(register)?;
+    a.io.write8(register, ldo & !bit)?;
     let mut control = a.io.read32(REG_EFUSE_CTRL)?;
     let mut bytes = [0; PHYSICAL];
     for (address, byte) in bytes.iter_mut().enumerate() {
@@ -247,15 +251,30 @@ fn verify<I: Io>(io: &mut I, profile: Profile) -> Result<(), Error> {
 /// Unlike the donor's permissive final-byte check, every header/word must fit
 /// completely before that protected tail. Malformed maps are explicit errors.
 pub fn logical_map(physical: &[u8; PHYSICAL]) -> Result<[u8; LOGICAL], Error> {
+    let size = RTL8822C.rtw88.as_ref().map(|spec| spec.efuse);
+    logical_map_sized(physical, size.ok_or(Error::WrongChip)?)
+}
+/// The chip's efuse sizes, which must fit the buffers here.
+fn efuse_size(profile: Profile) -> Result<EfuseSize, Error> {
+    let size = profile.rtw88().ok_or(Error::WrongChip)?.efuse;
+    if size.physical != PHYSICAL || size.logical > LOGICAL || size.protected >= PHYSICAL {
+        return Err(Error::WrongChip);
+    }
+    Ok(size)
+}
+/// [`logical_map`] for a chip of `size`: bytes past its logical map stay
+/// unprogrammed.
+fn logical_map_sized(physical: &[u8; PHYSICAL], size: EfuseSize) -> Result<[u8; LOGICAL], Error> {
+    let usable = PHYSICAL - size.protected;
     let mut logical = [255; LOGICAL];
     let mut cursor = 0;
-    while cursor < USABLE {
+    while cursor < usable {
         let first = physical[cursor];
         if first == 255 {
             break;
         }
         let (block, enabled) = if first & 0x1f == 0xf {
-            if cursor + 2 > USABLE {
+            if cursor + 2 > usable {
                 return Err(Error::Header { offset: cursor });
             }
             let second = physical[cursor + 1];
@@ -272,11 +291,11 @@ pub fn logical_map(physical: &[u8; PHYSICAL]) -> Result<[u8; LOGICAL], Error> {
             if enabled & (1 << word) != 0 {
                 continue;
             }
-            if cursor + 2 > USABLE {
+            if cursor + 2 > usable {
                 return Err(Error::Payload { offset: cursor });
             }
             let offset = usize::from(block) * 8 + word * 2;
-            if offset + 2 > LOGICAL {
+            if offset + 2 > size.logical {
                 return Err(Error::Logical { offset });
             }
             logical[offset..offset + 2].copy_from_slice(&physical[cursor..cursor + 2]);

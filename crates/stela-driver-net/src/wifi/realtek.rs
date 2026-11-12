@@ -10,6 +10,7 @@ pub mod bit_rate;
 pub mod bootstrap;
 pub mod calibrate;
 pub mod ccmp;
+pub mod chip;
 pub mod coex;
 pub mod commands;
 pub mod deep;

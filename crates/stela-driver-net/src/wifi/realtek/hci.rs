@@ -4,7 +4,6 @@
 //! Reset stores and zero indices are not an acknowledged DMA-stop mechanism.
 use super::{
     beacon::{self, Beacon},
-    identity::Chip,
     io::{self, Io, NativeIo},
     receive,
     registers::*,
@@ -71,7 +70,7 @@ pub unsafe fn setup<B: beacon::Registers, R: receive::Registers, T: transmit::Re
     tx: &mut transmit::Rings<T>,
 ) -> Result<(), Error> {
     let profile = io.profile();
-    if profile.chip() != Chip::Rtl8822C || tx.profile()? != profile {
+    if profile.rtw88().is_none() || tx.profile()? != profile {
         return Err(Error::IdentityChanged);
     }
     let mut a = Attempt { io, done: false };

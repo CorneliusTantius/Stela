@@ -2,7 +2,12 @@
 // Copyright(c) 2018-2019 Realtek Corporation
 //! Exact pinned RTL8822C power command tables, including filtered USB/SDIO rows.
 use super::Step;
-pub(super) const TRANS_CARDDIS_TO_CARDEMU_8822C: &[Step] = &[
+/// `card_enable_flow_8822c` and `card_disable_flow_8822c`.
+pub(in crate::wifi::realtek) const ON_8822C: [&[Step]; 2] =
+    [TRANS_CARDDIS_TO_CARDEMU_8822C, TRANS_CARDEMU_TO_ACT_8822C];
+pub(in crate::wifi::realtek) const OFF_8822C: [&[Step]; 2] =
+    [TRANS_ACT_TO_CARDEMU_8822C, TRANS_CARDEMU_TO_CARDDIS_8822C];
+const TRANS_CARDDIS_TO_CARDEMU_8822C: &[Step] = &[
     Step::new(0x0086, 0xff, 0x01, 3, 1, 0x01, 0x00),
     Step::new(0x0086, 0xff, 0x01, 3, 2, 0x02, 0x02),
     Step::new(0x002e, 0xff, 0x0f, 0, 1, 0x04, 0x04),
@@ -12,7 +17,7 @@ pub(super) const TRANS_CARDDIS_TO_CARDEMU_8822C: &[Step] = &[
     Step::new(0x0005, 0xff, 0x0f, 0, 1, 0x98, 0x00),
     Step::new(0xffff, 0xff, 0x0f, 0, 4, 0x00, 0x00),
 ];
-pub(super) const TRANS_CARDEMU_TO_ACT_8822C: &[Step] = &[
+const TRANS_CARDEMU_TO_ACT_8822C: &[Step] = &[
     Step::new(0x0000, 0xff, 0x03, 0, 1, 0x20, 0x00),
     Step::new(0x0005, 0xff, 0x0f, 0, 1, 0x1c, 0x00),
     Step::new(0x0075, 0xff, 0x04, 0, 1, 0x01, 0x01),
@@ -36,7 +41,7 @@ pub(super) const TRANS_CARDEMU_TO_ACT_8822C: &[Step] = &[
     Step::new(0x1064, 0xff, 0x0f, 0, 1, 0x02, 0x02),
     Step::new(0xffff, 0xff, 0x0f, 0, 4, 0x00, 0x00),
 ];
-pub(super) const TRANS_ACT_TO_CARDEMU_8822C: &[Step] = &[
+const TRANS_ACT_TO_CARDEMU_8822C: &[Step] = &[
     Step::new(0x0093, 0xff, 0x0f, 0, 1, 0x08, 0x00),
     Step::new(0x001f, 0xff, 0x0f, 0, 1, 0xff, 0x00),
     Step::new(0x00ef, 0xff, 0x0f, 0, 1, 0xff, 0x00),
@@ -50,7 +55,7 @@ pub(super) const TRANS_ACT_TO_CARDEMU_8822C: &[Step] = &[
     Step::new(0x0000, 0xff, 0x03, 0, 1, 0x20, 0x20),
     Step::new(0xffff, 0xff, 0x0f, 0, 4, 0x00, 0x00),
 ];
-pub(super) const TRANS_CARDEMU_TO_CARDDIS_8822C: &[Step] = &[
+const TRANS_CARDEMU_TO_CARDDIS_8822C: &[Step] = &[
     Step::new(0x0005, 0xff, 0x01, 0, 1, 0x80, 0x80),
     Step::new(0x0007, 0xff, 0x03, 0, 1, 0xff, 0x00),
     Step::new(0x0067, 0xff, 0x0f, 0, 1, 0x20, 0x00),

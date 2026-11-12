@@ -4,7 +4,8 @@
 //! These are internal device SRAM addresses, never CPU/physical/DMA addresses.
 //! Queue configuration is not a firmware command ACK, HCI start or radio ready.
 use super::{
-    identity::{Chip, Profile},
+    chip::Rtw88,
+    identity::Profile,
     io::{Error as HardwareError, Io},
     registers::*,
 };
@@ -24,7 +25,17 @@ impl From<HardwareError> for Error {
     }
 }
 
-/// Fixed RTL8822C chip geometry from rtw_set_trx_fifo_info and chip tables.
+/// `RSVD_PG_H2C_EXTRAINFO_NUM`, `RSVD_PG_H2C_STATICINFO_NUM`,
+/// `RSVD_PG_H2CQ_NUM` and `RSVD_PG_FW_TXBUF_NUM`; a 3081 CPU chip reserves
+/// no instruction pages.
+const H2C_EXTRA_PAGES: u16 = 24;
+const H2C_STATIC_PAGES: u16 = 8;
+const H2C_QUEUE_PAGES: u16 = 8;
+const FIRMWARE_TX_PAGES: u16 = 4;
+/// `C2H_PKT_BUF`, the receive FIFO's tail kept for firmware reports.
+const C2H_PACKET_BUFFER: u32 = 256;
+
+/// A chip's geometry from rtw_set_trx_fifo_info and its chip tables.
 /// Every address is in 128-byte pages of internal device TX SRAM.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Geometry {
@@ -41,18 +52,21 @@ pub struct Geometry {
 }
 impl Geometry {
     pub fn for_profile(profile: Profile) -> Result<Self, Error> {
-        if profile.chip() != Chip::Rtl8822C {
-            return Err(Error::UnsupportedChip);
-        }
-        let pages = (262144u32 / 128) as u16;
-        let reserved = 16 + 24 + 8 + 8 + 4 + 50;
-        let csi = pages - 50;
-        let firmware_tx = csi - 4;
+        let spec = profile.rtw88().ok_or(Error::UnsupportedChip)?;
+        let pages = (spec.txff_bytes >> 7) as u16;
+        let reserved = spec.driver_pages
+            + H2C_EXTRA_PAGES
+            + H2C_STATIC_PAGES
+            + H2C_QUEUE_PAGES
+            + FIRMWARE_TX_PAGES
+            + spec.csi_pages;
+        let csi = pages - spec.csi_pages;
+        let firmware_tx = csi - FIRMWARE_TX_PAGES;
         let cpu_instructions = firmware_tx;
-        let h2c_queue = cpu_instructions - 8;
-        let h2c_static = h2c_queue - 8;
-        let h2c_extra = h2c_static - 24;
-        let boundary = h2c_extra - 16;
+        let h2c_queue = cpu_instructions - H2C_QUEUE_PAGES;
+        let h2c_static = h2c_queue - H2C_STATIC_PAGES;
+        let h2c_extra = h2c_static - H2C_EXTRA_PAGES;
+        let boundary = h2c_extra - spec.driver_pages;
         Ok(Self {
             profile,
             pages,
@@ -135,8 +149,9 @@ pub unsafe fn configure<I: Io>(io: &mut I) -> Result<Geometry, Error> {
         if control == u32::MAX || control & u32::from(FW_READY_MASK) != u32::from(FW_READY) {
             return Err(Error::FirmwareNotReady);
         }
-        map_queues(attempt.io)?;
-        priority_queues(attempt.io, geometry)?;
+        let spec = geometry.profile.rtw88().ok_or(Error::UnsupportedChip)?;
+        map_queues(attempt.io, spec)?;
+        priority_queues(attempt.io, geometry, spec)?;
         h2c(attempt.io, geometry)?;
         Ok(geometry)
     })();
@@ -148,29 +163,28 @@ fn modify8<I: Io>(io: &mut I, register: u32, clear: u8, set: u8) -> Result<(), E
     io.write8(register, (value & !clear) | set)?;
     Ok(())
 }
-fn map_queues<I: Io>(io: &mut I) -> Result<(), Error> {
-    // Source PCIe rqpn row: VO normal, VI normal, BE low, BK low,
-    // MG extra, HI high. Mapping encoding: extra0/low1/normal2/high3.
-    io.write16(
-        REG_TXDMA_PQ_MAP,
-        3 << 14 | 1 << 10 | 1 << 8 | 2 << 6 | 2 << 4,
-    )?;
+fn map_queues<I: Io>(io: &mut I, spec: &Rtw88) -> Result<(), Error> {
+    // The chip's PCIe rqpn row.
+    io.write16(REG_TXDMA_PQ_MAP, spec.queue_map_register())?;
     io.write8(REG_CR, 0)?;
     io.write8(REG_CR, 0xff)?;
     io.write32(REG_H2CQ_CSR, BIT_H2CQ_FULL)?;
     Ok(())
 }
-fn priority_queues<I: Io>(io: &mut I, g: Geometry) -> Result<(), Error> {
-    for register in [
-        REG_FIFOPAGE_INFO_1,
-        REG_FIFOPAGE_INFO_2,
-        REG_FIFOPAGE_INFO_3,
-        REG_FIFOPAGE_INFO_4,
+fn priority_queues<I: Io>(io: &mut I, g: Geometry, spec: &Rtw88) -> Result<(), Error> {
+    let t = spec.page_table;
+    for (register, pages) in [
+        (REG_FIFOPAGE_INFO_1, t.high),
+        (REG_FIFOPAGE_INFO_2, t.low),
+        (REG_FIFOPAGE_INFO_3, t.normal),
+        (REG_FIFOPAGE_INFO_4, t.extra),
     ] {
-        io.write16(register, 64)?;
+        io.write16(register, pages)?;
     }
-    // TX pages minus reserved pages, four priority allocations and one gap.
-    io.write16(REG_FIFOPAGE_INFO_5, g.pages - g.reserved - 4 * 64 - 1)?;
+    // The public queue: TX pages less the reserved ones, the four priority
+    // queues and the gap.
+    let public = g.pages - g.reserved - t.high - t.normal - t.low - t.extra - t.gap;
+    io.write16(REG_FIFOPAGE_INFO_5, public)?;
     let rqpn = io.read32(REG_RQPN_CTRL_2)?;
     io.write32(REG_RQPN_CTRL_2, rqpn | BIT_LD_RQPN)?;
     io.write16(REG_FIFOPAGE_CTRL_2, g.boundary)?;
@@ -178,7 +192,7 @@ fn priority_queues<I: Io>(io: &mut I, g: Geometry) -> Result<(), Error> {
     io.write16(REG_BCNQ_BDNY_V1, g.boundary)?;
     io.write16(REG_FIFOPAGE_CTRL_2 + 2, g.boundary)?;
     io.write16(REG_BCNQ1_BDNY_V1, g.boundary)?;
-    io.write32(REG_RXFF_BNDY, 24576 - 256 - 1)?;
+    io.write32(REG_RXFF_BNDY, spec.rxff_bytes - C2H_PACKET_BUFFER - 1)?;
     modify8(io, REG_AUTO_LLT_V1, 0, 1)?;
     for _ in 0..1000 {
         let status = io.read32(REG_AUTO_LLT_V1)?;

@@ -5,7 +5,7 @@
 use super::{
     beacon::{self, Allocation},
     fifo::Geometry,
-    identity::{Chip, Profile},
+    identity::Profile,
     io::Bar,
     registers::*,
 };
@@ -216,7 +216,7 @@ impl<R: Registers> Rings<R> {
         source: &dyn PageSource,
         domain: Arc<dyn DmaDomain>,
     ) -> Result<Self, Error> {
-        if io.profile().chip() != Chip::Rtl8822C {
+        if io.profile().rtw88().is_none() {
             return Err(Error::UnsupportedChip);
         }
         io.verify_identity()?;

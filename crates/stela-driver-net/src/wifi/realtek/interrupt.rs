@@ -4,7 +4,7 @@
 //! This device block does not allocate vectors or manufacture an MSI route,
 //! deferred work, packet completion, firmware ACK or DMA-stop acknowledgement.
 use super::{
-    identity::{Chip, Profile},
+    identity::Profile,
     io::{self, Bar, Io},
     registers::*,
 };
@@ -126,7 +126,7 @@ impl<I: Registers> Controller<I> {
             state: State::Quarantined,
         };
         let profile = c.io()?.profile();
-        if profile.chip() != Chip::Rtl8822C {
+        if profile.rtw88().is_none() {
             return Err(Error::WrongChip);
         }
         let value = c.read(REG_SYS_CFG1)?;

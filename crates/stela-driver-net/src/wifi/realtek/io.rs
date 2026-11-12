@@ -4,7 +4,7 @@
 //! rtw88/{hci,pci}.h. `Io` carries the reserved-page beacon submission the
 //! firmware download needs; `Bar` is the plain BAR shared by the beacon, RX
 //! and TX register blocks.
-use super::identity::{Chip, Profile};
+use super::identity::Profile;
 use crate::{
     Clock, Deadline,
     bus::mmio::Mmio,
@@ -232,7 +232,7 @@ impl<Q: BeaconQueue> NativeIo<Q> {
         if clock.ticks_per_microsecond == 0 {
             return Err(Error::InvalidClock);
         }
-        if profile.chip() != Chip::Rtl8822C {
+        if profile.rtw88().is_none() {
             return Err(Error::WrongChip);
         }
         Ok(Self {
@@ -451,7 +451,7 @@ impl Bar {
         if bytes < BAR_BYTES || window.as_ptr().addr() & 3 != 0 {
             return Err(Error::Register);
         }
-        if profile.chip() != Chip::Rtl8822C {
+        if profile.rtw88().is_none() {
             return Err(Error::WrongChip);
         }
         Ok(Self {

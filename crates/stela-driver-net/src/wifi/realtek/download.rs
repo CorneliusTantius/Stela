@@ -6,7 +6,7 @@
 //! HCI setup, OTP, calibration, channel, MLME and keys are separate operations.
 use super::{
     firmware::{ParseError, Rtw88},
-    identity::{Chip, Staged},
+    identity::Staged,
     io::{Error, Io, sleep},
     registers::*,
 };
@@ -169,7 +169,7 @@ impl<I: Io> Download<I> {
             return Err(Error::InvalidState.into());
         }
         let profile = self.io.profile();
-        if staged.profile.chip() != Chip::Rtl8822C || staged.profile != profile {
+        if staged.profile.rtw88().is_none() || staged.profile != profile {
             return Err(Error::WrongChip.into());
         }
         // Staged fields are diagnostic and mutable, whereas Image keeps

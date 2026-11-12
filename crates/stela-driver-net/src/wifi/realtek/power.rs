@@ -3,12 +3,11 @@
 //! RTL8822C source MAC power sequence, before firmware upload. This controls
 //! power/reset registers and never grants RF/channel/Link readiness.
 use super::{
-    identity::Chip,
+    chip::Rtw88,
     io::{Error as HardwareError, Io, sleep},
     registers::*,
 };
-mod tables;
-use tables::*;
+pub(super) mod tables;
 
 const POLLS: usize = 20_000;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -29,8 +28,9 @@ impl From<HardwareError> for Error {
     }
 }
 
-#[derive(Clone, Copy)]
-struct Step {
+/// One row of a chip's power sequence (`rtw_pwr_seq_cmd`).
+#[derive(Clone, Copy, Debug)]
+pub struct Step {
     offset: u16,
     cut: u8,
     interface: u8,
@@ -86,9 +86,9 @@ impl<I: Io> Drop for Attempt<'_, I> {
 /// quarantined, and no retry is allowed without independent reset/ownership.
 pub async unsafe fn on<I: Io>(io: &mut I) -> Result<(), Error> {
     let profile = io.profile();
-    if profile.chip() != Chip::Rtl8822C {
+    let Some(spec) = profile.rtw88() else {
         return Err(Error::UnsupportedChip);
-    }
+    };
     if profile.cut() >= 7 {
         return Err(Error::UnsupportedCut(profile.cut()));
     }
@@ -102,14 +102,14 @@ pub async unsafe fn on<I: Io>(io: &mut I) -> Result<(), Error> {
             return Err(Error::IdentityChanged);
         }
         pre_system(attempt.io)?;
-        if !switch(attempt.io, true).await? {
-            switch(attempt.io, false).await?;
+        if !switch(attempt.io, spec, true).await? {
+            switch(attempt.io, spec, false).await?;
             pre_system(attempt.io)?;
-            if !switch(attempt.io, true).await? {
+            if !switch(attempt.io, spec, true).await? {
                 return Err(Error::InvalidPowerState);
             }
         }
-        system(attempt.io)
+        system(attempt.io, spec)
     }
     .await;
     attempt.complete = result.is_ok();
@@ -136,9 +136,9 @@ fn pre_system<I: Io>(io: &mut I) -> Result<(), Error> {
     modify8(io, REG_RF_CTRL, 7, 0)?;
     modify32(io, REG_WLRF1, 7 << 24, 0)
 }
-fn system<I: Io>(io: &mut I) -> Result<(), Error> {
+fn system<I: Io>(io: &mut I, spec: &Rtw88) -> Result<(), Error> {
     modify32(io, REG_CPU_DMEM_CON, 0, 1 << 16 | 1 << 8)?;
-    modify8(io, REG_SYS_FUNC_EN + 1, 0, 0xd8)?;
+    modify8(io, REG_SYS_FUNC_EN + 1, 0, spec.sys_func_en)?;
     let value = (io.read8(REG_CR_EXT + 3)? & 0xf0) | 0x0c;
     io.write8(REG_CR_EXT + 3, value)?;
     let control = io.read32(REG_MCUFW_CTRL)?;
@@ -148,7 +148,7 @@ fn system<I: Io>(io: &mut I) -> Result<(), Error> {
     }
     Ok(())
 }
-async fn switch<I: Io>(io: &mut I, on: bool) -> Result<bool, Error> {
+async fn switch<I: Io>(io: &mut I, spec: &Rtw88, on: bool) -> Result<bool, Error> {
     let rpwm = io.read8(RPWM_PCIE)?;
     if io.read16(REG_MCUFW_CTRL)? == FW_READY {
         io.write8(RPWM_PCIE, (rpwm ^ BIT_RPWM_TOGGLE) & BIT_RPWM_TOGGLE)?;
@@ -158,11 +158,7 @@ async fn switch<I: Io>(io: &mut I, on: bool) -> Result<bool, Error> {
         return Ok(false);
     }
     let cut_mask = 1u8 << (io.profile().cut() + 1);
-    let sequence = if on {
-        [TRANS_CARDDIS_TO_CARDEMU_8822C, TRANS_CARDEMU_TO_ACT_8822C]
-    } else {
-        [TRANS_ACT_TO_CARDEMU_8822C, TRANS_CARDEMU_TO_CARDDIS_8822C]
-    };
+    let sequence = if on { spec.power_on } else { spec.power_off };
     for table in sequence {
         run(io, table, cut_mask).await?;
     }
@@ -461,10 +457,10 @@ mod tests {
             std::fs::read(std::path::Path::new(&path).with_file_name("tables.bin")).unwrap();
         let mut actual_tables = Vec::new();
         for table in [
-            TRANS_CARDDIS_TO_CARDEMU_8822C,
-            TRANS_CARDEMU_TO_ACT_8822C,
-            TRANS_ACT_TO_CARDEMU_8822C,
-            TRANS_CARDEMU_TO_CARDDIS_8822C,
+            tables::ON_8822C[0],
+            tables::ON_8822C[1],
+            tables::OFF_8822C[0],
+            tables::OFF_8822C[1],
         ] {
             for step in table {
                 for value in [

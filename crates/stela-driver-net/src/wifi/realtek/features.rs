@@ -4,7 +4,7 @@
 //! efuse.h. Only the single-attempt Download creates a Report; pure
 //! decoding creates diagnostics, never firmware/PHY/ownership evidence.
 use super::{
-    identity::{Chip, Profile},
+    identity::Profile,
     io::{Error, Io, sleep},
     registers::*,
 };
@@ -106,7 +106,7 @@ pub fn decode(sys_cfg1: u32, raw: &[u8; LENGTH]) -> Capabilities {
 
 fn identity<I: Io>(io: &mut I) -> Result<Profile, Error> {
     let profile = io.profile();
-    if profile.chip() != Chip::Rtl8822C {
+    if profile.rtw88().is_none() {
         return Err(Error::WrongChip);
     }
     if io.read32(REG_SYS_CFG1)? != profile.observed().sys_cfg1 {

@@ -5,7 +5,7 @@
 //! table admission. No RF/air/radio readiness is inferred from a register store.
 use super::{
     features::Report,
-    identity::{Chip, Profile},
+    identity::Profile,
     io::{self, Io},
     registers::*,
 };
@@ -68,10 +68,7 @@ impl<'a, I: Io> Registers<'a, I> {
     pub unsafe fn new(io: &'a mut I, report: &Report) -> Result<Self, Error> {
         let profile = io.profile();
         let rf_phys = report.capabilities().rf_phys;
-        if profile.chip() != Chip::Rtl8822C
-            || report.profile() != profile
-            || !(1..=2).contains(&rf_phys)
-        {
+        if profile.rtw88().is_none() || report.profile() != profile || !(1..=2).contains(&rf_phys) {
             return Err(Error::WrongProfile);
         }
         let mut registers = Self {
