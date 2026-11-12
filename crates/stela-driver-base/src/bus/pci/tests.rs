@@ -1061,6 +1061,113 @@ fn a_function_silent_after_its_reset_ends_with_the_start_budget() {
     assert!(budget.expired().is_some());
 }
 
+/// A minimum-delay source on the virtual clock at 1 tick per microsecond,
+/// counting the waits it blocks in and, when `intervals`, giving intervals.
+struct SteppedTimer {
+    intervals: bool,
+    blocked: core::cell::Cell<u32>,
+}
+struct VirtualInterval(u64);
+impl power::Interval for VirtualInterval {
+    fn elapsed(&self) -> Result<bool, power::Error> {
+        Ok(crate::Clock::ticks() >= self.0)
+    }
+}
+const STEPPED_CLOCK: crate::Clock = crate::Clock {
+    ticks_per_microsecond: 1,
+};
+// SAFETY: a wait advances the virtual clock by at least its length, and an
+// interval is elapsed only once the virtual clock passed its end.
+unsafe impl power::Timer for SteppedTimer {
+    fn check(&self) -> Result<(), power::Error> {
+        Ok(())
+    }
+    fn wait_us(&self, microseconds: u64) -> Result<(), power::Error> {
+        self.blocked.set(self.blocked.get() + 1);
+        crate::test_clock::advance(STEPPED_CLOCK, microseconds);
+        Ok(())
+    }
+    fn begin_interval(
+        &self,
+        microseconds: u64,
+    ) -> Result<Option<alloc::boxed::Box<dyn power::Interval>>, power::Error> {
+        Ok(self.intervals.then(|| {
+            alloc::boxed::Box::new(VirtualInterval(crate::Clock::ticks() + microseconds))
+                as alloc::boxed::Box<dyn power::Interval>
+        }))
+    }
+}
+
+/// Step `function`'s reset, the clock advancing 1 ms between steps; the
+/// result, the steps and the most waits blocked in one step.
+fn reset_in_steps(
+    function: &mut Function<Resettable>,
+    intervals: bool,
+) -> (Result<bool, BlockError>, u32, u32) {
+    let timer = SteppedTimer {
+        intervals,
+        blocked: core::cell::Cell::new(0),
+    };
+    let mut reset = core::pin::pin!(function.function_level_reset_in_steps(&timer));
+    let (mut steps, mut most) = (0, 0);
+    loop {
+        steps += 1;
+        let before = timer.blocked.get();
+        let poll = core::future::Future::poll(
+            reset.as_mut(),
+            &mut core::task::Context::from_waker(core::task::Waker::noop()),
+        );
+        most = most.max(timer.blocked.get() - before);
+        if let core::task::Poll::Ready(result) = poll {
+            return (result, steps, most);
+        }
+        crate::test_clock::advance(STEPPED_CLOCK, 1_000);
+    }
+}
+
+/// A reset while the guest runs never blocks a step where the timer gives
+/// intervals, waits as long as the reset at once, and puts the setup back.
+#[test]
+fn a_function_reset_in_steps_waits_on_intervals_and_puts_its_setup_back() {
+    let _virtual = crate::test_clock::virtualize();
+    let mut function = resettable(1 << 28, 2);
+    let start = crate::Clock::ticks();
+    let (reset, steps, most) = reset_in_steps(&mut function, true);
+    assert_eq!(reset, Ok(true));
+    assert_eq!(most, 0, "no step blocks");
+    let waited = crate::Clock::ticks() - start;
+    // 700 ms for the request, 100 ms after the reset, 3 ms of silence.
+    assert!(waited >= 803_000, "{waited}");
+    assert!(steps > 500, "{steps} steps");
+    let config = &function.config;
+    assert_eq!(config.resets, 1);
+    assert_eq!(config.words[1] & 0xffff, 6);
+    assert_eq!(config.words[0x48 / 4] & 0xffff, 0x2810);
+    assert_eq!(config.words[0x70 / 4], 3);
+}
+
+/// Without intervals each wait blocks one step, which then ends; one that
+/// stays silent still ends after its 60 s.
+#[test]
+fn a_function_reset_in_steps_without_intervals_blocks_one_wait_a_step() {
+    let _virtual = crate::test_clock::virtualize();
+    let mut function = resettable(1 << 28, 2);
+    let (reset, steps, most) = reset_in_steps(&mut function, false);
+    assert_eq!((reset, most), (Ok(true), 1));
+    assert_eq!(steps, 7, "one step per wait and the last");
+    let mut function = resettable(1 << 28, u32::MAX);
+    let (reset, _, most) = reset_in_steps(&mut function, true);
+    assert_eq!(
+        (reset, most),
+        (
+            Err(BlockError::Unsupported(
+                "PCI function did not return from its reset"
+            )),
+            0
+        )
+    );
+}
+
 #[test]
 fn a_function_without_a_reset_is_left_alone_and_one_that_stays_silent_is_an_error() {
     let mut function = resettable(0, 0);

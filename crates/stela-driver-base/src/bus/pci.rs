@@ -654,9 +654,39 @@ impl<C: ConfigSpace> Function<C> {
             timer.wait_us(microseconds).map_err(BlockError::from)
         })
     }
+    /// [`Self::function_level_reset`] a step at a time, for a reset while the
+    /// guest runs: each wait is a minimum interval the steps poll, when
+    /// `timer` gives one, and otherwise a wait that ends its step. Polled with
+    /// any waker; nothing wakes it.
+    pub async fn function_level_reset_in_steps(
+        &mut self,
+        timer: &(impl power::Timer + ?Sized),
+    ) -> Result<bool, BlockError> {
+        timer.check()?;
+        self.function_level_reset_steps(|microseconds| interval(timer, microseconds))
+            .await
+    }
     fn function_level_reset_with(
         &mut self,
         mut delay: impl FnMut(u64) -> Result<(), BlockError>,
+    ) -> Result<bool, BlockError> {
+        let reset = self
+            .function_level_reset_steps(|microseconds| core::future::ready(delay(microseconds)));
+        let mut reset = core::pin::pin!(reset);
+        loop {
+            let context = &mut core::task::Context::from_waker(core::task::Waker::noop());
+            if let core::task::Poll::Ready(result) =
+                core::future::Future::poll(reset.as_mut(), context)
+            {
+                return result;
+            }
+        }
+    }
+    async fn function_level_reset_steps<
+        F: core::future::Future<Output = Result<(), BlockError>>,
+    >(
+        &mut self,
+        mut delay: impl FnMut(u64) -> F,
     ) -> Result<bool, BlockError> {
         let Some((offset, _)) = self
             .capabilities()?
@@ -694,12 +724,12 @@ impl<C: ConfigSpace> Function<C> {
             if status & EXPRESS_TRANSACTIONS_PENDING == 0 {
                 break;
             }
-            delay(FLR_WAIT_US << attempt)?;
+            delay(FLR_WAIT_US << attempt).await?;
         }
         let control = express + EXPRESS_DEVICE_CONTROL;
         let original = config.read16(control)?;
         config.write16(control, original | EXPRESS_INITIATE_FLR)?;
-        delay(FLR_WAIT_US)?;
+        delay(FLR_WAIT_US).await?;
         let mut poll = FLR_READY_POLL_US;
         let mut waited = 0;
         while matches!(config.read16(regs::VENDOR_ID)?, 0xffff | VENDOR_NOT_READY) {
@@ -712,7 +742,7 @@ impl<C: ConfigSpace> Function<C> {
                     "PCI function did not return from its reset",
                 ));
             }
-            delay(poll)?;
+            delay(poll).await?;
             waited += poll;
             poll *= 2;
         }
@@ -1033,3 +1063,34 @@ pub fn rooted(windows: &[EcamWindow], bridges: &[(u16, RangeInclusive<u8>)]) -> 
 
 #[cfg(test)]
 mod tests;
+
+/// Wait at least `microseconds` on `timer` as stepped work: each poll checks a
+/// minimum interval once, or, when `timer` gives none, the wait runs in one
+/// poll that then ends.
+async fn interval(
+    timer: &(impl power::Timer + ?Sized),
+    microseconds: u64,
+) -> Result<(), BlockError> {
+    let pending_once = || {
+        let mut polled = false;
+        core::future::poll_fn(move |_| {
+            if core::mem::replace(&mut polled, true) {
+                core::task::Poll::Ready(())
+            } else {
+                core::task::Poll::Pending
+            }
+        })
+    };
+    match timer.begin_interval(microseconds)? {
+        Some(interval) => {
+            while !interval.elapsed()? {
+                pending_once().await;
+            }
+        }
+        None => {
+            timer.wait_us(microseconds)?;
+            pending_once().await;
+        }
+    }
+    Ok(())
+}
