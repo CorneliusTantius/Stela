@@ -19,6 +19,18 @@ pub enum Stage {
     Table,
     Validate,
 }
+
+impl core::fmt::Display for Stage {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Select => "choosing the firmware's table",
+            Self::EntryPrefix => "reading the entry point's start",
+            Self::Entry => "reading the entry point",
+            Self::Table => "reading the table",
+            Self::Validate => "checking the table",
+        })
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Failure {
     pub stage: Stage,
@@ -266,12 +278,12 @@ pub fn summary(
             alloc::format!("SMBIOS {phase} unavailable: the firmware has no SMBIOS table\n")
         }
         State::Failed(error) => alloc::format!(
-            "SMBIOS {phase} unreadable at {:?}: {:?}{}\n",
+            "SMBIOS {phase} unreadable while {}: {}{}\n",
             error.stage,
             error.reason,
             error
                 .status
-                .map(|status| alloc::format!(", status={status:#x}"))
+                .map(|status| alloc::format!(" (firmware status {status:#x})"))
                 .unwrap_or_default()
         ),
     }

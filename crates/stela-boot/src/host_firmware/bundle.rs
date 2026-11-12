@@ -83,7 +83,7 @@ fn functions() -> Vec<Pci> {
             .collect(),
         Err(error) => {
             output::arguments(format_args!(
-                "FIRMWARE no PCI census ({error:?}): USB Bluetooth files only\n"
+                "FIRMWARE no PCI census, so only USB Bluetooth files are used: {error}\n"
             ));
             Vec::new()
         }

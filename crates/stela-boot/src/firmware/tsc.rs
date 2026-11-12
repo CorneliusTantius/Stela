@@ -215,7 +215,7 @@ fn measure_against_timers() -> Option<(Calibrated, TscSource)> {
         Ok(calibrated) => Some((calibrated, source)),
         Err(error) => {
             crate::output::arguments(format_args!(
-                "TSC calibration against {} failed: {error:?}\n",
+                "TSC calibration against {} failed: {error}\n",
                 source.name()
             ));
             None

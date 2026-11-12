@@ -43,5 +43,34 @@ pub enum Error {
     InconsistentRate,
     AdjustmentChanged,
 }
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::MalformedCapture => f.write_str("the CPU capture is malformed"),
+            Self::MissingCpuid(leaf) => write!(f, "CPUID leaf {leaf:#x} was not captured"),
+            Self::DuplicateCpuid(leaf) => write!(f, "CPUID leaf {leaf:#x} was captured twice"),
+            Self::MissingMsr(msr) => write!(f, "MSR {msr:#x} was not captured"),
+            Self::DuplicateMsr(msr) => write!(f, "MSR {msr:#x} was captured twice"),
+            Self::TscUnavailable => f.write_str("the CPU has no time-stamp counter"),
+            Self::InvariantUnavailable => {
+                f.write_str("the time-stamp counter does not run at a constant rate")
+            }
+            Self::HypervisorContractRequired => {
+                f.write_str("the hypervisor does not promise a stable time-stamp counter")
+            }
+            Self::InvalidPackageCount => f.write_str("the CPU package count is not valid"),
+            Self::Pc10StopsHpet => f.write_str("the HPET stops in the PC10 power state"),
+            Self::InvalidRate => f.write_str("the reference timer's rate is not valid"),
+            Self::InvalidMask => f.write_str("the reference timer's counter width is not valid"),
+            Self::NoProgress => f.write_str("the reference timer did not advance"),
+            Self::Backwards => f.write_str("the reference timer went backwards"),
+            Self::Disturbed => f.write_str("every measurement window was interrupted"),
+            Self::Overflow => f.write_str("the measurement overflowed"),
+            Self::InconsistentRate => f.write_str("the counter's rate changed between readings"),
+            Self::AdjustmentChanged => f.write_str("the counter's adjustment changed meanwhile"),
+        }
+    }
+}
 #[cfg(test)]
 mod tests;

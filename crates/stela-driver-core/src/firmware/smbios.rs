@@ -73,6 +73,48 @@ pub enum Error {
     AllocationFailed,
     ImageBinding,
 }
+
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::NotCaptured => f.write_str("the table was not captured"),
+            Self::NoConfigurationTable => f.write_str("the firmware publishes no SMBIOS table"),
+            Self::AmbiguousConfiguration => {
+                f.write_str("the firmware publishes more than one SMBIOS table of a kind")
+            }
+            Self::MemoryMapUnavailable => f.write_str("the firmware's memory map is unavailable"),
+            Self::UnreadableRange => f.write_str("the table lies in memory that may not be read"),
+            Self::AddressOverflow => f.write_str("the table's address range overflows"),
+            Self::NoncanonicalAddress => f.write_str("the table's address is not canonical"),
+            Self::EntryAnchor => f.write_str("the entry point has no SMBIOS anchor"),
+            Self::EntryLength => f.write_str("the entry point's length is wrong"),
+            Self::EntryChecksum => f.write_str("the entry point's checksum is wrong"),
+            Self::EntryRevision => f.write_str("the entry point's revision is unknown"),
+            Self::EntryVersion => f.write_str("the entry point's version is unknown"),
+            Self::IntermediateChecksum => f.write_str("the entry point's DMI checksum is wrong"),
+            Self::TableBound { bytes } => {
+                write!(f, "the table is {bytes} bytes, more than a table may be")
+            }
+            Self::TableLength => f.write_str("the table's length is wrong"),
+            Self::StructureLength => f.write_str("a structure's length is wrong"),
+            Self::UnterminatedStrings => f.write_str("a structure's strings are not terminated"),
+            Self::InvalidStringIndex => f.write_str("a structure names a string it lacks"),
+            Self::MissingType1 => f.write_str("the table has no system information (type 1)"),
+            Self::DuplicateType1 => f.write_str("the table has two system information structures"),
+            Self::DuplicateHandle => f.write_str("two structures share a handle"),
+            Self::MissingEnd => f.write_str("the table has no end-of-table structure"),
+            Self::StructureCount => f.write_str(
+                "the table holds another number of structures than its entry point says",
+            ),
+            Self::MaximumStructureSize => {
+                f.write_str("a structure is larger than the entry point allows")
+            }
+            Self::ChangedEntry => f.write_str("the entry point changed while it was read"),
+            Self::AllocationFailed => f.write_str("memory for its copy could not be allocated"),
+            Self::ImageBinding => f.write_str("its copy could not be bound to the boot image"),
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Observation<'a> {
     NotObserved,
