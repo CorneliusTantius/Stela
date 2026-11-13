@@ -197,6 +197,14 @@ fn a_short_vendor_length_is_malformed() {
 }
 
 #[test]
+fn a_zero_length_vendor_capability_is_header_only() {
+    let mut space = Space::new();
+    space.0[0x34] = 0x40;
+    space.standard(0x40, 0x09, 0);
+    assert_eq!(space.walk(), [Ok((0x40, 0x09, 3))]);
+}
+
+#[test]
 fn express_size_follows_version_type_and_slot() {
     for (flags, bytes) in [
         (0x0001, 0x14),

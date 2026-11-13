@@ -387,6 +387,13 @@ impl<R: CapabilityRead> Capabilities<R> {
             }
             0x09 => {
                 let bytes = self.read.read(offset + 2, 1)? as u16 & 0xff;
+                // Intel's xHCI controllers on some laptops write a zero length
+                // here. Such an entry has no body to size, so only its header
+                // is reserved and the walk goes on. Lengths 1 and 2 cannot hold
+                // the header and stay malformed.
+                if bytes == 0 {
+                    return sized(3);
+                }
                 if bytes < 3 {
                     return Err(CapabilityError::Malformed { offset }.into());
                 }
